@@ -735,8 +735,13 @@ function recordLiveHistory(record) {
 
 // --- interference timeline --------------------------------------------------
 
-const TIMELINE = { width: 900, height: 500, left: 68, right: 12, top: 28, bottom: 32 };
+const TIMELINE = { width: 900, height: 500, left: 142, right: 12, top: 28, bottom: 32 };
 const TIMELINE_BANDS = ['L1', 'L2', 'L5'];
+const TIMELINE_BAND_INFO = {
+  L1: { coverage: 'E1 / B1 / G1', range: '1559–1610 MHz' },
+  L2: { coverage: 'G2', range: '1215–1260 MHz' },
+  L5: { coverage: 'E5 / B2', range: '1164–1215 MHz' },
+};
 
 function timelineViewport(now = Date.now()) {
   const historyMs = state.windowMinutes * 60000;
@@ -844,7 +849,11 @@ function renderTimeline() {
     chart.append(svg('rect', {
       x: TIMELINE.left, y: y + 1, width: plotWidth, height: rowHeight - 2, class: 'tl-row',
     }));
-    chart.append(svg('text', { x: TIMELINE.left, y: y + 12, class: 'tl-title' }, `${bandId} · Power (dBm)`));
+    const bandInfo = TIMELINE_BAND_INFO[bandId];
+    chart.append(svg('text', { x: 8, y: y + rowHeight / 2 - 12, class: 'tl-band-name' }, bandId));
+    chart.append(svg('text', { x: 8, y: y + rowHeight / 2 + 2, class: 'tl-band-coverage' }, bandInfo.coverage));
+    chart.append(svg('text', { x: 8, y: y + rowHeight / 2 + 16, class: 'tl-band-coverage' }, bandInfo.range));
+    chart.append(svg('text', { x: TIMELINE.left, y: y + 12, class: 'tl-title' }, 'Power (dBm)'));
     for (const power of [-130, -110, -90, -70]) {
       const py = timelinePowerY(power, index, rowHeight);
       chart.append(svg('line', {

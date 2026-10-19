@@ -345,6 +345,8 @@ select {
 .tl-axis-utc { fill: var(--text); font-size: 10px; text-anchor: middle; font-variant-numeric: tabular-nums; }
 .tl-grid { stroke: var(--line); stroke-width: 1; }
 .tl-title { fill: var(--text); font-size: 11px; }
+.tl-band-name { fill: var(--text); font-size: 13px; font-weight: 700; }
+.tl-band-coverage { fill: var(--muted); font-size: 10px; }
 .tl-power-line { stroke-width: 1.5; }
 .timeline-controls { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem; }
 .plot-help { color: var(--muted); font-size: .75rem; }

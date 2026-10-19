@@ -208,6 +208,45 @@ test('power lines join detections but break at clear, unknown and missing report
   assert.equal((gapPaths.find((path) => path.className === 'tl-status-moderate').d.match(/M/g) || []).length, 2);
 });
 
+test('timeline places band names and frequency coverage in the left axis gutter', () => {
+  const elements = new Map();
+  const element = () => ({
+    children: [], attributes: {}, textContent: '',
+    append(...children) { this.children.push(...children); },
+    replaceChildren() { this.children = []; },
+    setAttribute(name, value) { this.attributes[name] = value; },
+    getBoundingClientRect: () => ({ width: 900 }),
+  });
+  const get = (id) => {
+    if (!elements.has(id)) elements.set(id, element());
+    return elements.get(id);
+  };
+  const context = vm.createContext({
+    state: { windowMinutes: 60, timeZone: 'UTC', interferenceHistory: [] },
+    $: get,
+    timelineViewport: () => ({ start: 0, end: 60000, windowMs: 60000 }),
+    utcLabel: () => '00:00',
+    renderSpectrumPlots() {},
+    svg: (tag, attrs, text) => Object.assign(element(), { tag, attributes: attrs, textContent: text }),
+  });
+  loadFunctions(browserCode, 'const TIMELINE =', 'function timelineViewport(', context);
+  loadFunctions(browserCode, 'function timelinePowerY(', 'const SPECTRUM_PLOTS =', context);
+  context.renderTimeline();
+
+  const labels = get('timeline').children.filter((child) => child.tag === 'text');
+  for (const [band, coverage, range] of [
+    ['L1', 'E1 / B1 / G1', '1559–1610 MHz'],
+    ['L2', 'G2', '1215–1260 MHz'],
+    ['L5', 'E5 / B2', '1164–1215 MHz'],
+  ]) {
+    const name = labels.find((label) => label.textContent === band);
+    assert.equal(name.attributes.x, 8);
+    assert(labels.some((label) => label.textContent === coverage));
+    assert(labels.some((label) => label.textContent === range));
+  }
+  assert.equal(labels.filter((label) => label.textContent === 'Power (dBm)').length, 3);
+});
+
 test('timeline zoom and pan stay within retained history and can follow live time', () => {
   const context = vm.createContext({ state: { windowMinutes: 60 }, renderTimeline() {} });
   loadFunctions(browserCode, 'function timelineViewport(', 'function initTimelineControls(', context);
@@ -256,15 +295,24 @@ test('timeline controls support wheel zoom, dragging, cursor inspection and live
   });
   loadFunctions(browserCode, 'const TIMELINE =', 'function timelineViewport(', context);
   loadFunctions(browserCode, 'function timelineViewport(', 'const SPECTRUM_PLOTS =', context);
-  loadFunctions(browserCode, 'function timelineTimeLabel(', 'function powerColour(', context);
+  loadFunctions(browserCode, 'function utcLabel(', 'function powerColour(', context);
   loadFunctions(browserCode, 'function formatTimestamp(', 'function initTimeZone(', context);
   context.initTimelineControls();
   context.renderTimeline();
   const chart = get('timeline');
   const labels = chart.children.filter((child) => child.tag === 'text').map((child) => child.textContent);
-  for (const band of ['L1', 'L2', 'L5']) {
-    assert(labels.includes(`${band} · Power (dBm)`));
+  for (const [band, coverage, range] of [
+    ['L1', 'E1 / B1 / G1', '1559–1610 MHz'],
+    ['L2', 'G2', '1215–1260 MHz'],
+    ['L5', 'E5 / B2', '1164–1215 MHz'],
+  ]) {
+    assert(labels.includes(band));
+    assert(labels.includes(coverage));
+    assert(labels.includes(range));
   }
+  assert.equal(chart.children.filter((child) => child.attributes.class === 'tl-band-name'
+    && child.attributes.x === 8).length, 3);
+  assert.equal(labels.filter((label) => label === 'Power (dBm)').length, 3);
   assert.equal(labels.filter((label) => label === 'Status').length, 3);
   assert.equal(labels.filter((label) => label.includes('Interference status')).length, 0);
   for (const label of ['-130', '-110', '-90', '-70']) {
