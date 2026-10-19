@@ -1,0 +1,20 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^node --check public\\\\app\\.js; if \\(\\$\\?\\) \\{ node --check src\\\\config\\.js \\}$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node --test --test-name-pattern=\"timeline\\|power lines\" tools/memory\\.test\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node --test --test-name-pattern=\"timeline\\|power lines\\|clicking a timeline report\" tools/memory\\.test\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^node --test --test-name-pattern=\"recent status reports\\|unchanged clear reports\" tools/memory\\.test\\.js$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

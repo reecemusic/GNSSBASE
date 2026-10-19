@@ -1,0 +1,22 @@
+{
+  "name": "novatel-itdetect-reader",
+  "version": "1.0.0",
+  "description": "Reads ITDETECTSTATUS logs from a NovAtel PwrPak over TCP and displays them in a browser.",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "sim": "node tools/simulator.js",
+    "test": "node --test tools/memory.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "serialport": "^12.0.0"
+  },
+  "private": true,
+  "allowScripts": {
+    "@serialport/bindings-cpp@12.0.1": true
+  }
+}

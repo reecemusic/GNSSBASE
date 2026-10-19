@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GNSSBASE Monitor</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+        integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H"
+        crossorigin="anonymous" referrerpolicy="no-referrer" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div>
+      <h1>GNSSBASE Monitor</h1>
+      <div id="version-line" class="subtitle">Waiting for VERSION...</div>
+    </div>
+    <div class="header-right">
+      <label class="history-control">
+        History
+        <select id="history-window">
+          <option value="5">5 min</option>
+          <option value="15">15 min</option>
+          <option value="60" selected>1 hour</option>
+          <option value="360">6 hours</option>
+          <option value="1440">24 hours</option>
+        </select>
+      </label>
+      <div id="status" class="status disconnected">
+        <span class="dot"></span>
+        <span id="status-text">Connecting...</span>
+      </div>
+    </div>
+  </header>
+
+  <form id="connection-form" class="connection-bar">
+    <label>
+      Connection
+      <select id="connection-transport">
+        <option value="tcp">TCP</option>
+        <option value="serial">USB serial</option>
+      </select>
+    </label>
+    <div id="tcp-fields" class="connection-fields">
+      <label>Receiver IP <input id="receiver-host" type="text" value="20.20.20.50" autocomplete="off" required /></label>
+      <label>Port <input id="receiver-port" type="number" value="3001" min="1" max="65535" required /></label>
+    </div>
+    <div id="serial-fields" class="connection-fields" hidden>
+      <label>COM port <select id="serial-path"><option value="COM11">COM11</option></select></label>
+      <label>Baud rate
+        <select id="serial-baud-rate">
+          <option value="9600">9600</option>
+          <option value="19200">19200</option>
+          <option value="38400">38400</option>
+          <option value="57600">57600</option>
+          <option value="115200" selected>115200</option>
+          <option value="230400">230400</option>
+        </select>
+      </label>
+    </div>
+    <button type="submit">Connect</button>
+    <button id="disconnect" type="button" class="secondary">Disconnect</button>
+    <span id="connection-message" role="status" aria-live="polite"></span>
+  </form>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview">Overview</button>
+    <button class="tab" data-tab="position">Position</button>
+    <button class="tab" data-tab="satellites">Satellites</button>
+    <button class="tab" data-tab="ephemeris">Ephemeris and Iono</button>
+    <button class="tab" data-tab="interference">Interference</button>
+    <button class="tab" data-tab="health">Receiver health</button>
+    <button class="tab" data-tab="raw">Raw stream</button>
+  </nav>
+
+  <!-- Overview ------------------------------------------------------------->
+  <section id="tab-overview" class="panel active">
+    <h2>Message flow</h2>
+    <table id="counts">
+      <thead><tr><th>Log</th><th>Format</th><th>Count</th><th>Last seen</th><th>CRC</th></tr></thead>
+      <tbody><tr class="empty"><td colspan="5">No messages received yet.</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- Position ------------------------------------------------------------->
+  <section id="tab-position" class="panel">
+    <h2>
+      Antenna position
+      <a id="gmaps-link" class="ext-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Open in Google Maps</a>
+    </h2>
+    <div id="map"></div>
+    <div id="map-fallback" class="map-fallback">Loading map…</div>
+
+    <h2>BESTPOS</h2>
+    <div class="summary">
+      <div class="card wide">
+        <span class="label">Solution</span>
+        <span id="pos-type" class="value">&mdash;</span>
+        <span id="pos-status-hint" class="hint"></span>
+        <span id="pos-quality" class="quality" hidden></span>
+      </div>
+      <div class="card"><span class="label">Latitude</span><span id="pos-lat" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Longitude</span><span id="pos-lon" class="value">&mdash;</span></div>
+      <div class="card height-card">
+        <div class="card-header">
+          <span id="pos-hgt-label" class="label">Height (MSL)</span>
+          <span class="toggle" id="height-toggle">
+            <button type="button" data-datum="msl" class="active">MSL</button>
+            <button type="button" data-datum="ellipsoidal">Ellipsoidal</button>
+          </span>
+        </div>
+        <span id="pos-hgt" class="value">&mdash;</span>
+        <span id="pos-undulation" class="hint"></span>
+      </div>
+      <div class="card"><span class="label">Std dev (lat/lon/hgt)</span><span id="pos-sigma" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">SVs used / tracked</span><span id="pos-svs" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Diff age / sol age</span><span id="pos-age" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Station ID</span><span id="pos-stn" class="value">&mdash;</span></div>
+    </div>
+    <h2>BESTGNSSPOS</h2>
+    <div class="summary">
+      <div class="card wide">
+        <span class="label">Solution</span>
+        <span id="gnss-type" class="value">&mdash;</span>
+        <span id="gnss-status-hint" class="hint"></span>
+      </div>
+      <div class="card"><span class="label">Lat / Lon</span><span id="gnss-latlon" class="value">&mdash;</span></div>
+      <div class="card height-card">
+        <div class="card-header">
+          <span id="gnss-hgt-label" class="label">Height (MSL)</span>
+        </div>
+        <span id="gnss-hgt" class="value">&mdash;</span>
+      </div>
+      <div class="card"><span class="label">SVs used</span><span id="gnss-svs" class="value">&mdash;</span></div>
+    </div>
+  </section>
+
+  <!-- Satellites ----------------------------------------------------------->
+  <section id="tab-satellites" class="panel">
+    <div class="summary">
+      <div class="card"><span class="label">Used in solution</span><span id="sv-used" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Tracked, not used</span><span id="sv-tracked" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Missing</span><span id="sv-missing" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Unhealthy</span><span id="sv-unhealthy" class="value">&mdash;</span></div>
+    </div>
+
+    <h2>
+      Skyplot <span id="sky-count" class="muted"></span>
+      <label class="checkbox"><input type="checkbox" id="show-traces" checked> Show traces</label>
+    </h2>
+    <div class="sky-wrap">
+      <svg id="skyplot" viewBox="0 0 420 420" role="img" aria-label="Satellite skyplot"></svg>
+      <div class="sky-side">
+        <div class="legend-title">Constellations <button id="sky-all" type="button">All</button></div>
+        <ul id="sky-legend" class="legend"></ul>
+        <div class="legend-title">Used signals</div>
+        <ul id="signal-legend" class="legend signal-legend">
+          <li class="muted">No used RANGE signals yet.</li>
+        </ul>
+        <div class="legend-title">Status</div>
+        <ul class="legend key">
+          <li><span class="key-marker used"></span>Used in solution</li>
+          <li><span class="key-marker tracked"></span>Tracked, not used</li>
+          <li><span class="key-marker missing"></span>Missing observation</li>
+          <li><span class="key-marker unhealthy"></span>Unhealthy / excluded</li>
+        </ul>
+      </div>
+    </div>
+    <div id="sky-fallback" class="map-fallback">
+      Waiting for SATVIS2 — add <code>LOG SATVIS2A ONTIME 10</code> if the receiver is not sending it.
+    </div>
+
+    <h2>Satellite status</h2>
+    <table id="sv-table">
+      <thead><tr><th>System</th><th>PRN</th><th>State</th><th>Elev</th><th>Azim</th><th>C/No</th><th>Detail</th></tr></thead>
+      <tbody><tr class="empty"><td colspan="7">No satellite data yet.</td></tr></tbody>
+    </table>
+
+    <h2>RANGE observations <span id="range-count" class="muted"></span></h2>
+    <table id="range">
+      <thead><tr><th>PRN</th><th>GLO freq</th><th>Pseudorange</th><th>C/No</th><th>Lock time</th><th>Tracking status</th></tr></thead>
+      <tbody><tr class="empty"><td colspan="6">No RANGE log received yet.</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- Ephemeris ----------------------------------------------------------->
+  <section id="tab-ephemeris" class="panel">
+    <div class="summary">
+      <div class="card"><span class="label">Constellations</span><span id="eph-systems" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Satellites decoded</span><span id="eph-satellites" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Unhealthy</span><span id="eph-unhealthy" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Latest ephemeris</span><span id="eph-latest" class="value">&mdash;</span></div>
+    </div>
+    <div id="ephemeris" class="ephemeris-groups">
+      <div class="empty-panel">Waiting for decoded ephemeris records.</div>
+    </div>
+  </section>
+
+  <!-- Interference --------------------------------------------------------->
+  <section id="tab-interference" class="panel">
+    <div id="it-banner" class="banner idle">
+      <span class="banner-icon"></span>
+      <div>
+        <div id="it-verdict" class="banner-title">Waiting for ITDETECTSTATUS</div>
+        <div id="it-detail" class="banner-detail">No interference data received yet.</div>
+      </div>
+    </div>
+
+    <div class="summary interference-summary">
+      <div class="card"><span class="label">Last status update</span><span id="it-time" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Active bands</span><span id="it-bands-hit" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Active detections</span><span id="it-count" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Status messages</span><span id="it-total" class="value">0</span></div>
+    </div>
+
+    <h2>
+      Power over time <span id="timeline-range" class="muted"></span>
+      <span class="scale">
+        <span class="scale-item"><i class="swatch strong"></i>&gt; &minus;95 dBm</span>
+        <span class="scale-item"><i class="swatch moderate"></i>&minus;95 to &minus;110</span>
+        <span class="scale-item"><i class="swatch weak"></i>&lt; &minus;110</span>
+        <span class="scale-item"><i class="swatch clear"></i>clear report</span>
+      </span>
+    </h2>
+    <div class="timeline-controls" role="group" aria-label="Linked chart navigation">
+      <button id="timeline-earlier" type="button">Earlier</button>
+      <button id="timeline-later" type="button">Later</button>
+      <button id="timeline-zoom-in" type="button">Zoom in</button>
+      <button id="timeline-zoom-out" type="button">Zoom out</button>
+      <button id="timeline-live" type="button">Reset / Live</button>
+      <span id="timeline-mode" role="status">Live</span>
+    </div>
+    <p class="plot-help">Drag any plot to pan; scroll to zoom around the pointer. All plots share the same time window (UTC).
+      Signal buttons toggle frequency overlays only; detected energy remains visible in red.
+      Overlapping allocations use alternating colour stripes; hover for full signal bounds.</p>
+    <svg id="timeline" viewBox="0 0 900 500" role="img" aria-label="Interference power over time"></svg>
+    <h2>Current band status</h2>
+    <div id="bands" class="bands"></div>
+    <div id="spectrum-plots" class="spectrum-plots" aria-label="GNSS signal frequency overlays"></div>
+
+    <h2>Recent status changes</h2>
+    <ul id="it-log"></ul>
+  </section>
+
+  <!-- Health --------------------------------------------------------------->
+  <section id="tab-health" class="panel">
+    <h2>RXSTATUS</h2>
+    <div class="summary">
+      <div class="card"><span class="label">Error word</span><span id="rx-error" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Receiver status word</span><span id="rx-status" class="value">&mdash;</span></div>
+    </div>
+    <h2>Active flags</h2>
+    <ul id="rx-flags" class="flags"><li class="muted">Nothing reported.</li></ul>
+    <h2>VERSION components</h2>
+    <table id="version">
+      <thead><tr><th>Type</th><th>Model</th><th>Serial</th><th>HW</th><th>SW</th><th>Boot</th><th>Compiled</th></tr></thead>
+      <tbody><tr class="empty"><td colspan="7">No VERSION log received yet.</td></tr></tbody>
+    </table>
+  </section>
+
+  <!-- Raw ------------------------------------------------------------------>
+  <section id="tab-raw" class="panel">
+    <h2>
+      Raw stream
+      <select id="raw-filter"><option value="">All logs</option></select>
+      <button id="pause">Pause</button>
+      <button id="clear">Clear</button>
+    </h2>
+    <ul id="raw-log"></ul>
+  </section>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+          integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH"
+          crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
