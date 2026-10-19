@@ -17,6 +17,13 @@
     </div>
     <div class="header-right">
       <label class="history-control">
+        Time zone
+        <select id="time-zone">
+          <option value="Asia/Dubai">United Arab Emirates (UTC+04:00)</option>
+          <option value="UTC">UTC</option>
+        </select>
+      </label>
+      <label class="history-control">
         History
         <select id="history-window">
           <option value="5">5 min</option>
@@ -230,7 +237,7 @@
       <button id="timeline-live" type="button">Reset / Live</button>
       <span id="timeline-mode" role="status">Live</span>
     </div>
-    <p class="plot-help">Drag any plot to pan; scroll to zoom around the pointer. All plots share the same time window (UTC).
+    <p class="plot-help">Drag any plot to pan; scroll to zoom around the pointer. All plots share the same time window and selected time zone.
       Signal buttons toggle frequency overlays only; detected energy remains visible in red.
       Overlapping allocations use alternating colour stripes; hover for full signal bounds.</p>
     <svg id="timeline" viewBox="0 0 900 500" role="img" aria-label="Interference power over time"></svg>

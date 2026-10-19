@@ -11,6 +11,7 @@ const state = {
   satvis: {},
   hiddenSystems: new Set(JSON.parse(localStorage.getItem('hiddenSystems') || '[]')),
   hiddenSignals: new Set(JSON.parse(localStorage.getItem('hiddenSignals') || '[]')),
+  timeZone: localStorage.getItem('timeZone') || 'Asia/Dubai',
   itSeen: 0,
   paused: false,
   filter: '',
@@ -701,7 +702,7 @@ function renderTimeline() {
         y: y + rowHeight - 20, width: 3, height: 12,
         fill: hit ? powerColour(sample.maxPower) : 'rgba(61,220,132,.35)',
       });
-      const description = `${band}, ${new Date(sample.t).toISOString()}: `
+      const description = `${band}, ${formatTimestamp(sample.t, true)}: `
         + (!hit ? 'Clear (no measured power)' : Number.isFinite(sample.maxPower) ? `${sample.maxPower} dBm` : 'Power unknown');
       status.append(svg('title', {}, description));
       chart.append(status);
@@ -734,12 +735,9 @@ function renderTimeline() {
     chart.append(svg('text', {
       x, y: TIMELINE.height - 20, class: 'tl-axis', style: `text-anchor:${anchor}`,
     }, utcLabel(start + (i / 4) * windowMs)));
-    chart.append(svg('text', {
-      x, y: TIMELINE.height - 7, class: 'tl-axis-utc', style: `text-anchor:${anchor}`,
-    }, 'UTC'));
   }
 
-  chart.append(svg('text', { x: TIMELINE.left - 8, y: TIMELINE.height - 7, class: 'tl-label' }, 'UTC'));
+  chart.append(svg('text', { x: TIMELINE.left, y: TIMELINE.height - 5, class: 'tl-title' }, state.timeZone));
 }
 
 const SPECTRUM_PLOTS = [
@@ -845,7 +843,7 @@ function renderSpectrumPlots(start, end, windowMs) {
         buttons.set(label, button);
         key.append(button);
       }
-      const svgChart = svg('svg', { role: 'img', 'aria-label': `${plot.id} frequency (MHz) over time (UTC)` });
+      const svgChart = svg('svg', { role: 'img' });
       initTimePlotNavigation(svgChart);
       section.append(heading, key, svgChart);
       container.append(section);
@@ -853,6 +851,7 @@ function renderSpectrumPlots(start, end, windowMs) {
       spectrumCharts.set(plot.id, elements);
     }
     const { svgChart, hitSummary, buttons } = elements;
+    svgChart.setAttribute('aria-label', `${plot.id} frequency (MHz) over time (${state.timeZone})`);
     svgChart.setAttribute('viewBox', `0 0 ${availableWidth} ${height}`);
     svgChart.replaceChildren();
     for (const [label, button] of buttons) {
@@ -941,7 +940,7 @@ function renderSpectrumPlots(start, end, windowMs) {
       const title = svg('title', {}, `${sample.signal}: ${centerMHz.toFixed(3)} MHz`
         + (Number.isFinite(detection.bandwidth) ? `, ${(detection.bandwidth / 1e6).toFixed(3)} MHz bandwidth` : '')
         + (Number.isFinite(detection.power) ? `, ${detection.power.toFixed(1)} dBm` : '')
-        + `, ${new Date(sample.t).toISOString()}`);
+        + `, ${formatTimestamp(sample.t, true)}`);
       marker.append(title);
       svgChart.append(marker);
     }
@@ -967,12 +966,15 @@ function renderSpectrumPlots(start, end, windowMs) {
 }
 
 function utcLabel(timestamp, windowMs = timelineViewport().windowMs) {
-  const date = new Date(timestamp);
-  const hh = String(date.getUTCHours()).padStart(2, '0');
-  const mm = String(date.getUTCMinutes()).padStart(2, '0');
-  // Seconds only matter on the short windows.
-  if (windowMs > 3600000) return `${hh}:${mm}`;
-  return `${hh}:${mm}:${String(date.getUTCSeconds()).padStart(2, '0')}`;
+  return timelineTimeLabel(timestamp, windowMs);
+}
+
+function timelineTimeLabel(timestamp, windowMs) {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: state.timeZone, hour: '2-digit', minute: '2-digit',
+    ...(windowMs < 3600000 ? { second: '2-digit' } : {}),
+    hourCycle: 'h23',
+  }).format(new Date(timestamp));
 }
 
 function powerColour(powerDbm) {
@@ -2076,6 +2078,7 @@ function appendItRow(record) {
 
   const time = document.createElement('span');
   time.className = 'time';
+  time.dataset.timestamp = (record.header && record.header.utc) || record.receivedAt || '';
   time.textContent = formatTime(record);
 
   const content = document.createElement('div');
@@ -2118,7 +2121,8 @@ function appendRawRow(record) {
 
   const time = document.createElement('span');
   time.className = 'time';
-  time.textContent = new Date(record.receivedAt).toLocaleTimeString([], { hour12: false });
+  time.dataset.timestamp = record.receivedAt || '';
+  time.textContent = formatTimestamp(record.receivedAt);
 
   const tag = document.createElement('span');
   tag.className = `tag ${record.format}`;
@@ -2184,11 +2188,42 @@ function formatFrequency(hz) {
 
 function formatTime(record) {
   const iso = (record.header && record.header.utc) || record.receivedAt;
-  if (!iso) return '—';
-  return new Date(iso).toLocaleTimeString([], {
-    hour12: false,
-    timeZone: record.header && record.header.utc ? 'UTC' : undefined,
-  }) + (record.header && record.header.utc ? ' UTC' : '');
+  return formatTimestamp(iso);
+}
+
+function formatTimestamp(timestamp, detailed = false) {
+  if (timestamp === null || timestamp === undefined || timestamp === '') return '—';
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return '—';
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: state.timeZone, hourCycle: 'h23',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'shortOffset',
+    ...(detailed ? { year: 'numeric', month: '2-digit', day: '2-digit', fractionalSecondDigits: 3 } : {}),
+  }).format(date);
+}
+
+function initTimeZone() {
+  const select = $('time-zone');
+  const zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
+  for (const zone of new Set([...zones, state.timeZone])) {
+    if ([...select.options].some((option) => option.value === zone)) continue;
+    const option = document.createElement('option');
+    option.value = zone;
+    option.textContent = zone.replace(/_/g, ' ');
+    select.append(option);
+  }
+  select.value = state.timeZone;
+  select.addEventListener('change', () => {
+    state.timeZone = select.value;
+    localStorage.setItem('timeZone', state.timeZone);
+    for (const element of document.querySelectorAll('[data-timestamp]')) {
+      element.textContent = formatTimestamp(element.dataset.timestamp);
+    }
+    if (latestByName.ITDETECTSTATUS) renderItDetect(latestByName.ITDETECTSTATUS);
+    renderCounts();
+    renderEphemeris();
+    renderTimeline();
+  });
 }
 
 // Refresh elapsed-time labels for historical detections.
@@ -2202,5 +2237,6 @@ setInterval(() => {
 window.addEventListener('resize', renderTimeline);
 
 syncHeightToggle();
+initTimeZone();
 initTimelineControls();
 loadHistory();

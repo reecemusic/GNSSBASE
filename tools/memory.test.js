@@ -404,6 +404,7 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
     document: { createElement: () => element(), createTextNode: (text) => ({ textContent: text }) },
     svg: (tag, attributes = {}, text) => Object.assign(element(), { tag, attributes, textContent: text || '' }),
     utcLabel: (timestamp) => `t${timestamp}`,
+    formatTimestamp: (timestamp) => `t${timestamp}`,
     initTimePlotNavigation() {},
     localStorage: { setItem: (key, value) => { saved[key] = value; } },
     renderTimeline() { renders++; context.renderSpectrumPlots(1000000, now, 60000); },
@@ -582,6 +583,7 @@ test('power chart plots measured power only, preserves gaps and shares its exact
     classifyBand: (signal) => signal,
     renderSpectrumPlots(...view) { spectrumView = view; },
     utcLabel: (time) => `t${time}`,
+    formatTimestamp: (time) => `t${time}`,
   });
   loadFunctions(browserCode, 'const TIMELINE =', 'const SPECTRUM_PLOTS =', context);
   loadFunctions(browserCode, 'function powerColour(', 'function formatWindow(', context);

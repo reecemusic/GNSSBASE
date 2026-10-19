@@ -76,7 +76,7 @@ The GNSS frequency overlays below the band cards use the same visible time
 window and time axis as **Power over time**, including its pan and zoom. Drag
 **any** plot to pan, or scroll over it to zoom around the pointer. The shared
 **Earlier / Later**, **Zoom in / Zoom out** and **Reset / Live** buttons work
-for all four plots. All plot labels and hover times in this version use UTC.
+for all four plots. All plot labels and hover times use the selected time zone.
 The vertical axis is frequency in MHz. Each signal has its own high-contrast
 colour within its group and a matching, keyboard-accessible toggle button.
 Signal visibility is remembered per browser. Overlapping allocations are split
@@ -96,9 +96,16 @@ Drag the power plot or use **Earlier / Later** to pan. Use **Zoom in / Zoom out*
 or the mouse wheel to zoom (down to a 10-second window). Navigation is bounded by
 the selected History window. Panning or zooming holds a historical view; **Reset /
 Live** restores the full window and follows incoming reports. Hover a power or
-status marker to inspect its band, UTC timestamp and reported power. Clear and
+status marker to inspect its band, timestamp and reported power. Clear and
 unknown-power reports are identified without inventing a power value. Stored
 timestamps and receiver data are unchanged.
+
+The header's **Time zone** selector defaults to **United Arab Emirates
+(Asia/Dubai, UTC+04:00)**. Choose UTC or another named time zone; the choice is
+remembered per browser and immediately updates chart labels, hover details,
+recent status changes, raw stream times and other displayed log timestamps.
+Hover details include the date, milliseconds and UTC offset; daylight-saving
+changes are handled according to the selected zone.
 
 **Current band status** sits directly below **Power over time**. Cards for
 **L1 / E1 / B1 / G1**, **L2 / G2**, **L5 / E5 / B2**, **L6 / E6 / B3**,
