@@ -163,11 +163,18 @@ function readJsonBody(req, res, callback) {
   });
   req.on('end', () => {
     if (res.writableEnded) return;
+    let data;
     try {
-      callback(JSON.parse(body));
+      data = JSON.parse(body);
     } catch {
       res.writeHead(400).end('Invalid JSON');
+      return;
     }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+      res.writeHead(400).end('Expected a JSON object');
+      return;
+    }
+    callback(data);
   });
 }
 
@@ -239,6 +246,11 @@ const server = http.createServer((req, res) => {
   }
 
   if (route === '/events') {
+    res.on('error', (error) => {
+      console.warn(`[stream] client error: ${error.message}`);
+      clients.delete(res);
+      res.destroy();
+    });
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
@@ -248,7 +260,14 @@ const server = http.createServer((req, res) => {
     res.write(`event: snapshot\ndata: ${JSON.stringify(snapshot())}\n\n`);
     clients.add(res);
 
-    const keepAlive = setInterval(() => res.write(': ping\n\n'), 15000);
+    const keepAlive = setInterval(() => {
+      if (res.destroyed || res.writableLength > 256 * 1024) {
+        clients.delete(res);
+        res.destroy();
+      } else {
+        res.write(': ping\n\n');
+      }
+    }, 15000);
     req.on('close', () => {
       clearInterval(keepAlive);
       clients.delete(res);
@@ -263,12 +282,16 @@ const server = http.createServer((req, res) => {
   }
 
   if (route === '/api/history') {
-    const requested = Number(new URL(req.url, 'http://localhost').searchParams.get('minutes'));
+    const parameters = new URL(req.url, 'http://localhost').searchParams;
+    const requested = Number(parameters.get('minutes'));
+    const requestedLimit = Number(parameters.get('limit'));
+    const limit = Number.isInteger(requestedLimit) && requestedLimit > 0
+      ? Math.min(requestedLimit, config.maxInterferenceSamples) : config.maxInterferenceSamples;
     const minutes = Number.isFinite(requested) && requested > 0
       ? Math.min(requested, config.historyRetentionMinutes)
       : config.historyRetentionMinutes;
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(history.since(minutes * 60000)));
+    res.end(JSON.stringify(history.since(minutes * 60000, Date.now(), limit)));
     return;
   }
 

@@ -59,15 +59,22 @@ class History {
   prune(now = Date.now()) {
     const cutoff = now - this.retentionMs;
     for (const [key, samples] of this.tracks) {
-      const kept = samples.filter((s) => s.t >= cutoff);
+      if (!Array.isArray(samples)) {
+        console.warn(`[history] discarding malformed track ${key}`);
+        this.tracks.delete(key);
+        continue;
+      }
+      const kept = samples.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff
+        && isValidSkyPosition(s.el, s.az));
       if (kept.length) this.tracks.set(key, kept);
       else this.tracks.delete(key);
     }
-    this.interference = this.interference.filter((s) => s.t >= cutoff);
+    this.interference = this.interference.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff)
+      .slice(-this.maxInterferenceSamples);
   }
 
   /** History no older than `windowMs`, capped by the configured retention. */
-  since(windowMs, now = Date.now()) {
+  since(windowMs, now = Date.now(), limit = this.maxInterferenceSamples) {
     const cutoff = now - Math.min(windowMs, this.retentionMs);
     const tracks = {};
     for (const [key, samples] of this.tracks) {
@@ -77,7 +84,7 @@ class History {
     return {
       retentionMinutes: Math.round(this.retentionMs / 60000),
       tracks,
-      interference: this.interference.filter((s) => s.t >= cutoff),
+      interference: this.interference.filter((s) => s.t >= cutoff).slice(-limit),
     };
   }
 
@@ -104,8 +111,9 @@ class History {
   load() {
     if (!this.filePath || !fs.existsSync(this.filePath)) return;
     try {
+      if (fs.statSync(this.filePath).size > 64 * 1024 * 1024) throw new Error('History file exceeds the 64 MiB load limit');
       const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-      if (parsed.version !== 1) return;
+      if (parsed.version !== 1) throw new Error('Unsupported history file version');
       this.tracks = parsed.satvisFieldLayout === 2
         ? new Map(Object.entries(parsed.tracks || {}))
         : new Map();

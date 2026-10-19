@@ -44,6 +44,7 @@ const LEAP_SECONDS = 18;
 function gpsToUtc(week, seconds) {
   if (!Number.isFinite(week) || !Number.isFinite(seconds)) return null;
   const ms = GPS_EPOCH_MS + week * 604800000 + (seconds - LEAP_SECONDS) * 1000;
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8640000000000000) return null;
   return new Date(ms).toISOString();
 }
 

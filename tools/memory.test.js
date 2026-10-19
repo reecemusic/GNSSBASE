@@ -49,6 +49,7 @@ function historyContext() {
     Date,
     MAX_INTERFERENCE_SAMPLES: 10000,
     MAX_TRACK_SAMPLES: 1081,
+    MAX_TRACKS: 512,
     state: { windowMinutes: 60, interferenceHistory: [], tracks: {} },
     isValidSkyPosition: () => true,
   });
@@ -90,7 +91,8 @@ test('rendering coalesces input, bounds queues and skips inactive panels', () =>
   const context = vm.createContext({
     document: { hidden: false, querySelector: () => ({ dataset: { tab } }) },
     state: { satvis: {} }, latestByName: {}, dirtyRecords: new Set(),
-    countsDirty: false, ephemerisDirty: false, pendingRaw: [], pendingInterference: [],
+    countsDirty: false, ephemerisDirty: false, timelineDirty: false, pendingRaw: [], pendingInterference: [],
+    renderSafely: (label, render) => render(),
   });
   for (const name of ['renderCounts', 'renderBestPos', 'renderBestGnssPos', 'renderSkyplot',
     'renderRange', 'renderRxStatus', 'renderVersion', 'renderEphemeris', 'renderItDetect',
@@ -343,7 +345,7 @@ test('selected time zone formats UAE rollover, UTC and daylight saving consisten
 });
 
 test('time zone selector defaults to UAE and persists changes', () => {
-  assert.match(browserCode, /timeZone: localStorage.getItem\('timeZone'\) \|\| 'Asia\/Dubai'/);
+  assert.match(browserCode, /timeZone: readPreference\('timeZone', 'Asia\/Dubai'/);
   const select = {
     options: [{ value: 'Asia/Dubai' }, { value: 'UTC' }],
     append(option) { this.options.push(option); },
@@ -354,10 +356,11 @@ test('time zone selector defaults to UAE and persists changes', () => {
   const context = vm.createContext({
     state: { timeZone: 'Asia/Dubai' }, latestByName: {},
     $: () => select, localStorage: { setItem: (key, value) => { saved[key] = value; } },
+    writePreference: (key, value) => { saved[key] = value; },
     document: { createElement: () => ({}), querySelectorAll: () => [row] },
     renderCounts() {}, renderEphemeris() {}, renderTimeline() {},
   });
-  loadFunctions(browserCode, 'function formatTimestamp(', '// Refresh elapsed-time', context);
+  loadFunctions(browserCode, 'function formatTimestamp(', 'setInterval(() => flushUpdates()', context);
   context.initTimeZone();
   assert.equal(select.value, 'Asia/Dubai');
   select.value = 'UTC';
@@ -407,6 +410,7 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
     formatTimestamp: (timestamp) => `t${timestamp}`,
     initTimePlotNavigation() {},
     localStorage: { setItem: (key, value) => { saved[key] = value; } },
+    writePreference: (key, value) => { saved[key] = value; },
     renderTimeline() { renders++; context.renderSpectrumPlots(1000000, now, 60000); },
   });
   loadFunctions(browserCode, 'const SPECTRUM_PLOTS =', 'function utcLabel(', context);

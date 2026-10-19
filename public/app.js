@@ -3,20 +3,89 @@
 const $ = (id) => document.getElementById(id);
 const MAX_RAW_ROWS = 300;
 const MAX_IT_ROWS = 50;
+const MAX_INTERFERENCE_SAMPLES = 10000;
+const MAX_TRACK_SAMPLES = 1081;
+const MAX_TRACKS = 512;
+const MAX_EVENT_CHARS = 8 * 1024 * 1024;
+const dirtyRecords = new Set();
+const pendingRaw = [];
+const pendingInterference = [];
+let countsDirty = false;
+let ephemerisDirty = false;
+let timelineDirty = false;
+let lastErrorNotice = '';
+
+function reportClientError(context, error) {
+  const message = `${context}: ${error instanceof Error ? error.message : String(error)}`;
+  const notice = $('client-error');
+  if (notice) {
+    notice.hidden = false;
+    notice.textContent = `${message}. Use Retry display to reload current data.`;
+  }
+  if (lastErrorNotice !== message) console.error(message, error);
+  lastErrorNotice = message;
+}
+
+function readPreference(key, fallback, parse = (value) => value) {
+  try {
+    const value = localStorage.getItem(key);
+    return value === null ? fallback : parse(value);
+  } catch (error) {
+    reportClientError(`Could not read preference ${key}`, error);
+    return fallback;
+  }
+}
+
+function writePreference(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch (error) {
+    reportClientError(`Could not save preference ${key}`, error);
+  }
+}
+
+async function request(url, options = {}, json = false) {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  options.signal?.addEventListener('abort', abort, { once: true });
+  if (options.signal?.aborted) controller.abort();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    if (!response.ok) throw new Error(`Request failed (${response.status}) for ${url}`);
+    return json ? await response.json() : response;
+  } finally {
+    clearTimeout(timeout);
+    options.signal?.removeEventListener('abort', abort);
+  }
+}
+
+function readHiddenPreference(key) {
+  return new Set(readPreference(key, [], (value) => {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed) || parsed.length > 512 || parsed.some((item) => typeof item !== 'string')) {
+      throw new Error('Expected a list of names');
+    }
+    return parsed;
+  }));
+}
 
 const state = {
   counts: {},
   ephemeris: {},
   itBySignal: {},
   satvis: {},
-  hiddenSystems: new Set(JSON.parse(localStorage.getItem('hiddenSystems') || '[]')),
-  hiddenSignals: new Set(JSON.parse(localStorage.getItem('hiddenSignals') || '[]')),
-  timeZone: localStorage.getItem('timeZone') || 'Asia/Dubai',
+  hiddenSystems: readHiddenPreference('hiddenSystems'),
+  hiddenSignals: readHiddenPreference('hiddenSignals'),
+  timeZone: readPreference('timeZone', 'Asia/Dubai', (zone) => {
+    new Intl.DateTimeFormat('en-GB', { timeZone: zone });
+    return zone;
+  }),
   itSeen: 0,
   paused: false,
   filter: '',
-  heightDatum: localStorage.getItem('heightDatum') === 'ellipsoidal' ? 'ellipsoidal' : 'msl',
-  ephemerisConstellation: localStorage.getItem('ephemerisConstellation') || '',
+  heightDatum: readPreference('heightDatum', 'msl') === 'ellipsoidal' ? 'ellipsoidal' : 'msl',
+  ephemerisConstellation: readPreference('ephemerisConstellation', ''),
 };
 
 // --- tabs -------------------------------------------------------------------
@@ -29,7 +98,7 @@ document.querySelectorAll('.tab').forEach((tab) => {
     $(`tab-${tab.dataset.tab}`).classList.add('active');
     // Leaflet mis-sizes tiles when the container was display:none at creation.
     if (tab.dataset.tab === 'position' && map) map.invalidateSize();
-    if (tab.dataset.tab === 'interference') renderTimeline();
+    flushUpdates(true);
   });
 });
 
@@ -42,7 +111,7 @@ $('height-toggle').addEventListener('click', (event) => {
   const button = event.target.closest('button[data-datum]');
   if (!button) return;
   state.heightDatum = button.dataset.datum;
-  localStorage.setItem('heightDatum', state.heightDatum);
+  writePreference('heightDatum', state.heightDatum);
   syncHeightToggle();
   if (latestByName.BESTPOS) renderBestPos(latestByName.BESTPOS);
   if (latestByName.BESTGNSSPOS) renderBestGnssPos(latestByName.BESTGNSSPOS);
@@ -84,7 +153,7 @@ $('disconnect').addEventListener('click', async () => {
   button.disabled = true;
   message.textContent = 'Disconnecting...';
   try {
-    const response = await fetch('/api/disconnect', { method: 'POST' });
+    const response = await request('/api/disconnect', { method: 'POST' });
     if (!response.ok) throw new Error(await response.text());
     message.textContent = 'Disconnected; connection closed';
   } catch (error) {
@@ -114,7 +183,7 @@ connectionForm.addEventListener('submit', async (event) => {
   button.disabled = true;
   message.textContent = 'Applying connection settings...';
   try {
-    const response = await fetch('/api/connection', {
+    const response = await request('/api/connection', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(settings),
@@ -137,9 +206,7 @@ function updateConnectionFields() {
 async function refreshSerialPorts(selectedPath = serialPathSelect.value) {
   const message = $('connection-message');
   try {
-    const response = await fetch('/api/serial-ports');
-    if (!response.ok) throw new Error('Could not list serial ports');
-    const ports = await response.json();
+    const ports = await request('/api/serial-ports', {}, true);
     serialPathSelect.replaceChildren();
     for (const port of ports) {
       const option = document.createElement('option');
@@ -162,9 +229,7 @@ async function refreshSerialPorts(selectedPath = serialPathSelect.value) {
 
 async function loadConnectionSettings() {
   try {
-    const response = await fetch('/api/connection');
-    if (!response.ok) throw new Error('Could not load connection settings');
-    const settings = await response.json();
+    const settings = await request('/api/connection', {}, true);
     connectionTransport.value = settings.transport;
     $('receiver-host').value = settings.receiverHost;
     $('receiver-port').value = settings.receiverPort;
@@ -180,12 +245,32 @@ loadConnectionSettings();
 
 // --- stream -----------------------------------------------------------------
 
-const source = new EventSource('/events');
+let source = null;
 
-source.addEventListener('status', (event) => renderStatus(JSON.parse(event.data)));
+function handleStreamEvent(context, event, handler) {
+  try {
+    if (event.data.length > MAX_EVENT_CHARS) throw new Error('Live event exceeds the display size limit');
+    const data = JSON.parse(event.data);
+    if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('Expected a data object');
+    handler(data);
+  } catch (error) {
+    reportClientError(context, error);
+  }
+}
 
-source.addEventListener('snapshot', (event) => {
-  const snap = JSON.parse(event.data);
+function connectStream() {
+  if (source || document.hidden) return;
+  source = new EventSource('/events');
+  source.addEventListener('status', (event) => handleStreamEvent('Receiver status', event, renderStatus));
+  source.addEventListener('snapshot', (event) => handleStreamEvent('Loading live snapshot', event, applySnapshot));
+  source.addEventListener('message', (event) => handleStreamEvent('Reading live report', event, applyPayload));
+  source.addEventListener('error', () => {
+    $('status').className = 'status disconnected';
+    $('status-text').textContent = 'Lost connection to local server — retrying...';
+  });
+}
+
+function applySnapshot(snap) {
   if (snap.status) renderStatus(snap.status);
   state.counts = snap.counts || {};
   state.ephemeris = snap.ephemeris || {};
@@ -193,37 +278,98 @@ source.addEventListener('snapshot', (event) => {
   state.satvis = snap.satvisBySystem || {};
   state.itSeen = state.counts.ITDETECTSTATUS || 0;
 
+  pendingRaw.length = 0;
+  pendingInterference.length = 0;
   Object.values(snap.latest || {}).forEach(applyRecord);
   $('it-log').replaceChildren();
   lastItReportHadDetections = false;
-  (snap.itdetectHistory || []).forEach(appendItRow);
-  (snap.rawLog || []).forEach(appendRawRow);
-  renderCounts();
-  renderEphemeris();
-  renderBands();
-  renderSkyplot();
-});
+  (snap.itdetectHistory || []).slice(-MAX_IT_ROWS).forEach((record) => queueRecord(pendingInterference, record, MAX_IT_ROWS));
+  $('raw-log').replaceChildren();
+  (snap.rawLog || []).slice(-MAX_RAW_ROWS).forEach((record) => queueRecord(pendingRaw, record, MAX_RAW_ROWS));
+  countsDirty = ephemerisDirty = timelineDirty = true;
+}
 
-source.addEventListener('message', (event) => {
-  const payload = JSON.parse(event.data);
+function applyPayload(payload) {
+  validateRecord(payload.record);
   state.counts = payload.counts;
   if (payload.ephemeris) state.ephemeris = payload.ephemeris;
   recordLiveHistory(payload.record);
   applyRecord(payload.record);
   if (payload.record.name === 'ITDETECTSTATUS') {
     state.itSeen = state.counts.ITDETECTSTATUS || 0;
-    appendItRow(payload.record);
-    renderTimeline();
+    queueRecord(pendingInterference, payload.record, MAX_IT_ROWS);
+    timelineDirty = true;
   }
-  appendRawRow(payload.record);
-  renderCounts();
-  renderEphemeris();
-});
+  if (!state.paused) queueRecord(pendingRaw, rawDisplayRecord(payload.record), MAX_RAW_ROWS);
+  countsDirty = true;
+  if (payload.ephemeris) ephemerisDirty = true;
+}
 
-source.addEventListener('error', () => {
-  $('status').className = 'status disconnected';
-  $('status-text').textContent = 'Lost connection to local server — retrying...';
-});
+function queueRecord(queue, record, limit) {
+  queue.push(record);
+  if (queue.length > limit) queue.splice(0, queue.length - limit);
+}
+
+function rawDisplayRecord(record) {
+  const text = String(record.raw ?? '');
+  return {
+    name: record.name, format: record.format, crcValid: record.crcValid, receivedAt: record.receivedAt,
+    raw: text.length > 16384 ? `${text.slice(0, 16384)} [display truncated]` : text,
+  };
+}
+
+function renderSafely(label, render) {
+  try {
+    render();
+  } catch (error) {
+    reportClientError(label, error);
+  }
+}
+
+function flushUpdates(force = false) {
+  if (document.hidden) return;
+  const tab = document.querySelector('.tab.active')?.dataset.tab;
+  const renderers = {
+    overview: () => { if (force || countsDirty) renderCounts(); },
+    position: () => {
+      if (latestByName.BESTPOS) renderBestPos(latestByName.BESTPOS);
+      if (latestByName.BESTGNSSPOS) renderBestGnssPos(latestByName.BESTGNSSPOS);
+    },
+    satellites: () => {
+      renderSkyplot();
+      if (latestByName.RANGE) renderRange(latestByName.RANGE);
+    },
+    ephemeris: () => { if (force || ephemerisDirty) renderEphemeris(); },
+    interference: () => {
+      if (latestByName.ITDETECTSTATUS) renderItDetect(latestByName.ITDETECTSTATUS);
+      for (const record of pendingInterference.splice(0)) renderSafely('Rendering interference report', () => appendItRow(record));
+      if (force || timelineDirty) renderTimeline();
+    },
+    health: () => {
+      if (latestByName.RXSTATUS) renderRxStatus(latestByName.RXSTATUS);
+      if (latestByName.VERSION) renderVersion(latestByName.VERSION);
+    },
+    raw: () => {
+      for (const record of pendingRaw.splice(0)) renderSafely('Rendering raw report', () => appendRawRow(record));
+    },
+  };
+  const relevant = {
+    overview: countsDirty,
+    position: dirtyRecords.has('BESTPOS') || dirtyRecords.has('BESTGNSSPOS'),
+    satellites: ['RANGE', 'SATVIS2', 'BESTSATS'].some((name) => dirtyRecords.has(name)),
+    ephemeris: ephemerisDirty,
+    interference: timelineDirty || dirtyRecords.has('ITDETECTSTATUS') || pendingInterference.length,
+    health: dirtyRecords.has('RXSTATUS') || dirtyRecords.has('VERSION'),
+    raw: pendingRaw.length,
+  };
+  if (force || relevant[tab]) {
+    if (renderers[tab]) renderSafely(`Rendering ${tab}`, renderers[tab]);
+  }
+  if (tab === 'overview') countsDirty = false;
+  if (tab === 'ephemeris') ephemerisDirty = false;
+  if (tab === 'interference') timelineDirty = false;
+  dirtyRecords.clear();
+}
 
 function renderStatus(status) {
   $('status').className = `status ${status.connected ? 'connected' : 'disconnected'}`;
@@ -236,19 +382,31 @@ function renderStatus(status) {
 }
 
 function applyRecord(record) {
+  validateRecord(record);
   latestByName[record.name] = record;
-  switch (record.name) {
-    case 'BESTPOS': renderBestPos(record); break;
-    case 'BESTGNSSPOS': renderBestGnssPos(record); break;
-    case 'RANGE': renderRange(record); break;
-    case 'SATVIS2': renderSatVis(record); break;
-    case 'BESTSATS': renderSkyplot(); break;
-    case 'RXSTATUS': renderRxStatus(record); break;
-    case 'VERSION': renderVersion(record); break;
-    case 'ITDETECTSTATUS': renderItDetect(record); break;
-    default: break;
-  }
+  dirtyRecords.add(record.name);
+  if (record.name === 'SATVIS2' && record.data) state.satvis[record.data.system] = record;
+  if (record.name === 'VERSION') renderVersionSummary(record);
   registerFilterOption(record.name);
+}
+
+function validateRecord(record) {
+  if (!record || typeof record.name !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(record.name)) {
+    throw new Error('Report has an invalid message name');
+  }
+  if (record.data !== undefined && record.data !== null && (typeof record.data !== 'object' || Array.isArray(record.data))) {
+    throw new Error(`${record.name} has invalid report data`);
+  }
+  if (Object.keys(latestByName).length >= 256 && !Object.hasOwn(latestByName, record.name)) {
+    throw new Error('Too many distinct message types');
+  }
+  for (const key of ['detections', 'satellites', 'observations', 'components']) {
+    const values = record.data?.[key];
+    if (values !== undefined && (!Array.isArray(values) || values.length > 2048
+      || values.some((value) => !value || typeof value !== 'object'))) {
+      throw new Error(`${record.name} has invalid or oversized ${key}`);
+    }
+  }
 }
 
 // --- renderers --------------------------------------------------------------
@@ -443,10 +601,14 @@ function svg(tag, attrs, text) {
 // --- history ----------------------------------------------------------------
 
 const HISTORY_WINDOW_KEY = 'historyWindowMinutes';
-state.windowMinutes = Number(localStorage.getItem(HISTORY_WINDOW_KEY)) || 60;
+state.windowMinutes = readPreference(HISTORY_WINDOW_KEY, 60, (value) => {
+  const minutes = Number(value);
+  if (![5, 15, 60, 360, 1440].includes(minutes)) throw new Error('Invalid history window');
+  return minutes;
+});
 state.tracks = {};
 state.interferenceHistory = [];
-state.showTraces = localStorage.getItem('showTraces') !== 'false';
+state.showTraces = readPreference('showTraces', 'true') !== 'false';
 
 $('history-window').value = String(state.windowMinutes);
 $('show-traces').checked = state.showTraces;
@@ -454,41 +616,49 @@ $('show-traces').checked = state.showTraces;
 $('history-window').addEventListener('change', (event) => {
   state.windowMinutes = Number(event.target.value);
   state.timelineView = null;
-  localStorage.setItem(HISTORY_WINDOW_KEY, String(state.windowMinutes));
+  writePreference(HISTORY_WINDOW_KEY, String(state.windowMinutes));
   loadHistory();
 });
 
 $('show-traces').addEventListener('change', (event) => {
   state.showTraces = event.target.checked;
-  localStorage.setItem('showTraces', String(state.showTraces));
+  writePreference('showTraces', String(state.showTraces));
   renderSkyplot();
 });
 
+let historyRequest = 0;
+let historyController = null;
 async function loadHistory() {
+  const generation = ++historyRequest;
+  historyController?.abort();
+  historyController = new AbortController();
   const requestedAt = Date.now();
   try {
-    const response = await fetch(`/api/history?minutes=${state.windowMinutes}`);
-    const data = await response.json();
-    state.tracks = data.tracks || {};
-    const savedInterference = data.interference || [];
-    const arrivedDuringRequest = state.interferenceHistory.filter((sample) => sample.t >= requestedAt);
-    state.interferenceHistory = [...savedInterference];
-    for (const sample of arrivedDuringRequest) {
-      const alreadySaved = state.interferenceHistory.some((saved) =>
-        saved.signal === sample.signal
-        && saved.count === sample.count
-        && saved.maxPower === sample.maxPower
-        && Math.abs(saved.t - sample.t) <= 250);
-      if (!alreadySaved) state.interferenceHistory.push(sample);
+    const data = await request(`/api/history?minutes=${state.windowMinutes}&limit=${MAX_INTERFERENCE_SAMPLES}`,
+      { signal: historyController.signal }, true);
+    if (generation !== historyRequest || document.hidden) return;
+    if (!data || !Array.isArray(data.interference) || !data.tracks || typeof data.tracks !== 'object') {
+      throw new Error('Invalid history response');
     }
+    if (data.interference.some((sample) => !sample || !Number.isFinite(sample.t)
+      || typeof sample.signal !== 'string' || !Number.isFinite(sample.count)
+      || (sample.detections !== undefined && (!Array.isArray(sample.detections) || sample.detections.length > 2048)))) {
+      throw new Error('Invalid history samples');
+    }
+    state.tracks = data.tracks || {};
+    const savedInterference = data.interference.slice(-MAX_INTERFERENCE_SAMPLES);
+    const arrivedDuringRequest = state.interferenceHistory.filter((sample) => sample.t >= requestedAt);
+    const keys = new Set(savedInterference.map((sample) => `${sample.t}:${sample.signal}:${sample.count}:${sample.maxPower}`));
+    state.interferenceHistory = [...savedInterference, ...arrivedDuringRequest.filter((sample) =>
+      !keys.has(`${sample.t}:${sample.signal}:${sample.count}:${sample.maxPower}`))];
     state.interferenceHistory.sort((a, b) => a.t - b.t);
+    pruneClientHistory();
     capHistoryWindow(data.retentionMinutes);
-  } catch {
-    state.tracks = {};
-    state.interferenceHistory = [];
+  } catch (error) {
+    if (generation === historyRequest) reportClientError('Could not load history (existing data retained)', error);
   }
-  renderSkyplot();
-  renderTimeline();
+  timelineDirty = true;
+  flushUpdates(true);
 }
 
 /** The server cannot serve more than it retains, so hide unusable options. */
@@ -502,10 +672,15 @@ function capHistoryWindow(retentionMinutes) {
 
 function pruneClientHistory() {
   const cutoff = Date.now() - state.windowMinutes * 60000;
-  state.interferenceHistory = state.interferenceHistory.filter((s) => s.t >= cutoff);
-  for (const [key, samples] of Object.entries(state.tracks)) {
-    const kept = samples.filter((s) => s.t >= cutoff);
-    if (kept.length > 1) state.tracks[key] = kept;
+  state.interferenceHistory = state.interferenceHistory.filter((s) => Number.isFinite(s.t) && s.t >= cutoff).slice(-MAX_INTERFERENCE_SAMPLES);
+  const tracks = Object.entries(state.tracks);
+  for (const [index, [key, samples]] of tracks.entries()) {
+    if (index >= MAX_TRACKS || !Array.isArray(samples)) {
+      delete state.tracks[key];
+      continue;
+    }
+    const kept = samples.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff).slice(-MAX_TRACK_SAMPLES);
+    if (kept.length) state.tracks[key] = kept;
     else delete state.tracks[key];
   }
 }
@@ -516,10 +691,14 @@ function recordLiveHistory(record) {
     for (const sat of record.data.satellites || []) {
       if (!isValidSkyPosition(sat.elevation, sat.azimuth)) continue;
       const key = `${record.data.system}:${sat.prn}`;
+      if (!Object.hasOwn(state.tracks, key) && Object.keys(state.tracks).length >= MAX_TRACKS) {
+        throw new Error('Too many satellite tracks');
+      }
       const samples = state.tracks[key] || (state.tracks[key] = []);
       const last = samples[samples.length - 1];
       if (last && now - last.t < 20000) continue;
       samples.push({ t: now, el: sat.elevation, az: sat.azimuth });
+      if (samples.length > MAX_TRACK_SAMPLES) samples.splice(0, samples.length - MAX_TRACK_SAMPLES);
     }
   }
   if (record.name === 'ITDETECTSTATUS' && record.data) {
@@ -549,7 +728,9 @@ function recordLiveHistory(record) {
       });
     }
   }
-  pruneClientHistory();
+  if (state.interferenceHistory.length > MAX_INTERFERENCE_SAMPLES) {
+    state.interferenceHistory.splice(0, state.interferenceHistory.length - MAX_INTERFERENCE_SAMPLES);
+  }
 }
 
 // --- interference timeline --------------------------------------------------
@@ -645,7 +826,7 @@ function renderTimeline() {
   const chart = $('timeline');
   chart.replaceChildren();
 
-  const width = Math.max(360, Math.round(chart.getBoundingClientRect().width) || TIMELINE.width);
+  const width = Math.min(1920, Math.max(360, Math.round(chart.getBoundingClientRect().width) || TIMELINE.width));
   chart.setAttribute('viewBox', `0 0 ${width} ${TIMELINE.height}`);
   const { start, end, windowMs } = timelineViewport();
   const bandIds = TIMELINE_BANDS;
@@ -663,7 +844,7 @@ function renderTimeline() {
     chart.append(svg('rect', {
       x: TIMELINE.left, y: y + 1, width: plotWidth, height: rowHeight - 2, class: 'tl-row',
     }));
-    chart.append(svg('text', { x: TIMELINE.left, y: y + 12, class: 'tl-title' }, `${bandId} Power (dBm)`));
+    chart.append(svg('text', { x: TIMELINE.left, y: y + 12, class: 'tl-title' }, `${bandId} · Power (dBm)`));
     for (const power of [-130, -110, -90, -70]) {
       const py = timelinePowerY(power, index, rowHeight);
       chart.append(svg('line', {
@@ -737,7 +918,8 @@ function renderTimeline() {
     }, utcLabel(start + (i / 4) * windowMs)));
   }
 
-  chart.append(svg('text', { x: TIMELINE.left, y: TIMELINE.height - 5, class: 'tl-title' }, state.timeZone));
+  chart.append(svg('text', { x: TIMELINE.left, y: TIMELINE.height - 5, class: 'tl-title' },
+    state.timeZone === 'Asia/Dubai' ? 'UAE' : state.timeZone));
 }
 
 const SPECTRUM_PLOTS = [
@@ -803,7 +985,7 @@ function spectrumAllocation([label, system, centerOrStart, widthOrEnd]) {
 function renderSpectrumPlots(start, end, windowMs) {
   const container = $('spectrum-plots');
   const historyHits = state.interferenceHistory.filter((sample) => sample.t >= start && sample.t <= end && sample.count > 0);
-  const availableWidth = Math.max(360, Math.round(container.getBoundingClientRect().width) || 900);
+  const availableWidth = Math.min(1920, Math.max(360, Math.round(container.getBoundingClientRect().width) || 900));
   const { left, right } = TIMELINE;
 
   for (const plot of SPECTRUM_PLOTS) {
@@ -837,7 +1019,7 @@ function renderSpectrumPlots(start, end, windowMs) {
         button.addEventListener('click', () => {
           if (state.hiddenSignals.has(label)) state.hiddenSignals.delete(label);
           else state.hiddenSignals.add(label);
-          localStorage.setItem('hiddenSignals', JSON.stringify([...state.hiddenSignals]));
+          writePreference('hiddenSignals', JSON.stringify([...state.hiddenSignals]));
           renderTimeline();
         });
         buttons.set(label, button);
@@ -970,7 +1152,7 @@ function utcLabel(timestamp, windowMs = timelineViewport().windowMs) {
 }
 
 function timelineTimeLabel(timestamp, windowMs) {
-  return new Intl.DateTimeFormat('en-GB', {
+  return dateFormatter({
     timeZone: state.timeZone, hour: '2-digit', minute: '2-digit',
     ...(windowMs < 3600000 ? { second: '2-digit' } : {}),
     hourCycle: 'h23',
@@ -1229,13 +1411,13 @@ function renderSkyLegend(perSystem) {
 function toggleSystem(system) {
   if (state.hiddenSystems.has(system)) state.hiddenSystems.delete(system);
   else state.hiddenSystems.add(system);
-  localStorage.setItem('hiddenSystems', JSON.stringify([...state.hiddenSystems]));
+  writePreference('hiddenSystems', JSON.stringify([...state.hiddenSystems]));
   renderSkyplot();
 }
 
 $('sky-all').addEventListener('click', () => {
   state.hiddenSystems.clear();
-  localStorage.setItem('hiddenSystems', '[]');
+  writePreference('hiddenSystems', '[]');
   renderSkyplot();
 });
 
@@ -1389,7 +1571,11 @@ function renderVersion(record) {
     cell(row, c.bootVersion);
     cell(row, c.compileDate);
   }
-  const main = d.components[0];
+  renderVersionSummary(record);
+}
+
+function renderVersionSummary(record) {
+  const main = record.data?.components?.[0];
   if (main) $('version-line').textContent = `${main.model} · SW ${main.softwareVersion} · S/N ${main.serialNumber}`;
 }
 
@@ -1713,7 +1899,7 @@ function renderEphemeris() {
 
   if (!sortedGroups.some(([constellation]) => constellation === state.ephemerisConstellation)) {
     state.ephemerisConstellation = sortedGroups[0][0];
-    localStorage.setItem('ephemerisConstellation', state.ephemerisConstellation);
+    writePreference('ephemerisConstellation', state.ephemerisConstellation);
   }
 
   container.append(buildEphemerisSubTabs(sortedGroups));
@@ -1747,7 +1933,7 @@ function buildEphemerisSubTabs(groups) {
     button.textContent = `${constellation} (${satelliteCount})`;
     button.addEventListener('click', () => {
       state.ephemerisConstellation = constellation;
-      localStorage.setItem('ephemerisConstellation', constellation);
+      writePreference('ephemerisConstellation', constellation);
       renderEphemeris();
     });
     nav.append(button);
@@ -2129,7 +2315,8 @@ function appendRawRow(record) {
   tag.textContent = record.name;
 
   const raw = document.createElement('pre');
-  raw.textContent = record.raw;
+  const rawText = String(record.raw ?? '');
+  raw.textContent = rawText.length > 16384 ? `${rawText.slice(0, 16384)} [display truncated]` : rawText;
 
   item.append(time, tag, raw);
   $('raw-log').prepend(item);
@@ -2145,6 +2332,7 @@ function applyRawFilter() {
 function registerFilterOption(name) {
   const select = $('raw-filter');
   if ([...select.options].some((o) => o.value === name)) return;
+  if (select.options.length >= 257) throw new Error('Too many raw log filter options');
   const option = document.createElement('option');
   option.value = name;
   option.textContent = name;
@@ -2195,11 +2383,22 @@ function formatTimestamp(timestamp, detailed = false) {
   if (timestamp === null || timestamp === undefined || timestamp === '') return '—';
   const date = new Date(timestamp);
   if (!Number.isFinite(date.getTime())) return '—';
-  return new Intl.DateTimeFormat('en-GB', {
+  return dateFormatter({
     timeZone: state.timeZone, hourCycle: 'h23',
     hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'shortOffset',
     ...(detailed ? { year: 'numeric', month: '2-digit', day: '2-digit', fractionalSecondDigits: 3 } : {}),
   }).format(date);
+}
+
+const dateFormatters = new Map();
+function dateFormatter(options) {
+  const key = JSON.stringify(options);
+  if (!dateFormatters.has(key)) {
+    const formatter = new Intl.DateTimeFormat('en-GB', options);
+    if (dateFormatters.size >= 12) dateFormatters.clear();
+    dateFormatters.set(key, formatter);
+  }
+  return dateFormatters.get(key);
 }
 
 function initTimeZone() {
@@ -2215,7 +2414,7 @@ function initTimeZone() {
   select.value = state.timeZone;
   select.addEventListener('change', () => {
     state.timeZone = select.value;
-    localStorage.setItem('timeZone', state.timeZone);
+    writePreference('timeZone', state.timeZone);
     for (const element of document.querySelectorAll('[data-timestamp]')) {
       element.textContent = formatTimestamp(element.dataset.timestamp);
     }
@@ -2226,17 +2425,36 @@ function initTimeZone() {
   });
 }
 
-// Refresh elapsed-time labels for historical detections.
-setInterval(renderBands, 10000);
-
-// Keep the timeline scrolling and drop samples that fell out of the window.
+setInterval(() => flushUpdates(), 250);
 setInterval(() => {
   pruneClientHistory();
-  renderTimeline();
+  timelineDirty = true;
 }, 15000);
-window.addEventListener('resize', renderTimeline);
+window.addEventListener('resize', () => { timelineDirty = true; });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    source?.close();
+    source = null;
+    historyRequest++;
+    historyController?.abort();
+  } else {
+    connectStream();
+    loadHistory();
+  }
+});
+window.addEventListener('error', (event) => reportClientError('Display error', event.error || event.message));
+window.addEventListener('unhandledrejection', (event) => reportClientError('Asynchronous display error', event.reason));
+$('retry-display').addEventListener('click', () => {
+  $('client-error').hidden = true;
+  lastErrorNotice = '';
+  source?.close();
+  source = null;
+  connectStream();
+  loadHistory();
+});
 
 syncHeightToggle();
 initTimeZone();
 initTimelineControls();
+connectStream();
 loadHistory();

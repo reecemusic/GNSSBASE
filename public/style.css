@@ -58,6 +58,8 @@ h2:first-child { margin-top: 0; }
 .status.connected .dot { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
 
 .header-right { display: flex; align-items: center; gap: 1.25rem; flex-wrap: wrap; }
+.client-notice { margin: .4rem 1rem; color: var(--bad); font-size: .8rem; }
+.client-notice:has(#client-error[hidden]) { display: none; }
 .connection-bar {
   display: flex;
   align-items: end;
