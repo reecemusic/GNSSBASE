@@ -367,6 +367,7 @@ select {
 .spectrum-grid { stroke: rgba(140, 148, 164, .3); stroke-width: 1; }
 .spectrum-signal { opacity: .7; }
 .spectrum-allocation-outline { stroke-width: 1; stroke-dasharray: 4 4; pointer-events: none; }
+.spectrum-centre-line { stroke-width: 2; vector-effect: non-scaling-stroke; }
 .spectrum-detection { fill: #ff5f56; stroke: #14171d; stroke-width: 1; vector-effect: non-scaling-stroke; }
 
 .scale { display: flex; gap: .75rem; margin-left: auto; font-size: .7rem; text-transform: none; letter-spacing: 0; color: var(--muted); flex-wrap: wrap; }

@@ -445,6 +445,19 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
   assert.equal(timeLabels[0].textContent, 't1000000');
   assert.equal(timeLabels[timeLabels.length - 1].textContent, `t${now}`);
   assert(sections[2].children[0].children[0].textContent.includes('1 hit'));
+  const centreLines = l5Chart.children.filter((child) => child.attributes.class === 'spectrum-centre-line');
+  assert.equal(centreLines.length, 6);
+  const gpsCentre = centreLines.find((line) => line.children[0].textContent.startsWith('GPS L5C centre:'));
+  assert.equal(gpsCentre.attributes.x1, 68);
+  assert.equal(gpsCentre.attributes.x2, 888);
+  assert(Math.abs(gpsCentre.attributes.y1 - (18 + (1215 - 1176.45) / 51 * 220)) < 1e-9);
+  assert.equal(gpsCentre.attributes.y1, gpsCentre.attributes.y2);
+  assert.equal(gpsCentre.attributes.stroke, legendColor('GPS L5C'));
+  assert.equal(gpsCentre.attributes['stroke-dasharray'], '6 34');
+  assert.match(gpsCentre.children[0].textContent, /1176\.450 MHz/);
+  const sharedCentres = centreLines.filter((line) => line.attributes.y1 === gpsCentre.attributes.y1);
+  assert.equal(sharedCentres.length, 4);
+  assert.equal(new Set(sharedCentres.map((line) => line.attributes['stroke-dashoffset'])).size, 4);
   const l5Stripes = l5Chart.children.filter((child) => child.attributes.class === 'spectrum-signal');
   for (let i = 0; i < l5Stripes.length; i++) {
     for (let j = i + 1; j < l5Stripes.length; j++) {
@@ -470,6 +483,7 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
   }
   assert(l5Chart.children.some((child) => child.attributes.class === 'spectrum-detection'));
   assert(!l5Chart.children.some((child) => child.attributes.class === 'spectrum-signal'));
+  assert(!l5Chart.children.some((child) => child.attributes.class === 'spectrum-centre-line'));
   context.renderSpectrumPlots(1040000, now, 20000);
   assert(!l5Chart.children.some((child) => child.attributes.class === 'spectrum-detection'));
 });
@@ -628,13 +642,17 @@ test('every band remains visible without data, when clear and during detections'
     $: () => ({ replaceChildren: () => { cards.length = 0; }, append: (card) => cards.push(card) }),
     bandStats: () => ({}),
     renderVerdict() {},
-    buildBandCard: (band, group, detections, status) => ({ band: band.id, status }),
+    buildBandCard: (band, group, detections, status) => ({ dataset: {}, band: band.id, title: band.title, status }),
   });
   loadFunctions(browserCode, 'const BANDS =', '/** Maps an ITDETECTSTATUS', context);
   loadFunctions(browserCode, 'function classifyBand(', '/** Detection rate, peak power', context);
   const expected = ['L1', 'L2', 'L5', 'L6', 'SBAS', 'SBAND', 'LBAND', 'OTHER'];
   context.renderBands();
   assert.deepEqual(cards.map((card) => card.band), expected);
+  assert.deepEqual(cards.map((card) => card.title), [
+    'L1 / E1 / B1 / G1', 'L2 / G2', 'L5 / E5 / B2', 'L6 / E6 / B3',
+    'SBAS', 'S-Band', 'L-Band', 'Unclassified',
+  ]);
   assert(cards.every((card) => card.status === 'unmonitored'));
   context.latestByName.ITDETECTSTATUS = { data: { detections: [] } };
   context.renderBands();
@@ -645,6 +663,30 @@ test('every band remains visible without data, when clear and during detections'
     context.renderBands();
     assert.deepEqual(cards.map((card) => card.band), expected);
     assert.equal(cards.filter((card) => card.status === 'jammed').length, 1);
+  }
+});
+
+test('all-band clear reports contribute to statistics for every band', () => {
+  const now = Date.now();
+  const context = vm.createContext({
+    state: {
+      windowMinutes: 60,
+      interferenceHistory: [
+        { t: now - 7200000, signal: 'ALL', count: 0, maxPower: null },
+        { t: now - 1000, signal: 'E5a', count: 1, maxPower: -85 },
+        { t: now, signal: 'ALL', count: 0, maxPower: null },
+      ],
+    },
+  });
+  loadFunctions(browserCode, 'const BANDS =', '/** Maps an ITDETECTSTATUS', context);
+  loadFunctions(browserCode, 'function classifyBand(', 'function renderBands()', context);
+  loadFunctions(browserCode, 'function bandStats(', 'function buildBandCard(', context);
+  const stats = context.bandStats(now);
+  assert.deepEqual(Object.keys(stats).sort(), ['L1', 'L2', 'L5', 'L6', 'LBAND', 'OTHER', 'SBAND', 'SBAS'].sort());
+  for (const [band, entry] of Object.entries(stats)) {
+    assert.equal(entry.samples, band === 'L5' ? 2 : 1);
+    assert.equal(entry.hits, band === 'L5' ? 1 : 0);
+    assert.equal(entry.peak, band === 'L5' ? -85 : null);
   }
 });
 
@@ -781,4 +823,14 @@ test('recent status reports show clear only after detections and suppress repeat
   context.appendItRow({ name: 'ITDETECTSTATUS', crcValid: true, data: { detectionCount: 2, detections: [{ signalType: 'L1' }, { signalType: 'L2' }] } });
   context.appendItRow(clear);
   assert.equal(rows.length, 4);
+  context.appendItRow({ data: null });
+  context.appendItRow(clear);
+  assert.equal(rows.length, 4);
+
+  context.appendItRow({ name: 'ITDETECTSTATUS', crcValid: false, data: { detectionCount: 1, detections: [{ signalType: 'L1' }] } });
+  context.appendItRow(clear);
+  assert.equal(rows.length, 5, 'CRC-failed detections must not create a valid clear transition');
+  const listLength = rows.length;
+  for (let i = 0; i < 100; i++) context.appendItRow(clear);
+  assert.equal(rows.length, listLength);
 });

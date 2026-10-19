@@ -82,7 +82,12 @@ colour within its group and a matching, keyboard-accessible toggle button.
 Signal visibility is remembered per browser. Overlapping allocations are split
 into alternating coloured stripes so no signal covers another; hover a stripe
 for the signal's full allocation bounds. Toggling an allocation never hides
-detected energy or changes the power chart. Narrow red vertical markers show each
+detected energy or changes the power chart. Dashed horizontal lines mark each
+visible signal allocation's centre frequency; coincident centres alternate
+signal colours along the line. Hover a guide for its signal name and frequency.
+For frequency-range allocations (GLONASS and BeiDou B3), the guide marks the
+midpoint of the displayed range, not individual GLONASS FDMA channels.
+Narrow red vertical markers show each
 interference detection's center frequency and bandwidth at its report time
 (hover for details). The grouped plots are titled **L1 / E1 / B1 / G1**,
 **L2 / G2 / B3**, and **L5 / E5 / B2**.
@@ -95,9 +100,12 @@ status marker to inspect its band, UTC timestamp and reported power. Clear and
 unknown-power reports are identified without inventing a power value. Stored
 timestamps and receiver data are unchanged.
 
-**Current band status** sits directly below **Power over time**. Cards for L1, L2,
-L5, L6, SBAS, S-Band, L-Band and unclassified signals remain visible even when
+**Current band status** sits directly below **Power over time**. Cards for
+**L1 / E1 / B1 / G1**, **L2 / G2**, **L5 / E5 / B2**, **L6 / E6 / B3**,
+**SBAS**, **S-Band**, **L-Band** and **Unclassified** remain visible even when
 there are no detections, keeping the band order consistent as status changes.
+Each card shows its frequency range and related signals. All-band clear reports
+contribute to the history statistics for every card, not just L1 and L2.
 
 Disconnected streams or status reports older than 60 seconds show an unavailable
 warning rather than a live clear indication.
@@ -105,9 +113,11 @@ warning rather than a live clear indication.
 Every connection requests `LOG ITDETECTSTATUSA ONTIME 1`, including when the other
 logs are managed by the receiver profile. Each report updates the timeline,
 last-report time and message counter even when the detection status is unchanged.
-Recent Status Reports omits clear rows except for the first clear report after
+Recent Status Changes omits clear rows except for the first valid clear report after
 detections; repeated clear reports do not add rows. Detection reports remain
-visible.
+visible. Initial clear reports are omitted, and CRC-failed clear reports do not
+change the last valid detection state. This filtering affects only the message
+list, not report counters, live status or chart history.
 
 ## Configuration (environment variables)
 

@@ -193,6 +193,8 @@ source.addEventListener('snapshot', (event) => {
   state.itSeen = state.counts.ITDETECTSTATUS || 0;
 
   Object.values(snap.latest || {}).forEach(applyRecord);
+  $('it-log').replaceChildren();
+  lastItReportHadDetections = false;
   (snap.itdetectHistory || []).forEach(appendItRow);
   (snap.rawLog || []).forEach(appendRawRow);
   renderCounts();
@@ -884,6 +886,26 @@ function renderSpectrumPlots(start, end, windowMs) {
       outline.append(svg('title', {}, `${label}: ${min.toFixed(3)}-${max.toFixed(3)} MHz`));
       svgChart.append(outline);
     });
+    const centres = new Map();
+    for (const { label, min, max } of allocations) {
+      const centre = (min + max) / 2;
+      const labels = centres.get(centre) || [];
+      labels.push(label);
+      centres.set(centre, labels);
+    }
+    for (const [centre, labels] of centres) {
+      if (centre < plot.min || centre > plot.max) continue;
+      labels.forEach((label, index) => {
+        const guide = svg('line', {
+          x1: left, x2: left + plotWidth, y1: yFor(centre), y2: yFor(centre),
+          stroke: SPECTRUM_COLORS[label], 'stroke-dasharray': `6 ${labels.length * 10 - 6}`,
+          'stroke-dashoffset': -index * 10, class: 'spectrum-centre-line',
+        });
+        guide.append(svg('title', {}, `${label} centre: ${centre.toFixed(3)} MHz`
+          + (labels.length > 1 ? ` (shared with ${labels.filter((name) => name !== label).join(', ')})` : '')));
+        svgChart.append(guide);
+      });
+    }
 
     const plotHits = [];
     for (const sample of historyHits) {
@@ -1380,8 +1402,8 @@ function renderItDetect(record) {
 // --- interference bands -----------------------------------------------------
 
 const BANDS = [
-  { id: 'L1', title: 'L1 detector', range: '1559 – 1610 MHz', note: 'Upper GNSS L-band' },
-  { id: 'L2', title: 'L2 detector', range: '1164 – 1300 MHz', note: 'Lower GNSS L-band' },
+  { id: 'L1', title: 'L1 / E1 / B1 / G1', range: '1559 – 1610 MHz', note: 'GPS/QZSS L1, Galileo E1, BeiDou B1, GLONASS G1' },
+  { id: 'L2', title: 'L2 / G2', range: '1215 – 1260 MHz', note: 'GPS/QZSS L2, GLONASS G2' },
   { id: 'L5', title: 'L5 / E5 / B2', range: '1164 – 1215 MHz', note: 'GPS L5, GAL E5a/E5b, BDS B2a, NavIC L5' },
   { id: 'L6', title: 'L6 / E6 / B3', range: '1260 – 1300 MHz', note: 'GAL E6, QZSS L6, BDS B3' },
   { id: 'SBAS', title: 'SBAS', range: 'L1 / L5 overlay', note: 'WAAS, EGNOS, MSAS, GAGAN' },
@@ -1389,8 +1411,6 @@ const BANDS = [
   { id: 'LBAND', title: 'L-Band', range: '1525 – 1560 MHz', note: 'TerraStar corrections' },
   { id: 'OTHER', title: 'Unclassified', range: '—', note: 'Signal type not recognised' },
 ];
-
-const ALWAYS_SHOWN = new Set(['L1', 'L2']);
 
 /** Maps an ITDETECTSTATUS signal type onto a band, falling back to detection frequency. */
 function classifyBand(signalType, detections) {
@@ -1438,15 +1458,15 @@ function renderBands() {
 
   for (const band of BANDS) {
     const group = groups[band.id];
-    if (!group && !ALWAYS_SHOWN.has(band.id)) continue;
-
     const bandDetections = group ? group.detections : [];
     const status = !record ? 'unmonitored' : bandDetections.length ? 'jammed' : 'clear';
     if (status === 'jammed') {
       jammedBands.push(band.id);
       totalDetections += bandDetections.length;
     }
-    container.append(buildBandCard(band, group, bandDetections, status, stats[band.id]));
+    const card = buildBandCard(band, group, bandDetections, status, stats[band.id]);
+    card.dataset.band = band.id;
+    container.append(card);
   }
 
   renderVerdict(jammedBands, totalDetections, Boolean(record));
@@ -1460,7 +1480,7 @@ function bandStats(now) {
   for (const sample of state.interferenceHistory) {
     if (sample.t < cutoff) continue;
     const bands = sample.signal === 'ALL'
-      ? BANDS.filter((band) => ALWAYS_SHOWN.has(band.id)).map((band) => band.id)
+      ? BANDS.map((band) => band.id)
       : [classifyBand(sample.signal, [])];
     for (const band of bands) {
       const entry = stats[band] || (stats[band] = { samples: 0, hits: 0, peak: null, lastHit: null });
@@ -2040,9 +2060,17 @@ function formatEphemerisValue(value, unit) {
 
 const latestByName = {};
 
+let lastItReportHadDetections = false;
+
 function appendItRow(record) {
   const d = record.data;
   if (!d) return;
+  if (d.detectionCount === 0) {
+    if (record.crcValid === false || !lastItReportHadDetections) return;
+    lastItReportHadDetections = false;
+  } else if (d.detectionCount > 0 && record.crcValid !== false) {
+    lastItReportHadDetections = true;
+  }
   const item = document.createElement('li');
   if (d.detectionCount > 0) item.className = 'has-detections';
 
