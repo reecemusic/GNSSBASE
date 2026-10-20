@@ -52,6 +52,10 @@ const archive = new InterferenceArchive({
   maxSamples: config.archiveMaxSamples,
   cacheDir: config.archiveCacheDir,
   settingsFile: config.archiveSettingsFile,
+  defaultAuto: config.archiveAuto,
+  refreshMs: config.archiveRefreshMinutes * 60000,
+  fsTimeoutMs: config.archiveTimeoutSeconds * 1000,
+  stallTimeoutMs: Math.max(60, config.archiveTimeoutSeconds * 6) * 1000,
 });
 archive.on('status', (status) => broadcast('archive', status));
 
@@ -444,6 +448,17 @@ function handleRequest(req, res) {
     return;
   }
 
+  if (route === '/api/archive/auto' && req.method === 'POST') {
+    readJsonBody(req, res, (body) => {
+      if (typeof body.enabled !== 'boolean') {
+        sendJson(res, 400, { error: 'enabled must be true or false' });
+        return;
+      }
+      sendJson(res, 200, archive.setAuto(body.enabled));
+    });
+    return;
+  }
+
   if (route === '/api/archive/clear' && req.method === 'POST') {
     sendJson(res, 200, archive.clear());
     return;
@@ -483,6 +498,12 @@ server.listen(config.webPort, config.webHost, () => {
   console.log(`[receiver] connecting to ${config.transport === 'auto' ? `${serialTarget}, falling back to ${tcpTarget}`
     : config.transport === 'serial' ? serialTarget : tcpTarget} ...`);
   receiver.start();
+  // Delayed so the receiver connection and first page loads are not competing with the NAS scan.
+  archive.startAuto(5000);
+  if (archive.settings.auto) {
+    console.log(`[archive] keeping the last ${archive.settings.days} day(s) loaded from ${archive.settings.root}, `
+      + `refreshed every ${config.archiveRefreshMinutes} min`);
+  }
 });
 
 let shuttingDown = false;
@@ -491,6 +512,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     if (shuttingDown) return;
     shuttingDown = true;
     receiver.stop();
+    archive.stopAuto();
     archive.cancel();
     history.save();
     const shutdownTimer = setTimeout(() => {

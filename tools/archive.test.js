@@ -221,7 +221,7 @@ test('archive loads the requested days from YYYY/DDD folders and reuses its cach
   assert.equal(status.filesCached, 0);
   assert.equal(status.reports, 12);
   assert.equal(status.samples, 4);
-  assert.deepEqual(JSON.parse(fs.readFileSync(options.settingsFile, 'utf8')), { root, days: 1 });
+  assert.deepEqual(JSON.parse(fs.readFileSync(options.settingsFile, 'utf8')), { root, days: 1, auto: false });
 
   const result = archive.query({ from: NOW - 86400000, to: NOW, buckets: 100 });
   assert.equal(result.bucketMs, 864000);
@@ -229,7 +229,7 @@ test('archive loads the requested days from YYYY/DDD folders and reuses its cach
   assert.equal(result.coverage.length, 2, 'coverage gaps shorter than a bucket are merged');
 
   const reloaded = new InterferenceArchive(options);
-  assert.deepEqual(reloaded.settings, { root, days: 1 }, 'settings persist across restarts');
+  assert.deepEqual(reloaded.settings, { root, days: 1, auto: false }, 'settings persist across restarts');
   reloaded.load({});
   status = await waitFor(reloaded, ['ready', 'error']);
   assert.equal(status.filesCached, 2, 'second load reads summaries from the cache');
@@ -411,4 +411,168 @@ test('archive coarsens detection resolution to stay within its sample limit', as
   assert.equal(result.bucketMs, status.resolutionMs, 'queries never claim finer detail than is stored');
   assert.equal(Math.max(...result.samples.map((sample) => sample.maxPower)), -91, 'the strongest report survives coarsening');
   assert(result.samples.length <= 750);
+});
+
+test('a background refresh keeps the loaded data visible until the new load is swapped in', async (t) => {
+  const { root, write, options } = makeArchive(t);
+  write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
+  const archive = new InterferenceArchive(options);
+  archive.load({ root, days: 1 });
+  const first = await waitFor(archive, ['ready', 'error']);
+  assert.equal(first.state, 'ready', first.message);
+  const query = { from: NOW - 86400000, to: NOW, buckets: 100 };
+  const before = archive.query(query);
+
+  write('293', 'X_2026-10-20_11-00-00.LOG', sampleLog(NOW - 3600000));
+  archive.start(root, 1, true);
+  const during = archive.status();
+  assert.equal(during.refreshing, true);
+  assert.equal(during.state, 'listing');
+  assert.equal(during.generation, first.generation, 'clients keep their data while refreshing');
+  assert.equal(during.samples, first.samples);
+  assert.equal(during.reports, first.reports);
+  assert.deepEqual(archive.query(query), before, 'queries keep serving the previous data');
+
+  const after = await waitFor(archive, ['ready', 'error']);
+  assert.equal(after.refreshing, false);
+  assert.notEqual(after.generation, first.generation, 'the swapped-in data is a new generation');
+  assert.equal(after.filesTotal, 2);
+  assert.equal(after.filesCached, 1, 'unchanged hourly files come from the cache');
+  assert(after.reports > first.reports);
+});
+
+test('a failed or cancelled background refresh restores the previous data', async (t) => {
+  const { root, write, options } = makeArchive(t);
+  write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
+  const archive = new InterferenceArchive(options);
+  archive.load({ root, days: 1 });
+  const first = await waitFor(archive, ['ready', 'error']);
+
+  archive.start(path.join(root, 'missing'), 1, true);
+  await new Promise((resolve) => archive.on('status', function listener(status) {
+    if (!status.refreshing) { archive.off('status', listener); resolve(); }
+  }));
+  let status = archive.status();
+  assert.equal(status.state, 'ready');
+  assert.equal(status.samples, first.samples);
+  assert.equal(status.generation, first.generation);
+  assert.match(status.message, /Refresh failed/);
+  assert.match(status.auto.lastError, /not reachable/);
+
+  archive.start(root, 1, true);
+  status = archive.cancel();
+  assert.equal(status.state, 'ready');
+  assert.equal(status.refreshing, false);
+  assert.equal(status.samples, first.samples);
+});
+
+test('NAS calls that hang time out, and automatic refresh waits for them to settle', async (t) => {
+  const { root, options } = makeArchive(t, { fsTimeoutMs: 50 });
+  fs.mkdirSync(root, { recursive: true });
+  const original = fs.promises.access;
+  let release;
+  fs.promises.access = () => new Promise((resolve) => { release = resolve; });
+  t.after(() => { fs.promises.access = original; });
+  const archive = new InterferenceArchive(options);
+  const started = Date.now();
+  archive.load({ root, days: 1 });
+  const status = await waitFor(archive, ['ready', 'error']);
+  assert.equal(status.state, 'error');
+  assert.match(status.message, /not reachable.*did not respond/);
+  assert(Date.now() - started < 2000);
+  assert.equal(archive.hung, 1);
+
+  archive.settings.auto = true;
+  const generation = archive.generation;
+  archive.autoTick();
+  assert.equal(archive.generation, generation, 'no new NAS work is started behind a hung call');
+  assert.match(archive.status().auto.lastError, /not answered/);
+  archive.stopAuto();
+
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(archive.hung, 0);
+});
+
+test('a read that stops delivering data is abandoned instead of hanging the load', async (t) => {
+  const { root, write, options } = makeArchive(t, { stallTimeoutMs: 80, cacheDir: null });
+  write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
+  const archive = new InterferenceArchive(options);
+  const { Readable } = require('node:stream');
+  const original = fs.createReadStream;
+  fs.createReadStream = () => new Readable({ read() {} });
+  t.after(() => { fs.createReadStream = original; });
+  archive.load({ root, days: 1 });
+  const status = await waitFor(archive, ['ready', 'error']);
+  assert.equal(status.state, 'error');
+  assert.match(status.message, /no data received/);
+});
+
+test('automatic mode loads, never overlaps a running load, and is turned off by Unload', async (t) => {
+  const { root, write, options } = makeArchive(t, { refreshMs: 3600000 });
+  write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
+  const archive = new InterferenceArchive(options);
+  assert.equal(archive.status().auto.enabled, false);
+  archive.load({ root, days: 1 });
+  await waitFor(archive, ['ready', 'error']);
+
+  archive.setAuto(true);
+  assert.equal(JSON.parse(fs.readFileSync(options.settingsFile, 'utf8')).auto, true);
+  assert(Number.isFinite(archive.status().auto.nextRunAt));
+  archive.stopAuto();
+  archive.autoTick();
+  assert.equal(archive.status().refreshing, true, 'automatic loads refresh in the background');
+  assert(archive.autoTimer, 'the next refresh is scheduled');
+  const generation = archive.generation;
+  archive.autoTick();
+  assert.equal(archive.generation, generation, 'a busy archive is not restarted');
+  const status = await waitFor(archive, ['ready', 'error']);
+  assert.equal(status.state, 'ready', status.message);
+  assert(Number.isFinite(status.auto.lastRunAt));
+  assert.equal(new InterferenceArchive(options).settings.auto, true, 'the choice survives a restart');
+
+  archive.clear();
+  assert.equal(archive.status().auto.enabled, false);
+  assert.equal(archive.status().auto.nextRunAt, null);
+  assert.equal(archive.autoTimer, null);
+});
+
+test('abbreviated ASCII BESTSATS and BESTPOS (as logged on the NAS) are decoded across chunk boundaries', () => {
+  const t = NOW - 3600000;
+  const { week, ms } = gpsTime(t);
+  const header = (name, offset) => `<${name} FILE 0 54.0 FINESTEERING ${week} ${((ms + offset) / 1000).toFixed(3)} 02000808 be05 18279\r\n`;
+  const bestsats = (offset, statuses) => header('BESTSATS', offset) + `<     ${statuses.length} \r\n`
+    + statuses.map((status, index) => `<                    GPS ${index + 1} ${status} 00000003 \r\n`).join('');
+  const bestpos = (offset) => header('BESTPOS', offset)
+    + '<     SOL_COMPUTED NARROW_INT 51.1 -114.0 1064.6 -16.2 WGS84 0.01 0.01 0.02 "0" 1.000 0.000 31 27 27 20 00 21 3f 37\r\n';
+  const log = Buffer.concat([
+    Buffer.from(bestsats(0, ['GOOD', 'GOOD', 'NOEPHEMERIS', 'GOOD'])),
+    binaryFrame(43, t + 500, Buffer.alloc(300, 0x3c)),
+    Buffer.from(bestpos(1000)),
+    asciiLine(t + 1500),
+    Buffer.from('<RANGE FILE 0 54.0 FINESTEERING 1 1.000 0 0 0\r\n<     0\r\n'),
+    Buffer.from(bestsats(2000, ['GOOD', 'GOOD'])),
+  ]);
+  for (const size of [log.length, 7, 64]) {
+    const summary = new FileSummary();
+    const scanner = createItDetectScanner(summary);
+    for (let offset = 0; offset < log.length; offset += size) scanner.push(log.subarray(offset, offset + size));
+    scanner.end();
+    const json = summary.toJSON();
+    assert.equal(json.bestsatsReports, 2, `chunk size ${size}`);
+    assert.deepEqual(json.bestsats.map(({ t: start, used }) => ({ start: start - t, used })),
+      [{ start: 0, used: 3 }, { start: 2000, used: 2 }], 'the final block is completed at end of file');
+    assert.equal(json.solutionReports, 1);
+    assert.equal(json.solution[0].used, 27);
+    assert.equal(json.solution[0].type, 'NARROW_INT');
+    assert.equal(json.reportCount, 1);
+    assert.equal(json.crcErrors, 0);
+  }
+
+  const truncated = new FileSummary();
+  const scanner = createItDetectScanner(truncated);
+  scanner.push(Buffer.from(header('BESTSATS', 0) + '<     3 \r\n<   GPS 1 GOOD 00000003 \r\n'));
+  scanner.end();
+  assert.equal(truncated.toJSON().bestsatsReports, 0, 'a block with missing rows is rejected');
+  assert.equal(truncated.toJSON().crcErrors, 1);
 });

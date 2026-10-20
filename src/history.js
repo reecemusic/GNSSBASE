@@ -93,7 +93,11 @@ class History {
       .slice(-this.maxInterferenceSamples);
   }
 
-  /** History no older than `windowMs`, capped by the configured retention. */
+  /**
+   * History no older than `windowMs`, capped by the configured retention. When more samples exist than
+   * `limit`, older data is reduced (strongest report per signal per time bucket; latest solution per
+   * bucket) instead of being cut off, so a 24 h window still reaches back 24 h.
+   */
   since(windowMs, now = Date.now(), limit = this.maxInterferenceSamples) {
     const cutoff = now - Math.min(windowMs, this.retentionMs);
     const tracks = {};
@@ -104,8 +108,8 @@ class History {
     return {
       retentionMinutes: Math.round(this.retentionMs / 60000),
       tracks,
-      interference: this.interference.filter((s) => s.t >= cutoff).slice(-limit),
-      solution: this.solution.filter((s) => s.t >= cutoff).slice(-limit),
+      interference: reduceInterference(this.interference.filter((s) => s.t >= cutoff), limit),
+      solution: reduceLatest(this.solution.filter((s) => s.t >= cutoff), limit),
     };
   }
 
@@ -154,6 +158,43 @@ class History {
 }
 
 const SOLUTION_HEARTBEAT_MS = 10000;
+
+/**
+ * Time-sorted samples cut to at most `limit`: the newest half stay untouched and older samples are merged
+ * into ever larger time buckets (`key` groups samples within a bucket, `keep` picks the survivor).
+ */
+function reduceSamples(samples, limit, key, keep) {
+  if (samples.length <= limit) return samples;
+  const recentCount = Math.floor(limit / 2);
+  const recent = samples.slice(samples.length - recentCount);
+  const older = samples.slice(0, samples.length - recentCount);
+  const budget = limit - recentCount;
+  let reduced = older;
+  for (let bucketMs = 1000; reduced.length > budget && bucketMs < 1e12; bucketMs *= 2) {
+    const kept = new Map();
+    for (const sample of older) {
+      const id = `${key(sample)}:${Math.floor(sample.t / bucketMs)}`;
+      const previous = kept.get(id);
+      kept.set(id, previous ? keep(previous, sample) : sample);
+    }
+    reduced = [...kept.values()].sort((a, b) => a.t - b.t);
+  }
+  return [...reduced.slice(-budget), ...recent];
+}
+
+function reduceInterference(samples, limit) {
+  return reduceSamples(samples, limit, (sample) => sample.signal, (previous, sample) => {
+    if ((sample.count > 0) !== (previous.count > 0)) return sample.count > 0 ? sample : previous;
+    if (Number.isFinite(sample.maxPower) && (!Number.isFinite(previous.maxPower) || sample.maxPower > previous.maxPower)) {
+      return sample;
+    }
+    return previous;
+  });
+}
+
+function reduceLatest(samples, limit) {
+  return reduceSamples(samples, limit, () => '', (previous, sample) => sample);
+}
 
 function solutionSample(data, timestamp) {
   if (!data || !Number.isFinite(timestamp)) return null;

@@ -130,15 +130,36 @@ test('raw pending records are compact and cannot retain full decoded reports', (
 });
 
 test('server history limits restored samples and caps browser responses', () => {
+  const now = Date.now();
   const history = new History({ retentionMs: 3600000, maxInterferenceSamples: 500 });
   history.interference = Array.from({ length: 2000 }, (_, index) => ({
-    t: Date.now(), signal: 'L1', count: 1, maxPower: -90, index,
+    t: now - (1999 - index) * 1000, signal: 'L1', count: 1, maxPower: -90, index,
   }));
-  history.prune();
+  history.prune(now);
   assert.equal(history.interference.length, 500);
-  const response = history.since(3600000, Date.now(), 100);
-  assert.equal(response.interference.length, 100);
-  assert.equal(response.interference[0].index, 1900);
+  const response = history.since(3600000, now, 100);
+  assert(response.interference.length <= 100);
+  assert.equal(response.interference[response.interference.length - 1].index, 1999, 'newest sample kept');
+  assert.deepEqual(response.interference.slice(-50).map((sample) => sample.index),
+    Array.from({ length: 50 }, (_, index) => 1950 + index), 'newest half is untouched');
+  assert(response.interference[0].index < 1600, 'older samples are downsampled, not cut off');
+  assert(response.interference.every((sample, index, all) => index === 0 || sample.t >= all[index - 1].t));
+});
+
+test('history responses downsample a long window instead of dropping its oldest hours', () => {
+  const now = Date.now();
+  const history = new History({ retentionMs: 86400000, maxInterferenceSamples: 100000 });
+  for (let index = 0; index < 20000; index++) {
+    const t = now - 86400000 + index * 4320;
+    history.interference.push({ t, signal: 'L1', count: index === 100 ? 1 : 0, maxPower: index === 100 ? -80 : null });
+    history.solution.push({ t, used: index % 30, tracked: 30, status: 'SOL_COMPUTED', type: 'SINGLE' });
+  }
+  const response = history.since(86400000, now, 2000);
+  assert(response.interference.length <= 2000);
+  assert(response.interference[0].t < now - 86000000, 'still reaches back about 24 h');
+  assert(response.interference.some((sample) => sample.count === 1 && sample.maxPower === -80), 'detections survive');
+  assert(response.solution.length <= 2000);
+  assert(response.solution[0].t < now - 86000000);
 });
 
 test('out-of-range GPS timestamps cannot throw during receiver parsing', () => {

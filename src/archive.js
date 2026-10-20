@@ -23,11 +23,14 @@ const LONG_HEADER_LENGTH = 28;
 const MAX_FRAME_BYTES = 1 << 16;
 const MAX_ASCII_LINE_BYTES = 16 * 1024;
 const SYNC = Buffer.from([0xaa, 0x44, 0x12]);
-const ASCII_MARKERS = [Buffer.from('#ITDETECTSTATUSA,'), Buffer.from('#BESTPOSA,'), Buffer.from('#BESTSATSA,')];
+const ASCII_MARKERS = [Buffer.from('#ITDETECTSTATUSA,'), Buffer.from('#BESTPOSA,'), Buffer.from('#BESTSATSA,'),
+  // Abbreviated ASCII ("LOG BESTSATS"): '<NAME header' then one '<   fields' line per row, without a CRC.
+  Buffer.from('<ITDETECTSTATUS '), Buffer.from('<BESTPOS '), Buffer.from('<BESTSATS ')];
+const MAX_ABBREVIATED_BYTES = 32 * 1024;
 const ASCII_CARRY_BYTES = Math.max(...ASCII_MARKERS.map((marker) => marker.length));
 // Reports further apart than this are treated as a gap in coverage, matching the live timeline.
 const COVERAGE_GAP_MS = 15000;
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5;
 const SOLUTION_HOLD_MS = 35000;
 const MAX_SOLUTION_SAMPLES = 300000;
 const MAX_DETECTIONS_PER_SAMPLE = 32;
@@ -38,6 +41,17 @@ const FILE_NAME_TIME = /_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.LOG$/i
 // File names and day folders may use local time; allow for any time zone offset.
 const FILE_TIME_TOLERANCE_MS = 14 * 3600000;
 const PROGRESS_INTERVAL_MS = 500;
+// While a background refresh runs, these come from the refresh; everything else describes the shown data.
+const PROGRESS_FIELDS = ['state', 'filesTotal', 'filesDone', 'filesCached', 'filesSkipped', 'bytesTotal', 'bytesDone',
+  'currentFile', 'message', 'errors', 'startedAt'];
+const DATA_FIELDS = ['coverage', 'samples', 'solution', 'solutionResolutionMs', 'bestsats', 'bestsatsResolutionMs',
+  'sorted', 'resolutionMs'];
+
+function fatalError(message) {
+  const error = new Error(message);
+  error.fatal = true;
+  return error;
+}
 
 /** True when sample `a` should replace `b` as the strongest report in a bucket. */
 function stronger(a, b) {
@@ -279,6 +293,20 @@ function createItDetectScanner(summary) {
         return;
       }
       if (ascii !== -1 && (sync === -1 || ascii < sync)) {
+        if (buf[ascii] === 0x3c) {
+          const end = abbreviatedEnd(buf, ascii);
+          if (end === -1) {
+            if (buf.length - ascii > MAX_ABBREVIATED_BYTES) {
+              i = ascii + 1;
+              continue;
+            }
+            carry = Buffer.from(buf.subarray(ascii));
+            return;
+          }
+          handleAscii(abbreviatedToAscii(buf.toString('latin1', ascii, end)));
+          i = end;
+          continue;
+        }
         const newline = buf.indexOf(0x0a, ascii);
         if (newline === -1) {
           if (buf.length - ascii > MAX_ASCII_LINE_BYTES) {
@@ -319,7 +347,36 @@ function createItDetectScanner(summary) {
     }
   }
 
-  return { push };
+  /** At end of file an abbreviated message cannot be followed by more rows, so the carried block is complete. */
+  function end() {
+    if (carry && carry[0] === 0x3c && carry.indexOf(0x0a) !== -1) {
+      handleAscii(abbreviatedToAscii(carry.toString('latin1')));
+    }
+    carry = null;
+  }
+
+  return { push, end };
+}
+
+/** Index just past an abbreviated ASCII block starting at `start`, or -1 if the buffer may end inside it. */
+function abbreviatedEnd(buf, start) {
+  let newline = buf.indexOf(0x0a, start);
+  while (newline !== -1) {
+    const next = newline + 1;
+    if (next + 1 >= buf.length) return -1;
+    if (buf[next] !== 0x3c || (buf[next + 1] !== 0x20 && buf[next + 1] !== 0x09)) return next;
+    if (next - start > MAX_ABBREVIATED_BYTES) return -1;
+    newline = buf.indexOf(0x0a, next);
+  }
+  return -1;
+}
+
+/** Rewrites an abbreviated block as an (unchecksummed) '#NAMEA,header;fields' line for the ASCII parser. */
+function abbreviatedToAscii(text) {
+  const lines = text.split(/\r?\n/).filter((line) => line.startsWith('<'));
+  const header = lines[0].slice(1).trim().split(/\s+/);
+  const fields = lines.slice(1).flatMap((line) => line.slice(1).trim().split(/\s+/)).filter(Boolean);
+  return `#${header[0]}A,${header.slice(1).join(',')};${fields.join(',')}`;
 }
 
 function fileNameTime(name) {
@@ -354,10 +411,22 @@ class InterferenceArchive extends EventEmitter {
       maxCacheFiles: 5000,
       cacheDir: null,
       settingsFile: null,
+      // Automatic refresh keeps the selected window (default 24 h) loaded and rolling forward.
+      defaultAuto: false,
+      refreshMs: 15 * 60000,
+      busyRetryMs: 60000,
+      // A NAS that stops answering must never wedge loading: fs calls and stalled reads are abandoned.
+      fsTimeoutMs: 20000,
+      stallTimeoutMs: 120000,
       now: () => Date.now(),
       ...options,
     };
     this.generation = 0;
+    this.dataGeneration = 0;
+    this.view = null;
+    this.hung = 0;
+    this.autoTimer = null;
+    this.autoState = { lastRunAt: null, nextRunAt: null, lastError: null };
     this.stream = null;
     this.lastProgressAt = 0;
     this.settings = this.readSettings();
@@ -365,13 +434,14 @@ class InterferenceArchive extends EventEmitter {
   }
 
   readSettings() {
-    const defaults = { root: this.options.defaultRoot, days: this.options.defaultDays };
+    const defaults = { root: this.options.defaultRoot, days: this.options.defaultDays, auto: this.options.defaultAuto };
     if (!this.options.settingsFile) return defaults;
     try {
       const saved = JSON.parse(fs.readFileSync(this.options.settingsFile, 'utf8'));
       return {
         root: validateRoot(saved.root),
         days: this.validateDays(saved.days),
+        auto: typeof saved.auto === 'boolean' ? saved.auto : this.options.defaultAuto,
       };
     } catch (error) {
       if (error.code !== 'ENOENT') console.warn(`[archive] ignoring saved settings: ${error.message}`);
@@ -400,7 +470,7 @@ class InterferenceArchive extends EventEmitter {
   info() {
     return {
       settings: this.settings,
-      defaults: { root: this.options.defaultRoot, days: this.options.defaultDays },
+      defaults: { root: this.options.defaultRoot, days: this.options.defaultDays, auto: this.options.defaultAuto },
       limits: { maxDays: this.options.maxDays },
       status: this.status(),
     };
@@ -441,18 +511,40 @@ class InterferenceArchive extends EventEmitter {
     };
   }
 
+  /**
+   * During a background refresh the previously loaded data stays queryable, so the status describes that
+   * data (range, counts, revision, generation) plus the refresh's progress fields.
+   */
   status() {
+    const view = this.view;
+    const base = view ? { ...view.state } : { ...this.state };
+    if (view) for (const key of PROGRESS_FIELDS) base[key] = this.state[key];
+    const data = view ? view.data : this;
     return {
-      ...this.state,
-      errors: this.state.errors.slice(),
-      samples: this.samples.length,
-      solutionSamples: this.solution.length,
-      solutionResolutionMs: this.solutionResolutionMs,
-      bestsatsSamples: this.bestsats.length,
-      bestsatsResolutionMs: this.bestsatsResolutionMs,
-      resolutionMs: this.resolutionMs,
-      generation: this.generation,
+      ...base,
+      errors: base.errors.slice(),
+      refreshing: Boolean(view),
+      samples: data.samples.length,
+      solutionSamples: data.solution.length,
+      solutionResolutionMs: data.solutionResolutionMs,
+      bestsatsSamples: data.bestsats.length,
+      bestsatsResolutionMs: data.bestsatsResolutionMs,
+      resolutionMs: data.resolutionMs,
+      generation: this.dataGeneration,
+      auto: {
+        enabled: this.settings.auto,
+        refreshMs: this.options.refreshMs,
+        ...this.autoState,
+      },
     };
+  }
+
+  busy() {
+    return this.state.state === 'listing' || this.state.state === 'scanning';
+  }
+
+  hasData() {
+    return this.samples.length > 0 || this.coverage.length > 0 || this.solution.length > 0 || this.bestsats.length > 0;
   }
 
   update(patch, force = false) {
@@ -471,10 +563,28 @@ class InterferenceArchive extends EventEmitter {
   load(request = {}) {
     const root = validateRoot(request.root === undefined ? this.settings.root : request.root);
     const days = this.validateDays(request.days === undefined ? this.settings.days : request.days);
-    this.settings = { root, days };
+    this.settings = { ...this.settings, root, days };
     this.saveSettings();
+    return this.start(root, days, false);
+  }
+
+  /**
+   * A background start keeps the loaded data visible (and queryable) until the new load finishes;
+   * it is swapped in only on success, and restored on failure or cancellation.
+   */
+  start(root, days, background) {
     this.stopStream();
     const generation = ++this.generation;
+    if (background && !this.view && !this.busy() && this.state.state !== 'idle' && this.hasData()) {
+      this.ensureSorted();
+      this.view = {
+        data: Object.fromEntries(DATA_FIELDS.map((key) => [key, this[key]])),
+        state: { ...this.state, errors: this.state.errors.slice() },
+      };
+    } else if (!background) {
+      this.view = null;
+    }
+    if (!this.view) this.dataGeneration = generation;
     const to = this.options.now();
     this.reset({
       state: 'listing', root, days, from: to - days * DAY_MS, to, startedAt: Date.now(),
@@ -483,15 +593,34 @@ class InterferenceArchive extends EventEmitter {
     this.update({}, true);
     this.run(generation).catch((error) => {
       if (generation !== this.generation) return;
-      this.update({ state: 'error', message: error.message, currentFile: null, finishedAt: Date.now() }, true);
+      this.stopStream();
+      if (this.view) {
+        this.restoreView();
+        this.autoState.lastError = error.message;
+        this.update({ message: `Refresh failed (${error.message}); showing the previously loaded data` }, true);
+      } else {
+        this.update({ state: 'error', message: error.message, currentFile: null, finishedAt: Date.now() }, true);
+      }
     });
     return this.status();
   }
 
+  restoreView() {
+    const { data, state } = this.view;
+    this.view = null;
+    Object.assign(this, data);
+    this.state = state;
+  }
+
   cancel() {
-    if (this.state.state !== 'listing' && this.state.state !== 'scanning') return this.status();
+    if (!this.busy()) return this.status();
     this.generation++;
     this.stopStream();
+    if (this.view) {
+      this.restoreView();
+      this.update({ message: 'Refresh cancelled; showing the previously loaded data' }, true);
+      return this.status();
+    }
     this.update({
       state: 'cancelled', currentFile: null, finishedAt: Date.now(),
       message: 'Loading cancelled; files already read remain available',
@@ -499,12 +628,91 @@ class InterferenceArchive extends EventEmitter {
     return this.status();
   }
 
+  /** Unloads everything and turns automatic refresh off, so the archive stays unloaded. */
   clear() {
     this.generation++;
+    this.dataGeneration = this.generation;
     this.stopStream();
+    this.view = null;
+    if (this.settings.auto) {
+      this.settings = { ...this.settings, auto: false };
+      this.saveSettings();
+    }
+    this.stopAuto();
     this.reset({ state: 'idle', message: 'Archive unloaded' });
     this.update({}, true);
     return this.status();
+  }
+
+  /** Turns automatic loading on (loading now unless busy) or off. */
+  setAuto(enabled) {
+    this.settings = { ...this.settings, auto: Boolean(enabled) };
+    this.saveSettings();
+    this.autoState.lastError = null;
+    if (this.settings.auto) this.scheduleAuto(0);
+    else this.stopAuto();
+    this.update({}, true);
+    return this.status();
+  }
+
+  startAuto(delayMs = 0) {
+    if (this.settings.auto) this.scheduleAuto(delayMs);
+  }
+
+  stopAuto() {
+    clearTimeout(this.autoTimer);
+    this.autoTimer = null;
+    this.autoState.nextRunAt = null;
+  }
+
+  scheduleAuto(delayMs) {
+    clearTimeout(this.autoTimer);
+    this.autoState.nextRunAt = Date.now() + delayMs;
+    this.autoTimer = setTimeout(() => this.autoTick(), delayMs);
+    if (typeof this.autoTimer.unref === 'function') this.autoTimer.unref();
+  }
+
+  /** One automatic refresh. Never interrupts a load in progress and never piles up behind a hung NAS. */
+  autoTick() {
+    this.autoTimer = null;
+    if (!this.settings.auto) return;
+    if (this.busy()) {
+      this.scheduleAuto(this.options.busyRetryMs);
+      return;
+    }
+    if (this.hung > 0) {
+      this.autoState.lastError = 'The network folder has not answered an earlier request yet; will retry';
+      this.scheduleAuto(this.options.refreshMs);
+      this.update({}, true);
+      return;
+    }
+    this.autoState.lastRunAt = Date.now();
+    this.scheduleAuto(this.options.refreshMs);
+    this.start(this.settings.root, this.settings.days, true);
+  }
+
+  /** Bounds a NAS call; a call that times out is still counted until it finally settles. */
+  async withTimeout(promise, label) {
+    let timer;
+    let timedOut = false;
+    const timeout = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        reject(fatalError(`${label} did not respond within ${Math.round(this.options.fsTimeoutMs / 1000)} s`));
+      }, this.options.fsTimeoutMs);
+    });
+    try {
+      return await Promise.race([promise, timeout]);
+    } finally {
+      clearTimeout(timer);
+      if (timedOut) this.trackHung(promise);
+    }
+  }
+
+  trackHung(promise) {
+    this.hung++;
+    const done = () => { this.hung--; };
+    Promise.resolve(promise).then(done, done);
   }
 
   stopStream() {
@@ -536,6 +744,7 @@ class InterferenceArchive extends EventEmitter {
         }
       } catch (error) {
         if (generation !== this.generation) return;
+        if (error.fatal) throw new Error(`${path.basename(file.path)}: ${error.message}`);
         this.addError(`${path.basename(file.path)}: ${error.message}`);
         summary = null;
       }
@@ -555,14 +764,20 @@ class InterferenceArchive extends EventEmitter {
     }
     this.ensureSorted();
     this.pruneCache();
+    if (this.view) {
+      this.view = null;
+      this.dataGeneration = generation;
+    }
+    this.autoState.lastError = null;
     this.update({ state: 'ready', currentFile: null, finishedAt: Date.now() }, true);
   }
 
   /** Lists `root\YYYY\DDD\*.LOG` files that can contain reports between `from` and `to`. */
   async listFiles(root, from, to) {
     try {
-      await fs.promises.access(root);
+      await this.withTimeout(fs.promises.access(root), `Archive folder ${root}`);
     } catch (error) {
+      if (error.fatal) throw new Error(`Archive folder ${root} is not reachable (${error.message})`);
       throw new Error(`Archive folder ${root} is not reachable (${error.code || error.message})`);
     }
     const folders = [];
@@ -571,8 +786,10 @@ class InterferenceArchive extends EventEmitter {
     for (let year = firstYear; year <= lastYear; year++) {
       let entries;
       try {
-        entries = await fs.promises.readdir(path.join(root, String(year)), { withFileTypes: true });
+        entries = await this.withTimeout(
+          fs.promises.readdir(path.join(root, String(year)), { withFileTypes: true }), `Folder ${year}`);
       } catch (error) {
+        if (error.fatal) throw error;
         if (error.code !== 'ENOENT') this.addError(`${year}: ${error.message}`);
         continue;
       }
@@ -589,21 +806,24 @@ class InterferenceArchive extends EventEmitter {
     for (const folder of folders) {
       let names;
       try {
-        names = (await fs.promises.readdir(folder.dir)).filter((name) => /\.log$/i.test(name)).sort();
+        names = (await this.withTimeout(fs.promises.readdir(folder.dir), `Folder ${folder.dir}`))
+          .filter((name) => /\.log$/i.test(name)).sort();
       } catch (error) {
+        if (error.fatal) throw error;
         this.addError(`${folder.dir}: ${error.message}`);
         continue;
       }
       for (const name of names) {
         const filePath = path.join(folder.dir, name);
         try {
-          const stat = await fs.promises.stat(filePath);
+          const stat = await this.withTimeout(fs.promises.stat(filePath), name);
           if (!stat.isFile()) continue;
           files.push({
             path: filePath, size: stat.size, mtimeMs: Math.round(stat.mtimeMs),
             start: fileNameTime(name) ?? folder.dayStart, folderStart: folder.dayStart,
           });
         } catch (error) {
+          if (error.fatal) throw error;
           this.addError(`${name}: ${error.message}`);
         }
       }
@@ -630,9 +850,17 @@ class InterferenceArchive extends EventEmitter {
     const stream = fs.createReadStream(file.path, { highWaterMark: READ_CHUNK_BYTES });
     this.stream = stream;
     let bytes = 0;
+    let lastDataAt = Date.now();
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastDataAt <= this.options.stallTimeoutMs || stream.destroyed) return;
+      // The destroyed stream closes only once the stuck read returns, so it counts as hung until then.
+      if (!stream.closed) this.trackHung(new Promise((resolve) => stream.once('close', resolve)));
+      stream.destroy(fatalError(`no data received for ${Math.round(this.options.stallTimeoutMs / 1000)} s`));
+    }, Math.max(10, Math.min(5000, this.options.stallTimeoutMs / 4)));
     try {
       for await (const chunk of stream) {
         if (generation !== this.generation) return null;
+        lastDataAt = Date.now();
         scanner.push(chunk);
         bytes += chunk.length;
         this.update({ bytesDone: bytesBefore + bytes });
@@ -641,9 +869,11 @@ class InterferenceArchive extends EventEmitter {
       if (generation !== this.generation) return null;
       throw error;
     } finally {
+      clearInterval(watchdog);
       if (this.stream === stream) this.stream = null;
       stream.destroy();
     }
+    if (generation === this.generation) scanner.end();
     return generation === this.generation ? summary.toJSON() : null;
   }
 
@@ -777,24 +1007,26 @@ class InterferenceArchive extends EventEmitter {
    * the strongest sample per signal per bucket, and coverage runs merged across sub-bucket gaps.
    */
   query({ from, to, buckets }) {
-    this.ensureSorted();
+    if (!this.view) this.ensureSorted();
+    const data = this.view ? this.view.data : this;
+    const revision = this.view ? this.view.state.revision : this.state.revision;
     const start = Number(from);
     const end = Number(to);
     if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) throw new Error('A valid from/to range is required');
     const count = Math.max(10, Math.min(MAX_QUERY_BUCKETS, Math.floor(Number(buckets)) || 1000));
-    const bucketMs = Math.max(this.resolutionMs, Math.ceil((end - start) / count));
+    const bucketMs = Math.max(data.resolutionMs, Math.ceil((end - start) / count));
 
     let low = 0;
-    let high = this.samples.length;
+    let high = data.samples.length;
     while (low < high) {
       const mid = (low + high) >> 1;
-      if (this.samples[mid].t < start) low = mid + 1;
+      if (data.samples[mid].t < start) low = mid + 1;
       else high = mid;
     }
     const chosen = new Map();
     let detectionSamples = 0;
-    for (let index = low; index < this.samples.length && this.samples[index].t <= end; index++) {
-      const sample = this.samples[index];
+    for (let index = low; index < data.samples.length && data.samples[index].t <= end; index++) {
+      const sample = data.samples[index];
       if (sample.count > 0) detectionSamples++;
       const key = `${sample.signal}:${Math.floor((sample.t - start) / bucketMs)}`;
       const previous = chosen.get(key);
@@ -803,7 +1035,7 @@ class InterferenceArchive extends EventEmitter {
 
     const coverage = [];
     const mergeGap = Math.max(COVERAGE_GAP_MS, bucketMs);
-    for (const [runStart, runEnd] of this.coverage) {
+    for (const [runStart, runEnd] of data.coverage) {
       if (runEnd < start) continue;
       if (runStart > end) break;
       const clipped = [Math.max(start, runStart), Math.min(end, runEnd)];
@@ -816,21 +1048,21 @@ class InterferenceArchive extends EventEmitter {
       from: start,
       to: end,
       bucketMs,
-      resolutionMs: this.resolutionMs,
-      revision: this.state.revision,
+      resolutionMs: data.resolutionMs,
+      revision,
       detectionSamples,
       coverage,
       samples: [...chosen.values()].sort((a, b) => a.t - b.t),
-      solutionResolutionMs: this.solutionResolutionMs,
-      solution: reduceSolutions(this.solution
+      solutionResolutionMs: data.solutionResolutionMs,
+      solution: reduceSolutions(data.solution
         .filter((sample) => sample.end >= start && sample.t <= end)
         .map((sample) => ({ ...sample, t: Math.max(start, sample.t), end: Math.min(end, sample.end) })),
-      Math.max(bucketMs, this.solutionResolutionMs)),
-      bestsats: reduceSolutions(this.bestsats
+      Math.max(bucketMs, data.solutionResolutionMs)),
+      bestsats: reduceSolutions(data.bestsats
         .filter((sample) => sample.end >= start && sample.t <= end)
         .map((sample) => ({ ...sample, t: Math.max(start, sample.t), end: Math.min(end, sample.end) })),
-      Math.max(bucketMs, this.bestsatsResolutionMs)),
-      bestsatsResolutionMs: this.bestsatsResolutionMs,
+      Math.max(bucketMs, data.bestsatsResolutionMs)),
+      bestsatsResolutionMs: data.bestsatsResolutionMs,
     };
   }
 }

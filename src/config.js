@@ -68,10 +68,11 @@ const config = {
   rawLogSize: integerSetting('RAW_LOG_SIZE', 200, 1),
 
   // Long-term history for skyplot traces and the interference timeline.
-  // This is the longest window a browser can ask for.
-  historyRetentionMinutes: integerSetting('HISTORY_RETENTION_MIN', 360, 1),
+  // This is the longest window a browser can ask for. 24 h so the newest hours, which reach the NAS
+  // archive only hours later, are always covered by live data.
+  historyRetentionMinutes: integerSetting('HISTORY_RETENTION_MIN', 1440, 1),
   trackSampleSeconds: integerSetting('TRACK_SAMPLE_SEC', 20, 1),
-  maxInterferenceSamples: integerSetting('MAX_IT_SAMPLES', 50000, 1),
+  maxInterferenceSamples: integerSetting('MAX_IT_SAMPLES', 100000, 1),
   // Set HISTORY_FILE='' to keep history in memory only.
   historyFile: process.env.HISTORY_FILE === undefined
     ? require('node:path').join(__dirname, '..', 'data', 'history.json')
@@ -84,6 +85,12 @@ const config = {
   archiveMaxDays: integerSetting('ARCHIVE_MAX_DAYS', 31, 1, 366),
   // Separate bounds for detections, BESTPOS and BESTSATS intervals; coarsened beyond this.
   archiveMaxSamples: integerSetting('ARCHIVE_MAX_SAMPLES', 300000, 1000),
+  // Default for "Keep loaded": reload the selected window (default the last 24 h) in the background
+  // at startup and every ARCHIVE_REFRESH_MIN minutes. The choice made in the web UI is saved and wins.
+  archiveAuto: process.env.ARCHIVE_AUTO !== 'false',
+  archiveRefreshMinutes: integerSetting('ARCHIVE_REFRESH_MIN', 15, 1, 1440),
+  // NAS calls that take longer than this are abandoned, so an unreachable share cannot wedge loading.
+  archiveTimeoutSeconds: integerSetting('ARCHIVE_TIMEOUT_SEC', 20, 1, 600),
   // Per-file summaries so each NAS file is only read once. Set ARCHIVE_CACHE_DIR='' to disable.
   archiveCacheDir: process.env.ARCHIVE_CACHE_DIR === undefined
     ? require('node:path').join(__dirname, '..', 'data', 'archive-cache')

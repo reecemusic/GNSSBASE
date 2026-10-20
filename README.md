@@ -45,9 +45,13 @@ options longer than the server's retention are disabled automatically.
 
 History is written to `data/history.json` periodically and on shutdown, then restored at
 startup, so traces and interference records survive a restart. Both memory and file size
-are bounded by `HISTORY_RETENTION_MIN`, `TRACK_SAMPLE_SEC` and `MAX_IT_SAMPLES`.
+are bounded by `HISTORY_RETENTION_MIN` (24 h by default), `TRACK_SAMPLE_SEC` and `MAX_IT_SAMPLES`.
+When a window holds more samples than the browser asks for, the newest half is sent as
+recorded and older samples are merged into time buckets (strongest report per band;
+latest solution), so a 24 h window always reaches back 24 h.
 
-For long-running sessions, the browser retains at most 10,000 interference samples,
+For long-running sessions, the browser retains at most 40,000 interference samples (and
+re-requests long windows every 30 minutes),
 1,081 points per satellite track, 300 raw rows and 50 recent interference events.
 At high input rates, older browser samples are dropped even within the selected window;
 the server retains its independently configured history. Timeline markers are combined
@@ -180,20 +184,40 @@ Expected layout: `<folder>\YYYY\DDD\*.LOG`, where `DDD` is the day of year, for 
 `\\20.20.20.1\novatel\pwrpak1\2026\275\NMUT23450006R_2026-10-02_00-43-27.LOG`. Both
 recording formats are read: binary `ITDETECTSTATUSB` (message 2065) and `BESTPOSB`
 (message 42), binary BESTSATS (message 1194), plus ASCII `#ITDETECTSTATUSA`,
-`#BESTPOSA` and `#BESTSATSA` lines mixed with binary
+`#BESTPOSA` and `#BESTSATSA` lines and abbreviated ASCII `<BESTSATS` / `<BESTPOS` /
+`<ITDETECTSTATUS` blocks (as produced by `LOG BESTSATS ONTIME 1`) mixed with binary
 logs. Only the primary antenna is used
 (`ITDETECTSTATUS_1`, `BESTPOS_1` and `BESTSATS_1` are ignored), times come from each report's GPS header (file and
 folder names are only used to choose which files to open), and CRC failures are skipped.
 
 Choose how many days to load (1 to `ARCHIVE_MAX_DAYS`) and select **Load history**.
-Loading never starts automatically. Safeguards keep the NAS, server and browser responsive:
+
+### Always 24 hours: live + archive combined
+
+Tick **Keep loaded (rolling, auto-refresh)** (on by default, `ARCHIVE_AUTO`) and the server
+loads the selected days (default the last 24 h) at start-up and reloads them every
+`ARCHIVE_REFRESH_MIN` minutes, so the archive window rolls forward. Hourly NAS files reach
+the archive hours late; the newest hours come from live history, which the server keeps for
+24 h (`HISTORY_RETENTION_MIN`). Select **History: 24 hours** in the header to see the whole
+day: archive data underneath, live data on top.
+
+- A refresh runs in the background: the plots keep showing the previous data until the new
+  load completes, then switch over. Only new or changed files are read; the rest come from cache.
+- Refreshes never overlap and never interrupt a load you started; they wait for it.
+- NAS calls that do not answer within `ARCHIVE_TIMEOUT_SEC` (and file reads that stall for
+  six times that) are abandoned. A failed refresh keeps the previous data, shows the reason
+  in the panel and retries at the next interval; no new NAS work starts while an abandoned
+  call is still outstanding.
+- **Unload** also turns automatic loading off. The choice is remembered across restarts.
+
+Safeguards keep the NAS, server and browser responsive:
 
 - Files are streamed one at a time in 1 MB chunks; only ITDETECTSTATUS, BESTPOS and BESTSATS frames are
   decoded and other logs (RANGE, ephemerides, …) are skipped by length.
 - Each file is reduced to a compact summary — coverage runs for clear reporting and the
   strongest detection per band per second, plus runs of unchanged BESTPOS solutions —
-  cached in `data/archive-cache/`. Older caches are rebuilt on the first reload to
-  include BESTSATS as well as BESTPOS. The NAS is
+  cached in `data/archive-cache/`. Older caches are rebuilt on the first reload (for
+  example to pick up abbreviated-ASCII BESTSATS). The NAS is
   read once per file (about 40 s and 475 MB per day the first time); reloading or
   extending the range only reads new or changed files, and a cached day reloads in well
   under a second.
@@ -230,16 +254,19 @@ Band cards and statistics remain live-only.
 | `NOVATEL_IDLE_MS` | `30000` | Recycle the socket if no data arrives for this long |
 | `WEB_HOST` / `WEB_PORT` | `127.0.0.1` / `8080` | Web UI bind address. Localhost by default; the UI has no authentication. |
 | `HISTORY_SIZE` / `RAW_LOG_SIZE` | `50` / `200` | Replay buffers sent to a newly opened browser |
-| `HISTORY_RETENTION_MIN` | `360` | How far back skyplot traces and the interference timeline are kept. This is the longest window a browser can select. |
+| `HISTORY_RETENTION_MIN` | `1440` | How far back skyplot traces and the interference timeline are kept. This is the longest window a browser can select. |
 | `TRACK_SAMPLE_SEC` | `20` | Minimum spacing between skyplot trace samples per satellite |
-| `MAX_IT_SAMPLES` | `50000` | Hard cap on stored interference samples |
+| `MAX_IT_SAMPLES` | `100000` | Hard cap on stored interference samples (about 24 h at typical report rates) |
 | `HISTORY_FILE` | `data/history.json` | Where history is persisted. Set to an empty string for memory-only. |
 | `HISTORY_SAVE_SEC` | `60` | How often history is written to disk |
 | `NOVATEL_ARCHIVE_ROOT` | `\\20.20.20.1\novatel\pwrpak1` | Default historic archive folder (`YYYY\DDD\*.LOG`). The folder chosen in the UI is saved in `data/archive-settings.json` and takes precedence. |
 | `ARCHIVE_DAYS` / `ARCHIVE_MAX_DAYS` | `1` / `31` | Default and maximum number of days the UI may load |
 | `ARCHIVE_MAX_SAMPLES` | `300000` | Separate memory caps for detection seconds, BESTPOS intervals and BESTSATS count intervals before their resolution is coarsened |
 | `ARCHIVE_CACHE_DIR` | `data/archive-cache` | Per-file summary cache. Set to an empty string to re-read the NAS every time. |
-| `ARCHIVE_SETTINGS_FILE` | `data/archive-settings.json` | Where the chosen folder and days are remembered. Empty string disables saving. |
+| `ARCHIVE_SETTINGS_FILE` | `data/archive-settings.json` | Where the chosen folder, days and Keep-loaded choice are remembered. Empty string disables saving. |
+| `ARCHIVE_AUTO` | `true` | Default for **Keep loaded** when no choice has been saved; `false` disables automatic loading |
+| `ARCHIVE_REFRESH_MIN` | `15` | Minutes between automatic background refreshes |
+| `ARCHIVE_TIMEOUT_SEC` | `20` | NAS calls slower than this are abandoned (stalled reads after 6×, minimum 60 s) |
 
 The requested logs are listed in [src/config.js](src/config.js). They are requested in
 ASCII on this tool's own port only — the profile's binary `LOG FILE ...` recording is

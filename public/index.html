@@ -248,6 +248,8 @@
           <button id="archive-default" type="button" disabled>Default folder</button>
         </div>
         <label class="archive-show"><input id="archive-show" type="checkbox" checked> Show archive on plots</label>
+        <label class="archive-show" title="Reloads the selected days in the background at server start-up and every few minutes; the shown data stays visible while it refreshes">
+          <input id="archive-auto" type="checkbox" disabled> Keep loaded (rolling, auto-refresh)</label>
       </form>
       <progress id="archive-progress" class="archive-progress" max="1" value="0" hidden></progress>
       <div id="archive-status" class="archive-status" role="status" aria-live="polite">Archive status unavailable.</div>
@@ -255,7 +257,10 @@
         and BESTPOS/BESTSATS reports and reads one file at a time. BESTPOS supplies satellite count and fix type;
         BESTSATS supplies a satellite-count fallback only. Each file is summarised once and cached locally, so reloading or
         extending the range only reads new files (about 400&nbsp;MB per day the first time). Archive data is
-        drawn with hollow markers and dashed lines beneath the live data.</p>
+        drawn with hollow markers and dashed lines beneath the live data. With <em>Keep loaded</em> on, the server
+        reloads the selected days every few minutes so the archive window rolls forward; the NAS receives each
+        hourly file hours late, and the server keeps 24&nbsp;hours of live history to cover those newest hours.
+        Choose <em>History: 24 hours</em> to see the whole day combined. An unreachable NAS times out and is retried later.</p>
     </details>
 
     <div id="it-banner" class="banner idle">

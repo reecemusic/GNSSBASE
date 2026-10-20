@@ -3,7 +3,9 @@
 const $ = (id) => document.getElementById(id);
 const MAX_RAW_ROWS = 300;
 const MAX_IT_ROWS = 50;
-const MAX_INTERFERENCE_SAMPLES = 10000;
+// Room for a downsampled 24 h history response plus many hours of live reports arriving on top of it.
+const MAX_INTERFERENCE_SAMPLES = 40000;
+const HISTORY_REQUEST_LIMIT = 15000;
 const MAX_TRACK_SAMPLES = 1081;
 const MAX_TRACKS = 512;
 const MAX_EVENT_CHARS = 8 * 1024 * 1024;
@@ -743,7 +745,7 @@ async function loadHistory() {
   historyController = new AbortController();
   const requestedAt = Date.now();
   try {
-    const data = await request(`/api/history?minutes=${state.windowMinutes}&limit=${MAX_INTERFERENCE_SAMPLES}`,
+    const data = await request(`/api/history?minutes=${state.windowMinutes}&limit=${HISTORY_REQUEST_LIMIT}`,
       { signal: historyController.signal }, true);
     if (generation !== historyRequest || document.hidden) return;
     if (!data || !Array.isArray(data.interference) || !data.tracks || typeof data.tracks !== 'object') {
@@ -1810,8 +1812,9 @@ function applyArchiveStatus(status) {
   const previous = state.archive.status;
   if (!previous || previous.generation !== status.generation) archiveFetch.startedAt = Date.now();
   state.archive.status = status;
+  // A new generation (e.g. a finished background refresh) keeps drawing the old data until the refetch lands.
+  if (status.state === 'idle') state.archive.data = null;
   if (status.state === 'idle' || (state.archive.data && state.archive.data.generation !== status.generation)) {
-    state.archive.data = null;
     archiveFetch.controller?.abort();
   }
   // A page opened while an archive is loaded starts by showing the whole range.
@@ -1833,12 +1836,15 @@ function renderArchiveStatus() {
   $('archive-clear').disabled = !known || status.state === 'idle' || pending;
   $('archive-default').disabled = !state.archive.defaults || pending;
   $('archive-show').checked = state.archive.shown;
+  $('archive-auto').disabled = !known || pending;
+  $('archive-auto').checked = Boolean(status?.auto?.enabled);
 
   const badge = $('archive-badge');
   const badgeState = !known ? 'idle' : busy ? 'busy' : status.state === 'error' ? 'error'
-    : status.state === 'idle' ? 'idle' : status.errors?.length || status.state === 'cancelled' ? 'warning' : 'ready';
+    : status.state === 'idle' ? 'idle' : status.errors?.length || status.state === 'cancelled' || status.auto?.lastError
+      ? 'warning' : 'ready';
   badge.className = `archive-badge ${badgeState}`;
-  badge.textContent = !known ? 'Unavailable' : {
+  badge.textContent = !known ? 'Unavailable' : status.refreshing ? 'Refreshing…' : {
     idle: 'Not loaded', listing: 'Searching…', scanning: 'Loading…', ready: 'Loaded', cancelled: 'Partly loaded', error: 'Failed',
   }[status.state] || status.state;
   $('archive-panel').setAttribute('aria-busy', String(busy));
@@ -1862,9 +1868,10 @@ function renderArchiveStatus() {
       timeZone: state.timeZone, hourCycle: 'h23', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
     }).format(new Date(time));
     const range = Number.isFinite(status.from) ? `${dateLabel(status.from)} – ${dateLabel(status.to)}` : '';
+    if (status.refreshing) parts.push(`Refreshing in the background; still showing ${range || 'the previously loaded data'}.`);
     if (status.state === 'listing') parts.push(status.message || 'Searching for log files…');
     if (status.state === 'scanning') {
-      const elapsed = Date.now() - archiveFetch.startedAt;
+      const elapsed = Date.now() - (status.refreshing && Number.isFinite(status.startedAt) ? status.startedAt : archiveFetch.startedAt);
       const remaining = status.bytesDone > 0 && elapsed > 3000
         ? elapsed * (status.bytesTotal - status.bytesDone) / status.bytesDone : null;
       parts.push(`Reading file ${Math.min(status.filesDone + 1, status.filesTotal)} of ${status.filesTotal}`
@@ -1891,6 +1898,15 @@ function renderArchiveStatus() {
     }
     if (status.crcErrors) parts.push(`${status.crcErrors} corrupt reports skipped.`);
     if (status.errors?.length) parts.push(`${status.errors.length} problem${status.errors.length === 1 ? '' : 's'}: ${status.errors.slice(0, 3).join('; ')}`);
+  }
+  const auto = status?.auto;
+  if (auto?.enabled) {
+    const clock = (time) => dateFormatter({ timeZone: state.timeZone, hourCycle: 'h23', hour: '2-digit', minute: '2-digit' })
+      .format(new Date(time));
+    parts.push(`Keep loaded: on, every ${formatSpan(auto.refreshMs || 900000)}`
+      + `${Number.isFinite(auto.lastRunAt) ? ` · last refresh ${clock(auto.lastRunAt)}` : ''}`
+      + `${Number.isFinite(auto.nextRunAt) ? ` · next ${clock(auto.nextRunAt)}` : ''}.`
+      + `${auto.lastError ? ` Last refresh problem: ${auto.lastError}.` : ''}`);
   }
   $('archive-status').textContent = parts.join(' ');
 }
@@ -2045,6 +2061,20 @@ $('archive-show').addEventListener('change', (event) => {
   if (state.archive.shown) showWholeArchive();
   else state.timelineView = null;
   flushUpdates(true);
+});
+
+$('archive-auto').addEventListener('change', (event) => {
+  const enabled = event.target.checked;
+  archiveRequest('/api/archive/auto', { enabled }).then(() => {
+    if (enabled && !state.archive.shown) {
+      state.archive.shown = true;
+      writePreference('archiveShown', 'true');
+      flushUpdates(true);
+    }
+  }).catch((error) => {
+    event.target.checked = !enabled;
+    $('archive-status').textContent = `Could not change automatic loading: ${error.message}`;
+  });
 });
 
 renderArchiveStatus();
@@ -3333,3 +3363,7 @@ initTimeZone();
 initTimelineControls();
 connectStream();
 loadHistory();
+// Long windows are served downsampled; re-fetching keeps their oldest hours from being trimmed by the cap.
+setInterval(() => {
+  if (!document.hidden && state.windowMinutes >= 360) loadHistory();
+}, 30 * 60000);
