@@ -284,24 +284,42 @@ function handleRequest(req, res) {
 
   if (route === '/api/connection' && req.method === 'POST') {
     readJsonBody(req, res, (settings) => {
-      if (settings.transport === 'tcp') {
+      const tcpSettings = () => {
         const host = String(settings.receiverHost || '').trim();
         const port = Number(settings.receiverPort);
-        if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
+        if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+        return { receiverHost: host, receiverPort: port };
+      };
+      const serialSettings = () => {
+        const serialPath = String(settings.serialPath || '').trim();
+        const serialBaudRate = Number(settings.serialBaudRate);
+        if (!serialPath || !Number.isInteger(serialBaudRate) || serialBaudRate < 1) return null;
+        return { serialPath, serialBaudRate };
+      };
+      if (settings.transport === 'tcp') {
+        const tcp = tcpSettings();
+        if (!tcp) {
           res.writeHead(400).end('A valid receiver host and TCP port are required');
           return;
         }
-        receiver.reconfigure({ transport: 'tcp', receiverHost: host, receiverPort: port });
+        receiver.reconfigure({ transport: 'tcp', ...tcp });
       } else if (settings.transport === 'serial') {
-        const serialPath = String(settings.serialPath || '').trim();
-        const serialBaudRate = Number(settings.serialBaudRate);
-        if (!serialPath || !Number.isInteger(serialBaudRate) || serialBaudRate < 1) {
+        const serial = serialSettings();
+        if (!serial) {
           res.writeHead(400).end('A serial port and valid baud rate are required');
           return;
         }
-        receiver.reconfigure({ transport: 'serial', serialPath, serialBaudRate });
+        receiver.reconfigure({ transport: 'serial', ...serial });
+      } else if (settings.transport === 'auto') {
+        const tcp = tcpSettings();
+        const serial = serialSettings();
+        if (!tcp || !serial) {
+          res.writeHead(400).end('Auto mode needs a serial port, baud rate, receiver host and TCP port');
+          return;
+        }
+        receiver.reconfigure({ transport: 'auto', ...serial, ...tcp });
       } else {
-        res.writeHead(400).end('Transport must be tcp or serial');
+        res.writeHead(400).end('Transport must be auto, tcp or serial');
         return;
       }
 
@@ -398,7 +416,10 @@ server.on('error', (error) => {
 server.listen(config.webPort, config.webHost, () => {
   console.log(`[web] http://${config.webHost}:${config.webPort}`);
   console.log(`[history] retaining ${config.historyRetentionMinutes} minutes${config.historyFile ? ` in ${config.historyFile}` : ' (memory only)'}`);
-  console.log(`[receiver] connecting to ${config.receiverHost}:${config.receiverPort} ...`);
+  const serialTarget = `${config.serialPath} @ ${config.serialBaudRate}`;
+  const tcpTarget = `${config.receiverHost}:${config.receiverPort}`;
+  console.log(`[receiver] connecting to ${config.transport === 'auto' ? `${serialTarget}, falling back to ${tcpTarget}`
+    : config.transport === 'serial' ? serialTarget : tcpTarget} ...`);
   receiver.start();
 });
 

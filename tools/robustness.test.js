@@ -148,6 +148,85 @@ test('out-of-range GPS timestamps cannot throw during receiver parsing', () => {
   });
 });
 
+test('auto transport tries serial first and falls back to TCP when serial does not connect', () => {
+  const ports = [];
+  const sockets = [];
+  const timers = [];
+  class FakePort extends EventEmitter {
+    constructor(options) {
+      super();
+      this.options = options;
+      ports.push(this);
+    }
+    open(callback) { this.openCallback = callback; }
+    write() {}
+    close(callback) { this.isOpen = false; if (callback) callback(); }
+  }
+  const fakeNet = {
+    createConnection(options) {
+      const socket = Object.assign(new EventEmitter(), {
+        options, destroyed: false,
+        setKeepAlive() {}, setTimeout() {}, write() {},
+        destroy() { this.destroyed = true; },
+      });
+      sockets.push(socket);
+      return socket;
+    },
+  };
+  const context = vm.createContext({
+    Buffer, module: { exports: {} },
+    console: { warn() {}, log() {}, error() {} },
+    setTimeout(callback, ms) { timers.push({ callback, ms }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
+    require: (name) => name === 'serialport' ? { SerialPort: FakePort }
+      : name === 'node:net' ? fakeNet
+        : name === './novatel' ? require('../src/novatel') : require(name),
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
+  const receiver = new context.module.exports.ReceiverClient({
+    transport: 'auto', serialPath: 'COM11', serialBaudRate: 9600, serialProbeMs: 5000,
+    receiverHost: '20.20.20.50', receiverPort: 3001, reconnectDelayMs: 3000, idleTimeoutMs: 30000,
+  });
+
+  receiver.start();
+  assert.equal(ports.length, 1);
+  assert.equal(ports[0].options.path, 'COM11');
+  assert.equal(ports[0].options.baudRate, 9600);
+  assert.equal(sockets.length, 0, 'Serial is tried before TCP');
+
+  ports[0].openCallback(new Error('File not found'));
+  assert.equal(sockets.length, 1, 'A failed serial open falls straight back to TCP');
+  assert.equal(sockets[0].options.host, '20.20.20.50');
+  assert.equal(receiver.state.transport, 'tcp');
+  assert.equal(receiver.state.mode, 'auto');
+
+  sockets[0].emit('close');
+  const retry = timers.filter((timer) => !timer.cleared && timer.ms === 3000).pop();
+  retry.callback();
+  assert.equal(ports.length, 2, 'The next cycle tries serial first again');
+  assert.equal(receiver.state.transport, 'serial');
+
+  ports[1].isOpen = true;
+  ports[1].openCallback(null);
+  assert.equal(receiver.state.connected, true);
+  const probe = timers.filter((timer) => !timer.cleared && timer.ms === 5000).pop();
+  probe.callback();
+  assert.equal(sockets.length, 2, 'A silent serial port falls back to TCP');
+  assert.equal(receiver.port, null);
+  assert.match(receiver.state.lastError, /No NovAtel logs on COM11 @ 9600/);
+
+  receiver.stop();
+  receiver.start();
+  ports[2].isOpen = true;
+  ports[2].openCallback(null);
+  const healthyProbe = timers.filter((timer) => !timer.cleared && timer.ms === 5000).pop();
+  ports[2].emit('data', Buffer.from('%ITDETECTSTATUSA,2200,1;0\n'));
+  assert(healthyProbe.cleared, 'A decodable log keeps the serial connection');
+  assert.equal(sockets.length, 2);
+  assert.equal(receiver.state.transport, 'serial');
+  receiver.stop();
+});
+
 test('receiver isolates valid logs, reports connection state and disconnects cleanly', async () => {
   const receivedCommands = [];
   const sockets = new Set();

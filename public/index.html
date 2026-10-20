@@ -48,23 +48,24 @@
     <label>
       Connection
       <select id="connection-transport">
-        <option value="tcp">TCP</option>
+        <option value="auto" selected>Auto (USB serial, then TCP)</option>
         <option value="serial">USB serial</option>
+        <option value="tcp">TCP</option>
       </select>
     </label>
     <div id="tcp-fields" class="connection-fields">
       <label>Receiver IP <input id="receiver-host" type="text" value="20.20.20.50" autocomplete="off" required /></label>
       <label>Port <input id="receiver-port" type="number" value="3001" min="1" max="65535" required /></label>
     </div>
-    <div id="serial-fields" class="connection-fields" hidden>
+    <div id="serial-fields" class="connection-fields">
       <label>COM port <select id="serial-path"><option value="COM11">COM11</option></select></label>
       <label>Baud rate
         <select id="serial-baud-rate">
-          <option value="9600">9600</option>
+          <option value="9600" selected>9600</option>
           <option value="19200">19200</option>
           <option value="38400">38400</option>
           <option value="57600">57600</option>
-          <option value="115200" selected>115200</option>
+          <option value="115200">115200</option>
           <option value="230400">230400</option>
         </select>
       </label>

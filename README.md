@@ -1,12 +1,13 @@
 # NovAtel GNSSBASE Monitor
 
-Connects to a NovAtel PwrPak over TCP, decodes the core logs used by the `GNSSBASE`
+Connects to a NovAtel PwrPak over USB serial (COM11 @ 9600 by default), falling back to TCP
+when serial does not connect, decodes the core logs used by the `GNSSBASE`
 profile and displays them live in a browser. No npm dependencies — Node 18+ only.
 
 ## Run
 
 ```bash
-npm start                       # defaults to 20.20.20.50:3001, UI at http://127.0.0.1:8080
+npm start                       # tries COM11 @ 9600, then 20.20.20.50:3001; UI at http://127.0.0.1:8080
 ```
 
 ## What is displayed
@@ -130,7 +131,10 @@ list, not report counters, live status or chart history.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `NOVATEL_HOST` / `NOVATEL_PORT` | `20.20.20.50` / `3001` | Receiver ICOM endpoint |
+| `NOVATEL_TRANSPORT` | `auto` | `auto` tries USB serial first and falls back to TCP if the port cannot be opened or yields no NovAtel log; each reconnect cycle tries serial again first. Use `serial` or `tcp` to force one transport. |
+| `NOVATEL_SERIAL_PATH` / `NOVATEL_SERIAL_BAUD` | `COM11` / `9600` | USB serial port and baud rate |
+| `NOVATEL_SERIAL_PROBE_MS` | `5000` | In `auto` mode, how long an open serial port may go without a decodable log before falling back to TCP |
+| `NOVATEL_HOST` / `NOVATEL_PORT` | `20.20.20.50` / `3001` | Receiver ICOM endpoint (TCP) |
 | `NOVATEL_SEND_LOG_CMD` | `false` | When `true`, sends `UNLOGALL THISPORT` plus its own `LOG ...A` requests on connect. Leave `false` when the receiver is running [profiles/GNSSBASE.txt](profiles/GNSSBASE.txt), which already pushes these logs to ICOM1 — `UNLOGALL THISPORT` would remove them. |
 | `NOVATEL_RECONNECT_MS` | `3000` | Reconnect delay |
 | `NOVATEL_IDLE_MS` | `30000` | Recycle the socket if no data arrives for this long |

@@ -10,19 +10,22 @@ function integerSetting(name, fallback, minimum, maximum = Number.MAX_SAFE_INTEG
   return value;
 }
 
-const transport = process.env.NOVATEL_TRANSPORT || 'tcp';
-if (!['tcp', 'serial'].includes(transport)) {
-  throw new Error('NOVATEL_TRANSPORT must be tcp or serial');
+const transport = process.env.NOVATEL_TRANSPORT || 'auto';
+if (!['auto', 'tcp', 'serial'].includes(transport)) {
+  throw new Error('NOVATEL_TRANSPORT must be auto, tcp or serial');
 }
 
 const config = {
+  // 'auto' tries USB serial first and falls back to TCP when serial does not connect.
   transport,
 
   // PwrPak ICOM port (raw TCP pass-through to the receiver's command interpreter).
   receiverHost: process.env.NOVATEL_HOST || '20.20.20.50',
   receiverPort: integerSetting('NOVATEL_PORT', 3001, 1, 65535),
   serialPath: process.env.NOVATEL_SERIAL_PATH || 'COM11',
-  serialBaudRate: integerSetting('NOVATEL_SERIAL_BAUD', 115200, 1),
+  serialBaudRate: integerSetting('NOVATEL_SERIAL_BAUD', 9600, 1),
+  // In auto mode, an open serial port without a decodable log within this time falls back to TCP.
+  serialProbeMs: integerSetting('NOVATEL_SERIAL_PROBE_MS', 5000, 1),
 
   // Commands sent after every (re)connect so the receiver starts emitting the logs.
   // Off by default: the GNSSBASE profile already pushes these logs to ICOM1, and

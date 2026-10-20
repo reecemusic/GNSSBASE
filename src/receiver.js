@@ -20,10 +20,14 @@ class ReceiverClient extends EventEmitter {
     this.port = null;
     this.buffer = Buffer.alloc(0);
     this.reconnectTimer = null;
+    this.probeTimer = null;
     this.stopped = true;
+    // In 'auto' mode each connection cycle tries serial first, then falls back to TCP.
+    this.autoTarget = 'serial';
     this.state = {
       connected: false,
-      transport: options.transport || 'tcp',
+      mode: options.transport || 'tcp',
+      transport: this.activeTransport(),
       host: options.receiverHost,
       port: options.receiverPort,
       serialPath: options.serialPath,
@@ -33,9 +37,15 @@ class ReceiverClient extends EventEmitter {
     };
   }
 
+  activeTransport() {
+    if (this.options.transport === 'auto') return this.autoTarget;
+    return this.options.transport === 'serial' ? 'serial' : 'tcp';
+  }
+
   start() {
     if (!this.stopped) return;
     this.stopped = false;
+    this.autoTarget = 'serial';
     this.connect();
   }
 
@@ -56,8 +66,10 @@ class ReceiverClient extends EventEmitter {
     this.stop();
     Object.assign(this.options, settings);
     this.buffer = Buffer.alloc(0);
+    this.autoTarget = 'serial';
     this.updateState({
-      transport: this.options.transport,
+      mode: this.options.transport,
+      transport: this.activeTransport(),
       host: this.options.receiverHost,
       port: this.options.receiverPort,
       serialPath: this.options.serialPath,
@@ -70,6 +82,8 @@ class ReceiverClient extends EventEmitter {
   }
 
   closeCurrentTransport() {
+    clearTimeout(this.probeTimer);
+    this.probeTimer = null;
     const socket = this.socket;
     const port = this.port;
     this.socket = null;
@@ -92,14 +106,28 @@ class ReceiverClient extends EventEmitter {
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.buffer = Buffer.alloc(0);
+    this.state.transport = this.activeTransport();
     try {
-      if (this.options.transport === 'serial') this.connectSerial();
+      if (this.state.transport === 'serial') this.connectSerial();
       else this.connectTcp();
     } catch (error) {
       this.closeCurrentTransport();
-      this.setError(error);
-      this.scheduleReconnect();
+      this.onAttemptFailed(error);
     }
+  }
+
+  /** In auto mode a failed serial attempt falls straight through to TCP; otherwise wait and retry. */
+  onAttemptFailed(error) {
+    this.setError(error);
+    if (this.stopped) return;
+    if (this.options.transport === 'auto' && this.autoTarget === 'serial') {
+      this.autoTarget = 'tcp';
+      console.warn(`[receiver] serial unavailable (${error.message || error}); falling back to TCP`);
+      this.connect();
+      return;
+    }
+    this.autoTarget = 'serial';
+    this.scheduleReconnect();
   }
 
   connectTcp() {
@@ -148,13 +176,36 @@ class ReceiverClient extends EventEmitter {
       }
       if (error) {
         this.port = null;
-        this.setError(error);
-        this.scheduleReconnect();
+        this.onAttemptFailed(error);
         return;
       }
       this.onConnected();
       this.sendConfiguredCommands(port);
+      this.startSerialProbe(port);
     });
+  }
+
+  /** In auto mode, an open serial port only counts once it yields a decodable log (e.g. wrong baud fails). */
+  startSerialProbe(port) {
+    const probeMs = this.options.serialProbeMs;
+    if (this.options.transport !== 'auto' || !(probeMs > 0)) return;
+    this.probeTimer = setTimeout(() => {
+      this.probeTimer = null;
+      if (port !== this.port || this.stopped) return;
+      this.closeCurrentTransport();
+      this.updateState({ connected: false });
+      this.onAttemptFailed(new Error(
+        `No NovAtel logs on ${this.options.serialPath} @ ${this.options.serialBaudRate} within ${probeMs} ms`,
+      ));
+    }, probeMs);
+  }
+
+  emitLog(message) {
+    if (this.probeTimer) {
+      clearTimeout(this.probeTimer);
+      this.probeTimer = null;
+    }
+    this.emit('log', message);
   }
 
   sendConfiguredCommands(transport) {
@@ -180,7 +231,8 @@ class ReceiverClient extends EventEmitter {
   onConnected() {
     this.updateState({
       connected: true,
-      transport: this.options.transport || 'tcp',
+      mode: this.options.transport || 'tcp',
+      transport: this.activeTransport(),
       host: this.options.receiverHost,
       port: this.options.receiverPort,
       serialPath: this.options.serialPath,
@@ -198,6 +250,9 @@ class ReceiverClient extends EventEmitter {
     if (transport !== this.socket && transport !== this.port) return;
     if (transport === this.socket) this.socket = null;
     if (transport === this.port) this.port = null;
+    clearTimeout(this.probeTimer);
+    this.probeTimer = null;
+    this.autoTarget = 'serial';
     this.updateState({ connected: false });
     this.scheduleReconnect();
   }
@@ -229,7 +284,7 @@ class ReceiverClient extends EventEmitter {
         if (binary) {
           if (binary.need) break;
           this.buffer = this.buffer.subarray(binary.consumed);
-          this.emit('log', binary.message);
+          this.emitLog(binary.message);
           continue;
         }
 
@@ -239,7 +294,7 @@ class ReceiverClient extends EventEmitter {
           const line = this.buffer.toString('ascii', 0, newlineIndex);
           this.buffer = this.buffer.subarray(newlineIndex + 1);
           const message = parseAsciiLog(line);
-          if (message) this.emit('log', message);
+          if (message) this.emitLog(message);
           continue;
         }
 

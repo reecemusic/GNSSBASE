@@ -348,6 +348,7 @@ select {
 .tl-band-name { fill: var(--text); font-size: 13px; font-weight: 700; }
 .tl-band-coverage { fill: var(--muted); font-size: 10px; }
 .tl-power-line { stroke-width: 1.5; }
+.tl-band-box { fill: none; stroke: rgba(140, 148, 164, .28); stroke-width: 1; pointer-events: none; }
 .tl-axis-ago { fill: var(--muted); font-size: 9px; font-style: italic; }
 .tl-now-line { stroke: #4fc3f7; stroke-width: 2; stroke-dasharray: 5 3; }
 .tl-now-label { fill: #4fc3f7; font-size: 11px; font-weight: 700; letter-spacing: .08em; }

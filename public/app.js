@@ -144,7 +144,7 @@ const serialPathSelect = $('serial-path');
 
 connectionTransport.addEventListener('change', () => {
   updateConnectionFields();
-  if (connectionTransport.value === 'serial') refreshSerialPorts();
+  if (connectionTransport.value !== 'tcp') refreshSerialPorts();
 });
 
 $('disconnect').addEventListener('click', async () => {
@@ -167,18 +167,18 @@ connectionForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const message = $('connection-message');
   const button = connectionForm.querySelector('button[type="submit"]');
-  const isSerial = connectionTransport.value === 'serial';
-  const settings = isSerial
-    ? {
-      transport: 'serial',
-      serialPath: serialPathSelect.value,
-      serialBaudRate: Number($('serial-baud-rate').value),
-    }
-    : {
-      transport: 'tcp',
-      receiverHost: $('receiver-host').value,
-      receiverPort: Number($('receiver-port').value),
-    };
+  const transport = connectionTransport.value;
+  const serial = {
+    serialPath: serialPathSelect.value,
+    serialBaudRate: Number($('serial-baud-rate').value),
+  };
+  const tcp = {
+    receiverHost: $('receiver-host').value,
+    receiverPort: Number($('receiver-port').value),
+  };
+  const settings = transport === 'serial' ? { transport, ...serial }
+    : transport === 'tcp' ? { transport, ...tcp }
+      : { transport: 'auto', ...serial, ...tcp };
 
   button.disabled = true;
   message.textContent = 'Applying connection settings...';
@@ -198,9 +198,9 @@ connectionForm.addEventListener('submit', async (event) => {
 });
 
 function updateConnectionFields() {
-  const serial = connectionTransport.value === 'serial';
-  $('tcp-fields').hidden = serial;
-  $('serial-fields').hidden = !serial;
+  const transport = connectionTransport.value;
+  $('tcp-fields').hidden = transport === 'serial';
+  $('serial-fields').hidden = transport === 'tcp';
 }
 
 async function refreshSerialPorts(selectedPath = serialPathSelect.value) {
@@ -376,9 +376,10 @@ function renderStatus(status) {
   const target = status.transport === 'serial'
     ? `${status.serialPath} @ ${status.baudRate}`
     : `${status.host}:${status.port}`;
+  const via = status.mode === 'auto' ? `${target} (auto${status.transport === 'tcp' ? ', TCP fallback' : ''})` : target;
   $('status-text').textContent = status.connected
-    ? `Connected via ${target}`
-    : `Disconnected from ${target}${status.lastError ? ` — ${status.lastError}` : ''}`;
+    ? `Connected via ${via}`
+    : `Disconnected from ${via}${status.lastError ? ` — ${status.lastError}` : ''}`;
 }
 
 function applyRecord(record) {
@@ -920,6 +921,9 @@ function renderTimeline() {
     chart.append(svg('rect', {
       x: TIMELINE.left, y: y + 1, width: plotWidth, height: rowHeight - 2, class: 'tl-row',
     }));
+    chart.append(svg('rect', {
+      x: 3, y: y + 2, width: width - 6, height: rowHeight - 4, rx: 6, class: 'tl-band-box',
+    }));
     const bandInfo = TIMELINE_BAND_INFO[bandId];
     chart.append(svg('text', { x: 8, y: y + rowHeight / 2 - 12, class: 'tl-band-name' }, bandId));
     chart.append(svg('text', { x: 8, y: y + rowHeight / 2 + 2, class: 'tl-band-coverage' }, bandInfo.coverage));
@@ -932,7 +936,7 @@ function renderTimeline() {
       }));
       chart.append(svg('text', { x: TIMELINE.left - 8, y: py + 4, class: 'tl-label' }, String(power)));
     }
-    chart.append(svg('text', { x: TIMELINE.left - 8, y: y + rowHeight - 10, class: 'tl-label' }, 'Status'));
+    chart.append(svg('text', { x: TIMELINE.left - 8, y: y + rowHeight - 13, class: 'tl-label' }, 'Status'));
   });
 
   for (const [index, band] of bandIds.entries()) {
@@ -960,7 +964,7 @@ function renderTimeline() {
       const color = hit ? powerColour(sample.maxPower) : 'rgba(61,220,132,.65)';
       const status = svg('rect', {
         x: Math.max(TIMELINE.left, Math.min(width - TIMELINE.right - 3, x - 1.5)),
-        y: y + rowHeight - 20, width: 3, height: 12,
+        y: y + rowHeight - 26, width: 3, height: 18,
         fill: hit ? powerColour(sample.maxPower) : 'rgba(61,220,132,.35)',
       });
       const description = `${band}, ${formatTimestamp(sample.t, true)}: `
