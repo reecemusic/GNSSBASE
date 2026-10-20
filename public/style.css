@@ -348,6 +348,10 @@ select {
 .tl-band-name { fill: var(--text); font-size: 13px; font-weight: 700; }
 .tl-band-coverage { fill: var(--muted); font-size: 10px; }
 .tl-power-line { stroke-width: 1.5; }
+.tl-axis-ago { fill: var(--muted); font-size: 9px; font-style: italic; }
+.tl-now-line { stroke: #4fc3f7; stroke-width: 2; stroke-dasharray: 5 3; }
+.tl-now-label { fill: #4fc3f7; font-size: 11px; font-weight: 700; letter-spacing: .08em; }
+.tl-now-time { fill: #4fc3f7; font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .timeline-controls { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem; }
 .plot-help { color: var(--muted); font-size: .75rem; }
 #timeline, .spectrum-chart svg { touch-action: none; user-select: none; cursor: grab; }

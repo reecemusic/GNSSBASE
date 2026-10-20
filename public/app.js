@@ -735,7 +735,7 @@ function recordLiveHistory(record) {
 
 // --- interference timeline --------------------------------------------------
 
-const TIMELINE = { width: 900, height: 500, left: 142, right: 12, top: 28, bottom: 32 };
+const TIMELINE = { width: 900, height: 500, left: 142, right: 12, top: 28, bottom: 46 };
 const TIMELINE_BANDS = ['L1', 'L2', 'L5'];
 const TIMELINE_BAND_INFO = {
   L1: { coverage: 'E1 / B1 / G1', range: '1559–1610 MHz' },
@@ -752,6 +752,75 @@ function timelineViewport(now = Date.now()) {
   return { start: end - windowMs, end, windowMs };
 }
 
+// Fraction of the time axis kept to the right of the viewport end so "now" sits inset from the edge.
+const TIMELINE_NOW_INSET = 0.1;
+const TIMELINE_TICK_STEPS = [
+  10e3, 15e3, 30e3, 60e3, 120e3, 300e3, 600e3, 900e3, 1800e3,
+  3600e3, 7200e3, 10800e3, 21600e3, 43200e3, 86400e3,
+];
+
+function timelineAxisMs(windowMs) {
+  return windowMs / (1 - TIMELINE_NOW_INSET);
+}
+
+/** Display axis for a viewport: spans the viewport plus headroom, mapping times to plot-relative x. */
+function timelineAxis(start, windowMs, plotWidth, now = Date.now()) {
+  const axisMs = timelineAxisMs(windowMs);
+  const end = start + axisMs;
+  return {
+    start, end, axisMs, plotWidth,
+    dataEnd: Math.min(now, end),
+    now: now >= start && now <= end ? now : null,
+    x: (time) => (time - start) / axisMs * plotWidth,
+  };
+}
+
+function formatTimeSince(ms) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds} s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return `${hours} hr${hours === 1 ? '' : 's'}${rest ? ` ${rest} min` : ''} ago`;
+}
+
+/** Tick times at whole steps before now (e.g. 1 hr ago, 2 hrs ago) that fall inside the axis. */
+function timelineTicks(axis, now = Date.now()) {
+  const maxTicks = Math.max(2, Math.floor(axis.plotWidth / 110));
+  const step = TIMELINE_TICK_STEPS.find((candidate) => axis.axisMs / candidate <= maxTicks)
+    || TIMELINE_TICK_STEPS[TIMELINE_TICK_STEPS.length - 1];
+  const ticks = [];
+  for (let k = Math.max(1, Math.ceil((now - axis.end) / step)); now - k * step >= axis.start; k++) {
+    ticks.push(now - k * step);
+  }
+  return ticks.reverse();
+}
+
+/** Draws relative time ticks and the NOW marker shared by the timeline and frequency plots. */
+function appendTimeAxis(chart, axis, layout, now = Date.now()) {
+  const { left, top, bottom, labelY, nowLabelY, gridClass, labelClass } = layout;
+  const right = left + axis.plotWidth;
+  const anchorFor = (x) => (x - left < 40 ? 'start' : right - x < 40 ? 'end' : 'middle');
+  for (const time of timelineTicks(axis, now)) {
+    const x = left + axis.x(time);
+    const anchor = anchorFor(x);
+    chart.append(svg('line', { x1: x, x2: x, y1: top, y2: bottom, class: gridClass }));
+    chart.append(svg('text', { x, y: labelY, class: labelClass, style: `text-anchor:${anchor}` }, utcLabel(time)));
+    chart.append(svg('text', { x, y: labelY + 12, class: 'tl-axis-ago', style: `text-anchor:${anchor}` },
+      formatTimeSince(now - time)));
+  }
+  if (axis.now === null) return;
+  const x = left + axis.x(axis.now);
+  const anchor = anchorFor(x);
+  const marker = svg('line', { x1: x, x2: x, y1: top, y2: bottom, class: 'tl-now-line' });
+  marker.append(svg('title', {}, `Now: ${utcLabel(axis.now)}`));
+  chart.append(marker);
+  chart.append(svg('text', { x, y: nowLabelY, class: 'tl-now-label', style: `text-anchor:${anchor}` }, 'NOW'));
+  chart.append(svg('text', { x, y: labelY, class: 'tl-now-time', style: `text-anchor:${anchor}` }, utcLabel(axis.now)));
+  chart.append(svg('text', { x, y: labelY + 12, class: 'tl-now-time', style: `text-anchor:${anchor}` }, 'now'));
+}
+
 function setTimelineView(end, windowMs) {
   state.timelineView = { end, windowMs };
   const view = timelineViewport();
@@ -762,8 +831,8 @@ function setTimelineView(end, windowMs) {
 function zoomTimeline(factor, fraction = 0.5) {
   const view = timelineViewport();
   const windowMs = Math.max(10000, Math.min(state.windowMinutes * 60000, view.windowMs * factor));
-  const anchor = view.start + fraction * view.windowMs;
-  setTimelineView(anchor + (1 - fraction) * windowMs, windowMs);
+  const anchor = view.start + fraction * timelineAxisMs(view.windowMs);
+  setTimelineView(anchor - fraction * timelineAxisMs(windowMs) + windowMs, windowMs);
 }
 
 function initTimelineControls() {
@@ -806,7 +875,7 @@ function initTimePlotNavigation(chart) {
   });
   chart.addEventListener('pointermove', (event) => {
     if (!drag || event.pointerId !== drag.id) return;
-    const offset = (event.clientX - drag.x) / drag.width * drag.view.windowMs;
+    const offset = (event.clientX - drag.x) / drag.width * timelineAxisMs(drag.view.windowMs);
     setTimelineView(drag.view.end - offset, drag.view.windowMs);
   });
   const endDrag = (event) => {
@@ -837,8 +906,10 @@ function renderTimeline() {
   const bandIds = TIMELINE_BANDS;
   const rowHeight = (TIMELINE.height - TIMELINE.top - TIMELINE.bottom) / bandIds.length;
   const plotWidth = width - TIMELINE.left - TIMELINE.right;
+  const now = Date.now();
+  const axis = timelineAxis(start, windowMs, plotWidth, now);
 
-  const samples = state.interferenceHistory.filter((sample) => sample.t >= start && sample.t <= end
+  const samples = state.interferenceHistory.filter((sample) => sample.t >= start && sample.t <= axis.dataEnd
     && (sample.signal === 'ALL' || bandIds.includes(classifyBand(sample.signal, []))))
     .sort((a, b) => a.t - b.t);
   $('timeline-range').textContent = `(${samples.length} samples, ${(windowMs / 1000).toFixed(0)} s window)`;
@@ -874,7 +945,7 @@ function renderTimeline() {
         segment++;
       }
       lastTime = sample.t;
-      const pixel = Math.round((sample.t - start) / windowMs * plotWidth);
+      const pixel = Math.round(axis.x(sample.t));
       const previous = pixels.get(pixel)?.sample;
       if (!previous || (sample.count > 0 && (!previous.count
         || (Number.isFinite(sample.maxPower) && (!Number.isFinite(previous.maxPower) || sample.maxPower > previous.maxPower))))) {
@@ -883,7 +954,7 @@ function renderTimeline() {
     }
     let previous = null;
     for (const { sample, segment } of pixels.values()) {
-      const x = TIMELINE.left + ((sample.t - start) / windowMs) * plotWidth;
+      const x = TIMELINE.left + axis.x(sample.t);
       const y = TIMELINE.top + index * rowHeight;
       const hit = sample.count > 0;
       const color = hit ? powerColour(sample.maxPower) : 'rgba(61,220,132,.65)';
@@ -915,17 +986,15 @@ function renderTimeline() {
 
   renderSpectrumPlots(start, end, windowMs);
 
-  for (let i = 0; i <= 4; i++) {
-    const x = TIMELINE.left + (i / 4) * plotWidth;
-    // Keep the end labels inside the plot instead of overflowing the viewBox.
-    const anchor = i === 0 ? 'start' : i === 4 ? 'end' : 'middle';
-    chart.append(svg('line', {
-      x1: x, y1: TIMELINE.top, x2: x, y2: TIMELINE.height - TIMELINE.bottom, class: 'tl-grid',
-    }));
-    chart.append(svg('text', {
-      x, y: TIMELINE.height - 20, class: 'tl-axis', style: `text-anchor:${anchor}`,
-    }, utcLabel(start + (i / 4) * windowMs)));
-  }
+  appendTimeAxis(chart, axis, {
+    left: TIMELINE.left,
+    top: TIMELINE.top,
+    bottom: TIMELINE.height - TIMELINE.bottom,
+    labelY: TIMELINE.height - 32,
+    nowLabelY: TIMELINE.top - 8,
+    gridClass: 'tl-grid',
+    labelClass: 'tl-axis',
+  }, now);
 
   chart.append(svg('text', { x: TIMELINE.left, y: TIMELINE.height - 5, class: 'tl-title' },
     state.timeZone === 'Asia/Dubai' ? 'UAE' : state.timeZone));
@@ -993,17 +1062,20 @@ function spectrumAllocation([label, system, centerOrStart, widthOrEnd]) {
 
 function renderSpectrumPlots(start, end, windowMs) {
   const container = $('spectrum-plots');
-  const historyHits = state.interferenceHistory.filter((sample) => sample.t >= start && sample.t <= end && sample.count > 0);
   const availableWidth = Math.min(1920, Math.max(360, Math.round(container.getBoundingClientRect().width) || 900));
   const { left, right } = TIMELINE;
+  const now = Date.now();
+  const axis = timelineAxis(start, windowMs, availableWidth - left - right, now);
+  const historyHits = state.interferenceHistory.filter((sample) => sample.t >= start && sample.t <= axis.dataEnd
+    && sample.count > 0);
 
   for (const plot of SPECTRUM_PLOTS) {
     const top = 18;
-    const axisHeight = 30;
+    const axisHeight = 40;
     const plotHeight = 220;
     const height = top + plotHeight + axisHeight;
     const plotWidth = availableWidth - left - right;
-    const xFor = (time) => left + (time - start) / windowMs * plotWidth;
+    const xFor = (time) => left + axis.x(time);
     const yFor = (frequency) => top + (plot.max - frequency) / (plot.max - plot.min) * plotHeight;
     let elements = spectrumCharts.get(plot.id);
     if (!elements) {
@@ -1138,20 +1210,17 @@ function renderSpectrumPlots(start, end, windowMs) {
 
     for (let tick = 0; tick <= 4; tick++) {
       const frequency = plot.min + ((plot.max - plot.min) * tick) / 4;
-      const x = left + plotWidth * tick / 4;
-      const y = yFor(frequency);
-      svgChart.append(svg('line', {
-        x1: x, y1: top, x2: x, y2: top + plotHeight,
-        class: 'spectrum-grid',
-      }));
       svgChart.append(svg('text', {
-        x: left - 8, y: y + 4, class: 'spectrum-label',
+        x: left - 8, y: yFor(frequency) + 4, class: 'spectrum-label',
       }, frequency.toFixed(1)));
-      svgChart.append(svg('text', {
-        x, y: height - 7, class: 'spectrum-axis',
-        style: `text-anchor:${tick === 0 ? 'start' : tick === 4 ? 'end' : 'middle'}`,
-      }, utcLabel(start + windowMs * tick / 4)));
     }
+    appendTimeAxis(svgChart, axis, {
+      left, top, bottom: top + plotHeight,
+      labelY: height - 19,
+      nowLabelY: 12,
+      gridClass: 'spectrum-grid',
+      labelClass: 'spectrum-axis',
+    }, now);
     svgChart.append(svg('text', { x: left - 8, y: 11, class: 'spectrum-label' }, 'MHz'));
   }
 }

@@ -230,6 +230,7 @@ test('timeline places band names and frequency coverage in the left axis gutter'
     svg: (tag, attrs, text) => Object.assign(element(), { tag, attributes: attrs, textContent: text }),
   });
   loadFunctions(browserCode, 'const TIMELINE =', 'function timelineViewport(', context);
+  loadFunctions(browserCode, 'const TIMELINE_NOW_INSET =', 'function setTimelineView(', context);
   loadFunctions(browserCode, 'function timelinePowerY(', 'const SPECTRUM_PLOTS =', context);
   context.renderTimeline();
 
@@ -433,6 +434,7 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
   const saved = {};
   let renders = 0;
   const context = vm.createContext({
+    Date: class extends Date { static now() { return now; } },
     TIMELINE: { left: 68, right: 12 },
     state: {
       hiddenSignals: new Set(),
@@ -462,6 +464,7 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
     renderTimeline() { renders++; context.renderSpectrumPlots(1000000, now, 60000); },
   });
   loadFunctions(browserCode, 'const SPECTRUM_PLOTS =', 'function utcLabel(', context);
+  loadFunctions(browserCode, 'const TIMELINE_NOW_INSET =', 'function setTimelineView(', context);
   context.renderSpectrumPlots(1000000, now, 60000);
 
   const sections = container.children.filter((child) => child.className === 'spectrum-chart');
@@ -484,7 +487,8 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
     .some((child) => child.attributes.class === 'spectrum-detection'));
   const l5Chart = sections[2].children.find((child) => child.tag === 'svg');
   const detection = l5Chart.children.find((child) => child.attributes.class === 'spectrum-detection');
-  assert.equal(detection.attributes.x, 476);
+  // The 60 s window occupies the left 90% of the axis; the rest is headroom right of NOW.
+  assert.equal(detection.attributes.x, 68 + 30000 / (60000 / 0.9) * 820 - 2);
   assert(detection.attributes.height > 3);
   assert.equal(detection.attributes.width, 4);
   assert.match(detection.children[0].textContent, /1176\.450 MHz, 20\.460 MHz bandwidth/);
@@ -496,7 +500,15 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
   assert(allocation.attributes.height < allocation.attributes.width);
   const timeLabels = l5Chart.children.filter((child) => child.attributes.class === 'spectrum-axis');
   assert.equal(timeLabels[0].textContent, 't1000000');
-  assert.equal(timeLabels[timeLabels.length - 1].textContent, `t${now}`);
+  assert.equal(timeLabels[timeLabels.length - 1].textContent, `t${now - 10000}`);
+  const agoLabels = l5Chart.children.filter((child) => child.attributes.class === 'tl-axis-ago')
+    .map((child) => child.textContent);
+  assert.equal(agoLabels[0], '1 min ago');
+  assert.equal(agoLabels[agoLabels.length - 1], '10 s ago');
+  const nowLine = l5Chart.children.find((child) => child.attributes.class === 'tl-now-line');
+  assert(Math.abs(nowLine.attributes.x1 - (68 + 0.9 * 820)) < 1e-9, 'NOW sits inset from the right edge');
+  assert(l5Chart.children.some((child) => child.attributes.class === 'tl-now-label' && child.textContent === 'NOW'));
+  assert(l5Chart.children.some((child) => child.attributes.class === 'tl-now-time' && child.textContent === `t${now}`));
   assert(sections[2].children[0].children[0].textContent.includes('1 hit'));
   const centreLines = l5Chart.children.filter((child) => child.attributes.class === 'spectrum-centre-line');
   assert.equal(centreLines.length, 6);
@@ -568,17 +580,18 @@ test('linked plot navigation clamps history and zoom and handles drag cancellati
   get('timeline-zoom-in').handlers.click();
   assert.equal(context.timelineViewport().windowMs, 1800000);
   const before = context.timelineViewport();
-  const anchor = before.start + before.windowMs / 4;
+  const axisMs = (windowMs) => windowMs / 0.9;
+  const anchor = before.start + axisMs(before.windowMs) / 4;
   let prevented = false;
   chart.handlers.wheel({ clientX: 273, deltaY: -1, preventDefault() { prevented = true; } });
   assert(prevented);
   const after = context.timelineViewport();
   assert.equal(after.windowMs, 1440000);
-  assert.equal(after.start + after.windowMs / 4, anchor);
+  assert(Math.abs(after.start + axisMs(after.windowMs) / 4 - anchor) < 1e-6, 'Wheel zoom keeps the time under the cursor');
   const originalEnd = after.end;
   chart.handlers.pointerdown({ button: 0, clientX: 273, pointerId: 7 });
   chart.handlers.pointermove({ clientX: 355, pointerId: 7 });
-  assert.equal(context.timelineViewport().end, originalEnd - after.windowMs / 10);
+  assert(Math.abs(context.timelineViewport().end - (originalEnd - axisMs(after.windowMs) / 10)) < 1e-6);
   chart.handlers.pointercancel({ pointerId: 7 });
   const cancelledEnd = context.timelineViewport().end;
   chart.handlers.pointermove({ clientX: 400, pointerId: 7 });
@@ -650,6 +663,12 @@ test('power chart plots measured power only, preserves gaps and shares its exact
   assert.equal(lines[0].attributes.x2, points[1].attributes.cx);
   assert(points[0].attributes.cy > points[1].attributes.cy);
   assert.equal(get('timeline-mode').textContent, 'Historical view');
+  const nowLine = chart.children.find((child) => child.attributes.class === 'tl-now-line');
+  assert(Math.abs(nowLine.attributes.x1 - (142 + 0.9 * 746)) < 1e-9, 'NOW is inset from the right edge');
+  assert(chart.children.some((child) => child.attributes.class === 'tl-now-label' && child.textContent === 'NOW'));
+  const agoLabels = chart.children.filter((child) => child.attributes.class === 'tl-axis-ago');
+  assert(agoLabels.length > 1 && agoLabels.every((child) => / ago$/.test(child.textContent)));
+  assert.equal(agoLabels[agoLabels.length - 1].textContent, '15 s ago');
   const titles = chart.children.flatMap((child) => child.children.map((title) => title.textContent));
   assert(titles.some((title) => title.includes('Clear (no measured power)')));
   assert(titles.some((title) => title.includes('Power unknown')));
