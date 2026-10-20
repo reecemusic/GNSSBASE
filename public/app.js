@@ -881,7 +881,7 @@ function recordSolution(data, now) {
 
 // --- interference timeline --------------------------------------------------
 
-const TIMELINE = { width: 900, height: 680, left: 142, right: 12, top: 28, bottom: 46, solutionRow: 90 };
+const TIMELINE = { width: 900, height: 680, left: 168, right: 72, top: 28, bottom: 46, solutionRow: 90 };
 const TIMELINE_SOLUTION_ROWS = 2;
 const TIMELINE_BANDS = ['L1', 'L2', 'L5'];
 const TIMELINE_BAND_INFO = {
@@ -1057,6 +1057,12 @@ function timelinePowerY(power, index, rowHeight) {
     + (1 - (Math.max(-130, Math.min(-70, power)) + 130) / 60) * (rowHeight - 52);
 }
 
+/** A y-axis label drawn in both the left and right margins so values can be read from either side. */
+function appendYLabel(chart, y, text, width, className = 'tl-label') {
+  chart.append(svg('text', { x: TIMELINE.left - 8, y, class: className }, text));
+  chart.append(svg('text', { x: width - TIMELINE.right + 8, y, class: `${className} tl-label-right` }, text));
+}
+
 function renderTimeline() {
   const chart = $('timeline');
   chart.replaceChildren();
@@ -1099,9 +1105,9 @@ function renderTimeline() {
       chart.append(svg('line', {
         x1: TIMELINE.left, x2: width - TIMELINE.right, y1: py, y2: py, class: 'tl-grid',
       }));
-      chart.append(svg('text', { x: TIMELINE.left - 8, y: py + 4, class: 'tl-label' }, String(power)));
+      appendYLabel(chart, py + 4, String(power), width);
     }
-    chart.append(svg('text', { x: TIMELINE.left - 8, y: y + rowHeight - 13, class: 'tl-label' }, 'Status'));
+    appendYLabel(chart, y + rowHeight - 13, 'Status', width);
   });
 
   if (archive) drawArchiveTimeline(chart, axis, archive, bandIds, rowHeight, width);
@@ -1305,11 +1311,12 @@ function solutionRuns(samples, start, end, key) {
     const sample = samples[index];
     if (sample.t > end) break;
     const next = samples[index + 1];
-    const stop = Math.min(next ? next.t : end, sample.t + SOLUTION_HOLD_MS, end);
+    const stop = Math.min(next ? next.t : end, Number.isFinite(sample.end) ? sample.end : sample.t + SOLUTION_HOLD_MS, end);
     const value = key(sample);
-    if (stop <= start || value === null) continue;
+    if (stop <= Math.max(start, sample.t) || value === null) continue;
     const last = runs[runs.length - 1];
-    if (last && last.value === value && last.end >= sample.t) {
+    if (last && last.value === value && Boolean(last.last.archive) === Boolean(sample.archive)
+      && last.last.source === sample.source && last.end >= sample.t) {
       last.end = stop;
       last.last = sample;
     } else {
@@ -1319,25 +1326,129 @@ function solutionRuns(samples, start, end, key) {
   return runs;
 }
 
+/** Archive intervals fill gaps in local history; never let archived values become live readouts. */
+function timelineSolutionSamples(start, end) {
+  const live = (state.solutionHistory || []).filter((sample) => sample.t >= start - SOLUTION_HOLD_MS && sample.t <= end)
+    .map((sample, index, samples) => ({
+      ...sample, end: Math.min(sample.t + SOLUTION_HOLD_MS, samples[index + 1]?.t ?? end, end),
+    }));
+  const archive = state.archive?.shown ? state.archive.data?.solution || [] : [];
+  const bestsats = state.archive?.shown ? state.archive.data?.bestsats || [] : [];
+  const bestpos = mergeSolutionIntervals(live, archive.map((sample) => ({ ...sample, archive: true })), start, end);
+  return mergeSolutionIntervals(bestpos, bestsats.map((sample) => ({ ...sample, archive: true, source: 'BESTSATS' })), start, end);
+}
+
+function mergeSolutionIntervals(primary, fallback, start, end) {
+  const combined = [...primary];
+  let primaryIndex = 0;
+  for (let index = 0; index < fallback.length; index++) {
+    const sample = fallback[index];
+    let cursor = Math.max(start, sample.t);
+    const stop = Math.min(end, sample.end, fallback[index + 1]?.t ?? end);
+    if (stop <= cursor) continue;
+    while (primaryIndex < primary.length && primary[primaryIndex].end <= cursor) primaryIndex++;
+    for (let i = primaryIndex; i < primary.length && primary[i].t < stop; i++) {
+      if (primary[i].t > cursor) combined.push({ ...sample, t: cursor, end: primary[i].t });
+      cursor = Math.max(cursor, primary[i].end);
+      if (cursor >= stop) break;
+    }
+    if (cursor < stop) combined.push({ ...sample, t: cursor, end: stop });
+  }
+  return combined.sort((a, b) => a.t - b.t);
+}
+
+/** Text for the live (latest) solution: tier, headline value and detail, or null when BESTPOS has gone stale. */
+function liveSolution(now = Date.now()) {
+  const history = state.solutionHistory || [];
+  const latest = history[history.length - 1];
+  if (!latest || now - latest.t > SOLUTION_HOLD_MS) return null;
+  const tier = fixTier(latest);
+  return {
+    used: latest.used,
+    tracked: latest.tracked,
+    tier,
+    fix: latest.status && latest.status !== 'SOL_COMPUTED' ? latest.status : (latest.type || '—'),
+  };
+}
+
+// Live values roll in when they change; the change time lets re-renders resume the animation mid-way.
+const SOLUTION_ROLL_MS = 450;
+let solutionRoll = { used: undefined, fix: undefined, usedAt: 0, fixAt: 0, usedDirection: 'up' };
+
+function solutionRollAttributes(key, now) {
+  const elapsed = now - solutionRoll[`${key}At`];
+  if (elapsed >= SOLUTION_ROLL_MS) return {};
+  const direction = key === 'used' ? solutionRoll.usedDirection : 'up';
+  return { class: `tl-roll-${direction}`, style: `animation-delay:-${Math.max(0, elapsed)}ms` };
+}
+
+/** Large live readouts in the row header boxes: satellites used now, and the current fix type. */
+function drawSolutionLive(chart, top, rowHeight, now) {
+  const live = liveSolution(now);
+  const used = live && Number.isInteger(live.used) ? live.used : null;
+  const fix = live ? live.fix : null;
+  if (used !== solutionRoll.used) {
+    if (solutionRoll.used !== undefined) {
+      solutionRoll.usedAt = now;
+      solutionRoll.usedDirection = used !== null && solutionRoll.used !== null && used < solutionRoll.used ? 'down' : 'up';
+    }
+    solutionRoll.used = used;
+  }
+  if (fix !== solutionRoll.fix) {
+    if (solutionRoll.fix !== undefined) solutionRoll.fixAt = now;
+    solutionRoll.fix = fix;
+  }
+
+  const satValue = svg('text', { x: 8, y: top + 70, class: `tl-live-value${used === null ? ' stale' : ''}` },
+    used === null ? '—' : String(used));
+  const usedRoll = solutionRollAttributes('used', now);
+  if (usedRoll.class) {
+    satValue.setAttribute('class', `tl-live-value ${usedRoll.class}`);
+    satValue.setAttribute('style', usedRoll.style);
+  }
+  satValue.append(svg('title', {}, used === null ? 'No live BESTPOS in the last 35 s'
+    : `${used} satellites used now${Number.isInteger(live.tracked) ? ` of ${live.tracked} tracked` : ''}`));
+  chart.append(satValue);
+  chart.append(svg('text', { x: 8 + Math.max(1, String(used ?? '—').length) * 16 + 6, y: top + 70, class: 'tl-live-detail' },
+    used === null ? 'no live data' : Number.isInteger(live.tracked) ? `of ${live.tracked} tracked` : 'used'));
+
+  const fixY = top + rowHeight;
+  const colour = live ? FIX_TIERS[live.tier].colour : null;
+  const fixAttributes = { x: 8, y: fixY + 56, class: `tl-live-fix${live ? '' : ' stale'}` };
+  if (colour) fixAttributes.fill = colour;
+  // Long NovAtel type names are squeezed to fit the header box.
+  if (fix && fix.length > 10) Object.assign(fixAttributes, { textLength: TIMELINE.left - 82, lengthAdjust: 'spacingAndGlyphs' });
+  const fixValue = svg('text', fixAttributes, fix ?? '—');
+  const fixRoll = solutionRollAttributes('fix', now);
+  if (fixRoll.class) {
+    fixValue.setAttribute('class', `tl-live-fix ${fixRoll.class}`);
+    fixValue.setAttribute('style', fixRoll.style);
+  }
+  fixValue.append(svg('title', {}, live ? `Current fix: ${FIX_TIERS[live.tier].label} (${fix})` : 'No live BESTPOS in the last 35 s'));
+  chart.append(fixValue);
+  chart.append(svg('text', { x: 8, y: fixY + 74, class: 'tl-live-detail' }, live ? FIX_TIERS[live.tier].label : 'no live data'));
+}
+
 /** Satellites used and fix type from BESTPOS, drawn as two rows beneath the band rows on the shared time axis. */
 function drawSolutionTimeline(chart, axis, top, width) {
   const rowHeight = TIMELINE.solutionRow;
   const right = width - TIMELINE.right;
   const xFor = (time) => Math.max(TIMELINE.left, Math.min(right, TIMELINE.left + axis.x(time)));
-  const samples = (state.solutionHistory || []).filter((sample) => sample.t >= axis.start - SOLUTION_HOLD_MS
-    && sample.t <= axis.dataEnd);
-  const range = (run) => `${formatTimestamp(run.start, true)} – ${formatTimestamp(run.end, true)}`;
+  const samples = timelineSolutionSamples(axis.start, axis.dataEnd);
+  const range = (run) => `${formatTimestamp(run.start, true)} – ${formatTimestamp(run.end, true)}${run.first.archive ? ' (archive)' : ''}`
+    + `${run.first.source === 'BESTSATS' ? ' · BESTSATS: GOOD satellites; fix type unavailable' : ''}`;
   const rows = [
     ['Satellites', 'used in solution'],
-    ['Fix type', 'BESTPOS'],
+    ['Fix type', 'BESTPOS only'],
   ];
   rows.forEach(([name, detail], index) => {
     const y = top + index * rowHeight;
     chart.append(svg('rect', { x: TIMELINE.left, y: y + 1, width: right - TIMELINE.left, height: rowHeight - 2, class: 'tl-row' }));
     chart.append(svg('rect', { x: 3, y: y + 2, width: width - 6, height: rowHeight - 4, rx: 6, class: 'tl-band-box' }));
-    chart.append(svg('text', { x: 8, y: y + rowHeight / 2 - 4, class: 'tl-band-name' }, name));
-    chart.append(svg('text', { x: 8, y: y + rowHeight / 2 + 12, class: 'tl-band-coverage' }, detail));
+    chart.append(svg('text', { x: 8, y: y + 22, class: 'tl-band-name' }, name));
+    chart.append(svg('text', { x: 8, y: y + 38, class: 'tl-band-coverage' }, detail));
   });
+  drawSolutionLive(chart, top, rowHeight, Date.now());
   if (!samples.length) {
     for (let index = 0; index < rows.length; index++) {
       chart.append(svg('text', {
@@ -1356,7 +1467,7 @@ function drawSolutionTimeline(chart, axis, top, width) {
   for (const count of [0, Math.round(maxUsed / 2), maxUsed]) {
     const y = satY(count);
     chart.append(svg('line', { x1: TIMELINE.left, x2: right, y1: y, y2: y, class: 'tl-grid' }));
-    chart.append(svg('text', { x: TIMELINE.left - 8, y: y + 4, class: 'tl-label' }, String(count)));
+    appendYLabel(chart, y + 4, String(count), width);
   }
   let path = '';
   let previous = null;
@@ -1378,10 +1489,15 @@ function drawSolutionTimeline(chart, axis, top, width) {
   const laneHeight = (rowHeight - 12) / FIX_TIERS.length;
   const laneY = (tier) => fixTop + (FIX_TIERS.length - 1 - tier) * laneHeight;
   FIX_TIERS.forEach((tier, index) => {
-    chart.append(svg('text', { x: TIMELINE.left - 8, y: laneY(index) + laneHeight / 2 + 3, class: 'tl-label tl-fix-label' }, tier.label));
+    appendYLabel(chart, laneY(index) + laneHeight / 2 + 4, tier.label, width, 'tl-label tl-fix-label');
   });
   const fixRuns = solutionRuns(samples, axis.start, axis.dataEnd, (sample) => (sample.type || sample.status
     ? `${fixTier(sample)}|${sample.status || ''}|${sample.type || ''}` : null));
+  if (!fixRuns.length) {
+    chart.append(svg('text', {
+      x: (TIMELINE.left + right) / 2, y: top + rowHeight * 1.5 + 4, class: 'tl-solution-empty',
+    }, 'Fix type unavailable: BESTSATS does not report it'));
+  }
   for (const run of fixRuns) {
     const tier = fixTier(run.first);
     const x1 = xFor(run.start);
@@ -1621,9 +1737,9 @@ function renderSpectrumPlots(start, end, windowMs) {
 
     for (let tick = 0; tick <= 4; tick++) {
       const frequency = plot.min + ((plot.max - plot.min) * tick) / 4;
-      svgChart.append(svg('text', {
-        x: left - 8, y: yFor(frequency) + 4, class: 'spectrum-label',
-      }, frequency.toFixed(1)));
+      for (const [x, className] of [[left - 8, 'spectrum-label'], [left + plotWidth + 8, 'spectrum-label spectrum-label-right']]) {
+        svgChart.append(svg('text', { x, y: yFor(frequency) + 4, class: className }, frequency.toFixed(1)));
+      }
     }
     appendTimeAxis(svgChart, axis, {
       left, top, bottom: top + plotHeight,
@@ -1633,6 +1749,7 @@ function renderSpectrumPlots(start, end, windowMs) {
       labelClass: 'spectrum-axis',
     }, now);
     svgChart.append(svg('text', { x: left - 8, y: 11, class: 'spectrum-label' }, 'MHz'));
+    svgChart.append(svg('text', { x: left + plotWidth + 8, y: 11, class: 'spectrum-label spectrum-label-right' }, 'MHz'));
   }
 }
 
@@ -1766,6 +1883,10 @@ function renderArchiveStatus() {
     if (status.state !== 'listing') {
       parts.push(`${status.reports.toLocaleString()} status reports, ${status.samples.toLocaleString()} seconds with detections`
         + `${status.resolutionMs > 1000 ? ` (stored at ${formatSpan(status.resolutionMs)} resolution)` : ''}`
+        + ` · ${(status.solutionReports || 0).toLocaleString()} BESTPOS reports, ${(status.solutionSamples || 0).toLocaleString()} solution intervals`
+        + ` · ${(status.bestsatsReports || 0).toLocaleString()} BESTSATS reports (satellite-count fallback)`
+        + `${status.bestsatsResolutionMs > 1000 ? ` (stored at ${formatSpan(status.bestsatsResolutionMs)} resolution)` : ''}`
+        + `${status.solutionResolutionMs > 1000 ? ` (stored at ${formatSpan(status.solutionResolutionMs)} resolution)` : ''}`
         + `${range ? ` · ${range}` : ''}.`);
     }
     if (status.crcErrors) parts.push(`${status.crcErrors} corrupt reports skipped.`);
@@ -1815,6 +1936,13 @@ async function fetchArchiveData() {
       { signal: controller.signal }, true);
     if (controller.signal.aborted || state.archive.status?.generation !== generation) return;
     if (!data || !Array.isArray(data.samples) || !Array.isArray(data.coverage) || !Number.isFinite(data.bucketMs)
+      || !Array.isArray(data.solution) || !Array.isArray(data.bestsats)
+      || [...data.solution, ...data.bestsats].some((sample) => !sample || !Number.isFinite(sample.t)
+        || !Number.isFinite(sample.end) || sample.end < sample.t
+        || (sample.used !== null && (!Number.isInteger(sample.used) || sample.used < 0 || sample.used > 255))
+        || (sample.tracked !== null && (!Number.isInteger(sample.tracked) || sample.tracked < 0 || sample.tracked > 255))
+        || (sample.type !== null && typeof sample.type !== 'string')
+        || (sample.status !== null && typeof sample.status !== 'string'))
       || data.samples.some((sample) => !sample || !Number.isFinite(sample.t) || typeof sample.signal !== 'string'
         || !Number.isFinite(sample.count) || (sample.detections !== undefined && !Array.isArray(sample.detections)))) {
       throw new Error('Invalid archive response');

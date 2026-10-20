@@ -102,6 +102,33 @@ test('browser records live BESTPOS with the same thinning and history merge as t
   assert.equal(context.state.solutionHistory.length, 3);
 });
 
+test('browser merges historic BESTPOS intervals with local precedence and archive visibility', () => {
+  const context = vm.createContext({
+    state: {
+      solutionHistory: [{ t: 60000, used: 25, tracked: 30, type: 'SINGLE', status: 'SOL_COMPUTED' }],
+      archive: { shown: true, data: { solution: [
+        { t: 0, end: 120000, used: 20, tracked: 30, type: 'NARROW_INT', status: 'SOL_COMPUTED' },
+        { t: 180000, end: 200000, used: 0, tracked: 30, type: 'NONE', status: 'INSUFFICIENT_OBS' },
+      ] } },
+    },
+  });
+  loadFunctions(browserCode, 'const SOLUTION_HOLD_MS =', 'function drawSolutionTimeline(', context);
+  const samples = context.timelineSolutionSamples(10000, 210000);
+  const runs = context.solutionRuns(samples, 10000, 210000, (s) => s.used);
+  assert.deepEqual(plain(runs.map((r) => [r.start, r.end, r.value, Boolean(r.first.archive)])), [
+    [10000, 60000, 20, true],
+    [60000, 95000, 25, false],
+    [95000, 120000, 20, true],
+    [180000, 200000, 0, true],
+  ], 'long archive intervals survive zoom, resume after live coverage and preserve gaps');
+  assert.equal(context.liveSolution(190000), null, 'archive samples never appear as current values');
+  context.state.archive.shown = false;
+  assert.equal(context.timelineSolutionSamples(10000, 210000).length, 1);
+  context.state.archive.shown = true;
+  context.state.archive.data = null;
+  assert.equal(context.timelineSolutionSamples(10000, 210000).length, 1);
+});
+
 test('timeline geometry keeps the band rows and adds two solution rows above the axis', () => {
   const context = vm.createContext({});
   loadFunctions(browserCode, 'const TIMELINE =', 'const TIMELINE_BANDS', context);
@@ -110,6 +137,30 @@ test('timeline geometry keeps the band rows and adds two solution rows above the
   assert.equal(bands, 142, 'band rows keep their previous height');
   const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
   assert.match(html, new RegExp(`id="timeline" viewBox="0 0 900 ${TIMELINE.height}"`));
+});
+
+test('BESTSATS counts fill gaps only, with BESTPOS precedence and no fabricated fix', () => {
+  const context = vm.createContext({
+    state: {
+      solutionHistory: [{ t: 80000, used: 25, tracked: 30, type: 'SINGLE', status: 'SOL_COMPUTED' }],
+      archive: { shown: true, data: {
+        solution: [{ t: 20000, end: 60000, used: 22, tracked: 30, type: 'NARROW_INT', status: 'SOL_COMPUTED' }],
+        bestsats: [{ t: 0, end: 150000, used: 18, tracked: null, type: null, status: null }],
+      } },
+    },
+  });
+  loadFunctions(browserCode, 'const SOLUTION_HOLD_MS =', 'function drawSolutionTimeline(', context);
+  const samples = context.timelineSolutionSamples(0, 160000);
+  assert.deepEqual(plain(context.solutionRuns(samples, 0, 160000, (s) => s.used)
+    .map((run) => [run.start, run.end, run.value])), [
+    [0, 20000, 18], [20000, 60000, 22], [60000, 80000, 18], [80000, 115000, 25], [115000, 150000, 18],
+  ]);
+  const fixes = context.solutionRuns(samples, 0, 160000, (s) => s.type || null);
+  assert.deepEqual(plain(fixes.map((run) => [run.start, run.end, run.value])), [
+    [20000, 60000, 'NARROW_INT'], [80000, 115000, 'SINGLE'],
+  ]);
+  context.state.archive.shown = false;
+  assert.equal(context.timelineSolutionSamples(0, 160000).length, 1);
 });
 
 test('a report with interference in one band shows clear status in the other bands', () => {
@@ -129,4 +180,97 @@ test('a report with interference in one band shows clear status in the other ban
   assert.deepEqual(summary('L1'), [[0, 0], [1000, 0], [2000, 0], [3000, 1]]);
   assert.deepEqual(summary('L2'), [[0, 0], [1000, 1], [2000, 1], [3000, 2]]);
   assert.deepEqual(summary('L5'), [[0, 0], [1000, 0], [2000, 0], [3000, 0]], 'one clear sample per report');
+});
+
+function fakeSvg() {
+  const element = (tag, attributes = {}, textContent = '') => ({
+    tag, attributes: { ...attributes }, textContent, children: [],
+    append(...children) { this.children.push(...children); },
+    setAttribute(name, value) { this.attributes[name] = value; },
+  });
+  return element;
+}
+
+test('BESTSATS-only plot shows satellite count and unavailable fix instead of a no-fix classification', () => {
+  const svg = fakeSvg();
+  const context = vm.createContext({
+    svg, Date, TIMELINE: { left: 168, right: 72, solutionRow: 90 }, appendYLabel() {},
+    formatTimestamp: String,
+    state: { solutionHistory: [], archive: { shown: true, data: {
+      bestsats: [{ t: 0, end: 30000, used: 18, tracked: null, type: null, status: null }], solution: [],
+    } } },
+  });
+  loadFunctions(browserCode, 'const SOLUTION_HOLD_MS =', 'const SPECTRUM_PLOTS =', context);
+  const chart = svg('svg');
+  context.drawSolutionTimeline(chart, { start: 0, dataEnd: 60000, x: (t) => t / 100 }, 0, 900);
+  assert(chart.children.some((el) => el.attributes.class === 'tl-sats-area'));
+  assert(!chart.children.some((el) => el.attributes.class === 'tl-fix-bar'));
+  assert(chart.children.some((el) => el.textContent === 'Fix type unavailable: BESTSATS does not report it'));
+});
+
+test('live solution readouts show the current count and fix type, roll on change and go stale', () => {
+  const svg = fakeSvg();
+  let now = 1_000_000;
+  const context = vm.createContext({
+    svg, state: { solutionHistory: [] }, formatTimestamp: String,
+    POSITION_TYPE_TEXT: { SINGLE: ['', 'single'], NARROW_FLOAT: ['', 'float'] },
+    Date: class extends Date { static now() { return now; } },
+  });
+  loadFunctions(browserCode, 'const TIMELINE =', 'function timelineViewport(', context);
+  loadFunctions(browserCode, 'const SOLUTION_HOLD_MS =', 'function drawSolutionTimeline(', context);
+  const draw = () => {
+    const chart = svg('svg');
+    context.drawSolutionLive(chart, 0, 90, now);
+    const texts = chart.children.filter((child) => child.tag === 'text');
+    return Object.fromEntries(['tl-live-value', 'tl-live-fix'].map((name) => [name,
+      texts.find((child) => child.attributes.class.split(' ')[0] === name)]));
+  };
+  let live = draw();
+  assert.equal(live['tl-live-value'].textContent, '—');
+  assert.match(live['tl-live-value'].attributes.class, /stale/);
+
+  context.state.solutionHistory.push({ t: now, used: 22, tracked: 30, status: 'SOL_COMPUTED', type: 'SINGLE' });
+  live = draw();
+  assert.equal(live['tl-live-value'].textContent, '22');
+  assert.equal(live['tl-live-fix'].textContent, 'SINGLE');
+  assert.equal(live['tl-live-fix'].attributes.fill, '#8c94a4');
+
+  now += 1000;
+  context.state.solutionHistory.push({ t: now, used: 19, tracked: 30, status: 'SOL_COMPUTED', type: 'NARROW_FLOAT' });
+  live = draw();
+  assert.match(live['tl-live-value'].attributes.class, /tl-roll-down/, 'a falling count rolls down');
+  assert.match(live['tl-live-fix'].attributes.class, /tl-roll-up/);
+  assert.equal(live['tl-live-fix'].attributes.lengthAdjust, 'spacingAndGlyphs', 'long type names are fitted');
+  now += 200;
+  assert.match(draw()['tl-live-value'].attributes.style, /animation-delay:-200ms/, 're-renders resume the roll');
+  now += 1000;
+  assert.doesNotMatch(draw()['tl-live-value'].attributes.class, /roll/);
+
+  now += 36000;
+  live = draw();
+  assert.equal(live['tl-live-value'].textContent, '—', 'stale BESTPOS is not shown as live');
+  assert.equal(live['tl-live-fix'].textContent, '—');
+});
+
+test('y-axis labels are duplicated in the right margin', () => {
+  const svg = fakeSvg();
+  const context = vm.createContext({ svg });
+  loadFunctions(browserCode, 'const TIMELINE =', 'function timelineViewport(', context);
+  loadFunctions(browserCode, 'function appendYLabel(', 'function renderTimeline(', context);
+  const chart = svg('svg');
+  context.appendYLabel(chart, 50, '-90', 900);
+  const [leftLabel, rightLabel] = chart.children;
+  assert.equal(leftLabel.attributes.x, 168 - 8);
+  assert.equal(rightLabel.attributes.x, 900 - 72 + 8);
+  assert.equal(rightLabel.attributes.class, 'tl-label tl-label-right');
+  assert.equal(rightLabel.textContent, '-90');
+  const css = fs.readFileSync(path.join(__dirname, '../public/style.css'), 'utf8');
+  assert.match(css, /\.tl-label\.tl-label-right, \.spectrum-label\.spectrum-label-right \{ text-anchor: start; \}/);
+});
+
+test('historic archive panel sits at the top of the interference tab', () => {
+  const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
+  const tab = html.indexOf('id="tab-interference"');
+  assert(tab < html.indexOf('id="archive-panel"'));
+  assert(html.indexOf('id="archive-panel"') < html.indexOf('id="it-banner"'));
 });

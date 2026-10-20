@@ -95,9 +95,23 @@ and zoom:
 Both rows come from live BESTPOS logs and are saved with the local history. The
 server stores a sample when the solution changes, or at least every 10 seconds
 while it is unchanged. A row breaks when no BESTPOS has been received for 35
-seconds. The NAS archive logs contain no BESTPOS, so these rows have no archive
-data.
+seconds. Historic archive loading also parses ASCII BESTPOSA and binary BESTPOS
+(message ID 42), using their receiver timestamps for these same rows. Local/live
+history takes precedence where it overlaps archive data; archived values never
+replace the current live readouts. Logs without BESTPOS leave gaps in the fix-type row.
+For older logs, ASCII BESTSATSA and binary BESTSATS (message ID 1194) supply a
+satellite-count fallback: the number of entries marked `GOOD`, not the total list
+length (which also includes excluded satellites). BESTPOS takes precedence wherever
+its reporting overlaps BESTSATS, regardless of file or message order. BESTSATS does
+not contain fix type or solution status, so fix type is shown as unavailable rather
+than inferred; it also does not supply a tracked-satellite count. `SUPPLEMENTARY`
+entries are not counted as `GOOD` satellites.
 
+The left-hand side of each row shows the current values: the number of satellites
+used (with the number tracked) and the current fix type, coloured by its tier. Both
+roll to the new value when it changes and show "—" once BESTPOS is more than 35
+seconds old. Y-axis labels are repeated on the right-hand side of the power,
+satellite, fix-type and frequency plots.
 The GNSS frequency overlays below the band cards use the same visible time
 window and time axis as **Power over time**, including its pan and zoom. Drag
 **any** plot to pan, or scroll over it to zoom around the pointer. The shared
@@ -154,7 +168,7 @@ list, not report counters, live status or chart history.
 
 ## Historic Archive
 
-The **Historic archive** panel on the Interference tab loads ITDETECTSTATUS history
+The **Historic archive** panel at the top of the Interference tab loads ITDETECTSTATUS and BESTPOS history
 from the receiver's recorded `.LOG` files on the network store and draws it on the same
 power and frequency plots as live data. The default folder is
 `\\20.20.20.1\novatel\pwrpak1`; change it in the panel (it is remembered on the server)
@@ -162,23 +176,33 @@ or set `NOVATEL_ARCHIVE_ROOT`. **Default folder** restores the configured defaul
 
 Expected layout: `<folder>\YYYY\DDD\*.LOG`, where `DDD` is the day of year, for example
 `\\20.20.20.1\novatel\pwrpak1\2026\275\NMUT23450006R_2026-10-02_00-43-27.LOG`. Both
-recording formats are read: binary `ITDETECTSTATUSB` (message 2065) and ASCII
-`#ITDETECTSTATUSA` lines mixed with binary logs. Only the primary antenna is used
-(`ITDETECTSTATUS_1` is ignored), times come from each report's GPS header (file and
+recording formats are read: binary `ITDETECTSTATUSB` (message 2065) and `BESTPOSB`
+(message 42), binary BESTSATS (message 1194), plus ASCII `#ITDETECTSTATUSA`,
+`#BESTPOSA` and `#BESTSATSA` lines mixed with binary
+logs. Only the primary antenna is used
+(`ITDETECTSTATUS_1`, `BESTPOS_1` and `BESTSATS_1` are ignored), times come from each report's GPS header (file and
 folder names are only used to choose which files to open), and CRC failures are skipped.
 
 Choose how many days to load (1 to `ARCHIVE_MAX_DAYS`) and select **Load history**.
 Loading never starts automatically. Safeguards keep the NAS, server and browser responsive:
 
-- Files are streamed one at a time in 1 MB chunks; only ITDETECTSTATUS frames are
+- Files are streamed one at a time in 1 MB chunks; only ITDETECTSTATUS, BESTPOS and BESTSATS frames are
   decoded and other logs (RANGE, ephemerides, …) are skipped by length.
 - Each file is reduced to a compact summary — coverage runs for clear reporting and the
-  strongest detection per band per second — cached in `data/archive-cache/`. The NAS is
+  strongest detection per band per second, plus runs of unchanged BESTPOS solutions —
+  cached in `data/archive-cache/`. Older caches are rebuilt on the first reload to
+  include BESTSATS as well as BESTPOS. The NAS is
   read once per file (about 40 s and 475 MB per day the first time); reloading or
   extending the range only reads new or changed files, and a cached day reloads in well
   under a second.
 - At most `ARCHIVE_MAX_SAMPLES` detection seconds are kept in memory; beyond that, older
   detail is merged into wider time buckets, keeping the strongest report.
+- BESTPOS and BESTSATS storage are each capped at `ARCHIVE_MAX_SAMPLES` intervals, including
+  during each file scan. At that limit, intervals are reduced into wider buckets,
+  showing the latest solution per bucket over continuous reporting only. Query
+  responses also keep at most one solution interval per bucket. Short-lived changes
+  can be omitted at coarse resolution; zoom in for finer detail where retained.
+  No BESTPOS for 35 seconds ends an interval, leaving a gap rather than inventing a fix.
 - The browser only requests the visible range at about one point per pixel (at most 4,000
   buckets), so a 30-day view returns tens of kilobytes rather than millions of reports.
 - Progress, cache hits, an estimated time remaining and any unreadable files are shown in
@@ -211,7 +235,7 @@ Band cards and statistics remain live-only.
 | `HISTORY_SAVE_SEC` | `60` | How often history is written to disk |
 | `NOVATEL_ARCHIVE_ROOT` | `\\20.20.20.1\novatel\pwrpak1` | Default historic archive folder (`YYYY\DDD\*.LOG`). The folder chosen in the UI is saved in `data/archive-settings.json` and takes precedence. |
 | `ARCHIVE_DAYS` / `ARCHIVE_MAX_DAYS` | `1` / `31` | Default and maximum number of days the UI may load |
-| `ARCHIVE_MAX_SAMPLES` | `300000` | Detection seconds kept in memory before archive resolution is coarsened |
+| `ARCHIVE_MAX_SAMPLES` | `300000` | Separate memory caps for detection seconds, BESTPOS intervals and BESTSATS count intervals before their resolution is coarsened |
 | `ARCHIVE_CACHE_DIR` | `data/archive-cache` | Per-file summary cache. Set to an empty string to re-read the NAS every time. |
 | `ARCHIVE_SETTINGS_FILE` | `data/archive-settings.json` | Where the chosen folder and days are remembered. Empty string disables saving. |
 

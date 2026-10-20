@@ -221,21 +221,6 @@
 
   <!-- Interference --------------------------------------------------------->
   <section id="tab-interference" class="panel">
-    <div id="it-banner" class="banner idle">
-      <span class="banner-icon"></span>
-      <div>
-        <div id="it-verdict" class="banner-title">Waiting for ITDETECTSTATUS</div>
-        <div id="it-detail" class="banner-detail">No interference data received yet.</div>
-      </div>
-    </div>
-
-    <div class="summary interference-summary">
-      <div class="card"><span class="label">Last status update</span><span id="it-time" class="value">&mdash;</span></div>
-      <div class="card"><span class="label">Active bands</span><span id="it-bands-hit" class="value">&mdash;</span></div>
-      <div class="card"><span class="label">Active detections</span><span id="it-count" class="value">&mdash;</span></div>
-      <div class="card"><span class="label">Status messages</span><span id="it-total" class="value">0</span></div>
-    </div>
-
     <details id="archive-panel" class="archive-panel" open>
       <summary>
         Historic archive
@@ -267,10 +252,26 @@
       <progress id="archive-progress" class="archive-progress" max="1" value="0" hidden></progress>
       <div id="archive-status" class="archive-status" role="status" aria-live="polite">Archive status unavailable.</div>
       <p class="plot-help">The server searches <code>&lt;folder&gt;\YYYY\DDD\*.LOG</code> (DDD = day of year) for ITDETECTSTATUS
-        reports and reads one file at a time. Each file is summarised once and cached locally, so reloading or
+        and BESTPOS/BESTSATS reports and reads one file at a time. BESTPOS supplies satellite count and fix type;
+        BESTSATS supplies a satellite-count fallback only. Each file is summarised once and cached locally, so reloading or
         extending the range only reads new files (about 400&nbsp;MB per day the first time). Archive data is
         drawn with hollow markers and dashed lines beneath the live data.</p>
     </details>
+
+    <div id="it-banner" class="banner idle">
+      <span class="banner-icon"></span>
+      <div>
+        <div id="it-verdict" class="banner-title">Waiting for ITDETECTSTATUS</div>
+        <div id="it-detail" class="banner-detail">No interference data received yet.</div>
+      </div>
+    </div>
+
+    <div class="summary interference-summary">
+      <div class="card"><span class="label">Last status update</span><span id="it-time" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Active bands</span><span id="it-bands-hit" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Active detections</span><span id="it-count" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Status messages</span><span id="it-total" class="value">0</span></div>
+    </div>
 
     <h2>
       Power over time <span id="timeline-range" class="muted"></span>

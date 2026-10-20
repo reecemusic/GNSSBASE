@@ -9,20 +9,27 @@ const { EventEmitter } = require('node:events');
 const {
   parseAsciiLog, interpretItDetectStatus, decodeItDetectStatusBinary, novatelCrc32Buffer, gpsToMs,
 } = require('./novatel');
+const { decode } = require('./messages');
+const { solutionSample } = require('./history');
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 
 const DAY_MS = 86400000;
 const IT_MESSAGE_ID = 2065;
+const BESTPOS_MESSAGE_ID = 42;
+const BESTSATS_MESSAGE_ID = 1194;
 const LONG_HEADER_LENGTH = 28;
 const MAX_FRAME_BYTES = 1 << 16;
 const MAX_ASCII_LINE_BYTES = 16 * 1024;
 const SYNC = Buffer.from([0xaa, 0x44, 0x12]);
-const ASCII_MARKER = Buffer.from('#ITDETECTSTATUSA,');
+const ASCII_MARKERS = [Buffer.from('#ITDETECTSTATUSA,'), Buffer.from('#BESTPOSA,'), Buffer.from('#BESTSATSA,')];
+const ASCII_CARRY_BYTES = Math.max(...ASCII_MARKERS.map((marker) => marker.length));
 // Reports further apart than this are treated as a gap in coverage, matching the live timeline.
 const COVERAGE_GAP_MS = 15000;
-const CACHE_VERSION = 2;
+const CACHE_VERSION = 4;
+const SOLUTION_HOLD_MS = 35000;
+const MAX_SOLUTION_SAMPLES = 300000;
 const MAX_DETECTIONS_PER_SAMPLE = 32;
 const MAX_ERRORS = 20;
 const MAX_QUERY_BUCKETS = 4000;
@@ -40,6 +47,18 @@ function stronger(a, b) {
   if (aPower !== bPower) return aPower;
   if (aPower && a.maxPower !== b.maxPower) return a.maxPower > b.maxPower;
   return a.count > b.count;
+}
+
+/** Latest value per bucket, spanning only contiguous reporting; never bridge missing BESTPOS output. */
+function reduceSolutions(samples, resolutionMs) {
+  const kept = new Map();
+  for (const sample of samples) {
+    const key = Math.floor(sample.t / resolutionMs);
+    const previous = kept.get(key);
+    kept.set(key, previous && previous.end >= sample.t
+      ? { ...sample, t: previous.t, end: Math.max(previous.end, sample.end) } : sample);
+  }
+  return [...kept.values()];
 }
 
 /** Converts one ITDETECTSTATUS report into per-signal samples in the shape used by live history. */
@@ -72,16 +91,51 @@ function reportSamples(t, detections) {
 }
 
 /**
- * Accumulates one log file's ITDETECTSTATUS reports compactly: clear reporting is stored as
- * coverage runs, and detections keep only the strongest sample per signal per second.
+ * Compact file summary: interference coverage and strongest detections per second,
+ * plus bounded intervals of unchanged BESTPOS solutions and BESTSATS counts.
  */
 class FileSummary {
-  constructor() {
+  constructor(maxSolutions = MAX_SOLUTION_SAMPLES) {
     this.reportCount = 0;
     this.crcErrors = 0;
     this.coverage = [];
     this.samples = [];
     this.lastBySignal = new Map();
+    this.solution = [];
+    this.solutionReports = 0;
+    this.solutionResolutionMs = 1000;
+    this.maxSolutions = maxSolutions;
+    this.lastSolution = null;
+    this.bestsatsSummary = null;
+  }
+
+  addBestSats(t, used) {
+    if (!this.bestsatsSummary) this.bestsatsSummary = new FileSummary(this.maxSolutions);
+    this.bestsatsSummary.addSolution(t, { satellitesUsed: used });
+  }
+
+  addSolution(t, data) {
+    const sample = solutionSample(data, t);
+    if (!sample) return;
+    this.solutionReports++;
+    const last = this.lastSolution;
+    if (last && t >= last.t && t <= last.end && last.used === sample.used
+      && last.tracked === sample.tracked && last.status === sample.status && last.type === sample.type) {
+      last.end = t + SOLUTION_HOLD_MS;
+      return;
+    }
+    if (last && t >= last.t) last.end = Math.min(last.end, t);
+    const interval = { ...sample, end: t + SOLUTION_HOLD_MS };
+    this.solution.push(interval);
+    this.lastSolution = interval;
+    if (this.solution.length > this.maxSolutions) {
+      this.solution.sort((a, b) => a.t - b.t);
+      do {
+        this.solutionResolutionMs *= 2;
+        this.solution = reduceSolutions(this.solution, this.solutionResolutionMs);
+      } while (this.solution.length > this.maxSolutions * 0.75);
+      this.lastSolution = this.solution[this.solution.length - 1];
+    }
   }
 
   addReport(t, detections) {
@@ -111,13 +165,19 @@ class FileSummary {
       crcErrors: this.crcErrors,
       coverage: this.coverage,
       samples: this.samples,
+      solution: this.solution,
+      solutionReports: this.solutionReports,
+      solutionResolutionMs: this.solutionResolutionMs,
+      bestsats: this.bestsatsSummary ? this.bestsatsSummary.solution : [],
+      bestsatsReports: this.bestsatsSummary ? this.bestsatsSummary.solutionReports : 0,
+      bestsatsResolutionMs: this.bestsatsSummary ? this.bestsatsSummary.solutionResolutionMs : 1000,
     };
   }
 }
 
 /**
- * Incremental scanner for NovAtel log files. Only ITDETECTSTATUS (binary ID 2065 or
- * `#ITDETECTSTATUSA`) is decoded; every other binary frame is skipped by its length
+ * Incremental scanner for NovAtel log files. Only ITDETECTSTATUS, BESTPOS and BESTSATS are
+ * decoded; every other binary frame is skipped by its length
  * without CRC work, so large RANGE/ephemeris traffic costs very little.
  */
 function createItDetectScanner(summary) {
@@ -133,8 +193,28 @@ function createItDetectScanner(summary) {
     const week = buf.readUInt16LE(start + 14);
     if (week === 0) return;
     const t = gpsToMs(week, buf.readUInt32LE(start + 16) / 1000);
-    const data = decodeItDetectStatusBinary(buf.subarray(start + LONG_HEADER_LENGTH, start + total - 4));
-    summary.addReport(t, data.detections);
+    const body = buf.subarray(start + LONG_HEADER_LENGTH, start + total - 4);
+    const messageId = buf.readUInt16LE(start + 4);
+    if (messageId === BESTSATS_MESSAGE_ID) {
+      const count = body.length >= 4 ? body.readUInt32LE(0) : -1;
+      if (count < 0 || count > 255 || body.length !== 4 + count * 16) {
+        summary.crcErrors++;
+        return;
+      }
+      let used = 0;
+      for (let index = 0; index < count; index++) {
+        if (body.readUInt32LE(12 + index * 16) === 0) used++;
+      }
+      summary.addBestSats(t, used);
+    } else if (messageId === BESTPOS_MESSAGE_ID) {
+      if (body.length < 72) {
+        summary.crcErrors++;
+        return;
+      }
+      summary.addSolution(t, decode({ format: 'binary', header: { messageName: 'BESTPOS' }, body }).data);
+    } else {
+      summary.addReport(t, decodeItDetectStatusBinary(body).detections);
+    }
   }
 
   function handleAscii(line) {
@@ -145,7 +225,23 @@ function createItDetectScanner(summary) {
     }
     if (!parsed.header.week) return;
     const t = gpsToMs(parsed.header.week, parsed.header.seconds);
-    summary.addReport(t, interpretItDetectStatus(parsed).detections);
+    if (parsed.header.messageName === 'BESTSATS') {
+      const count = Number(parsed.fields[0]);
+      if (!Number.isInteger(count) || count < 0 || count > 255 || parsed.fields.length !== 1 + count * 4) {
+        summary.crcErrors++;
+        return;
+      }
+      const data = decode(parsed).data;
+      summary.addBestSats(t, data.satellites.filter((satellite) => satellite.status === 'GOOD').length);
+    } else if (parsed.header.messageName === 'BESTPOS') {
+      if (parsed.fields.length < 15) {
+        summary.crcErrors++;
+        return;
+      }
+      summary.addSolution(t, decode(parsed).data);
+    } else {
+      summary.addReport(t, interpretItDetectStatus(parsed).detections);
+    }
   }
 
   function push(input) {
@@ -161,18 +257,25 @@ function createItDetectScanner(summary) {
     const buf = carry ? Buffer.concat([carry, chunk]) : chunk;
     carry = null;
     let i = 0;
-    let nextAscii = -2;
+    const nextAscii = ASCII_MARKERS.map(() => -2);
+    let nextSync = -2;
     const asciiFrom = (from) => {
-      if (nextAscii === -1) return -1;
-      if (nextAscii < from) nextAscii = buf.indexOf(ASCII_MARKER, from);
-      return nextAscii;
+      let nearest = -1;
+      for (let index = 0; index < ASCII_MARKERS.length; index++) {
+        if (nextAscii[index] !== -1 && nextAscii[index] < from) {
+          nextAscii[index] = buf.indexOf(ASCII_MARKERS[index], from);
+        }
+        if (nextAscii[index] >= 0 && (nearest === -1 || nextAscii[index] < nearest)) nearest = nextAscii[index];
+      }
+      return nearest;
     };
 
     for (;;) {
-      const sync = buf.indexOf(SYNC, i);
+      if (nextSync !== -1 && nextSync < i) nextSync = buf.indexOf(SYNC, i);
+      const sync = nextSync;
       const ascii = asciiFrom(i);
       if (sync === -1 && ascii === -1) {
-        carry = Buffer.from(buf.subarray(Math.max(i, buf.length - ASCII_MARKER.length)));
+        carry = Buffer.from(buf.subarray(Math.max(i, buf.length - ASCII_CARRY_BYTES)));
         return;
       }
       if (ascii !== -1 && (sync === -1 || ascii < sync)) {
@@ -198,7 +301,8 @@ function createItDetectScanner(summary) {
         i = sync + 1;
         continue;
       }
-      if (buf.readUInt16LE(sync + 4) !== IT_MESSAGE_ID) {
+      const messageId = buf.readUInt16LE(sync + 4);
+      if (messageId !== IT_MESSAGE_ID && messageId !== BESTPOS_MESSAGE_ID && messageId !== BESTSATS_MESSAGE_ID) {
         if (sync + total > buf.length) {
           skip = sync + total - buf.length;
           return;
@@ -305,6 +409,10 @@ class InterferenceArchive extends EventEmitter {
   reset(patch) {
     this.coverage = [];
     this.samples = [];
+    this.solution = [];
+    this.solutionResolutionMs = 1000;
+    this.bestsats = [];
+    this.bestsatsResolutionMs = 1000;
     this.sorted = true;
     this.resolutionMs = 1000;
     this.state = {
@@ -321,6 +429,8 @@ class InterferenceArchive extends EventEmitter {
       bytesDone: 0,
       currentFile: null,
       reports: 0,
+      solutionReports: 0,
+      bestsatsReports: 0,
       crcErrors: 0,
       errors: [],
       message: null,
@@ -336,6 +446,10 @@ class InterferenceArchive extends EventEmitter {
       ...this.state,
       errors: this.state.errors.slice(),
       samples: this.samples.length,
+      solutionSamples: this.solution.length,
+      solutionResolutionMs: this.solutionResolutionMs,
+      bestsatsSamples: this.bestsats.length,
+      bestsatsResolutionMs: this.bestsatsResolutionMs,
       resolutionMs: this.resolutionMs,
       generation: this.generation,
     };
@@ -433,6 +547,8 @@ class InterferenceArchive extends EventEmitter {
         filesCached: this.state.filesCached + (cached ? 1 : 0),
         bytesDone: bytesBefore,
         reports: this.state.reports + (summary ? summary.reportCount : 0),
+        solutionReports: this.state.solutionReports + (summary ? summary.solutionReports : 0),
+        bestsatsReports: this.state.bestsatsReports + (summary ? summary.bestsatsReports : 0),
         crcErrors: this.state.crcErrors + (summary ? summary.crcErrors : 0),
         revision: this.state.revision + 1,
       });
@@ -509,7 +625,7 @@ class InterferenceArchive extends EventEmitter {
   }
 
   async scanFile(file, generation, bytesBefore) {
-    const summary = new FileSummary();
+    const summary = new FileSummary(this.options.maxSamples);
     const scanner = createItDetectScanner(summary);
     const stream = fs.createReadStream(file.path, { highWaterMark: READ_CHUNK_BYTES });
     this.stream = stream;
@@ -543,7 +659,10 @@ class InterferenceArchive extends EventEmitter {
     try {
       const parsed = JSON.parse(await gunzip(await fs.promises.readFile(cachePath)));
       if (parsed.version !== CACHE_VERSION || parsed.path !== file.path || parsed.size !== file.size
-        || parsed.mtimeMs !== file.mtimeMs || !Array.isArray(parsed.coverage) || !Array.isArray(parsed.samples)) {
+        || parsed.mtimeMs !== file.mtimeMs || !Array.isArray(parsed.coverage) || !Array.isArray(parsed.samples)
+        || !Array.isArray(parsed.solution) || !Number.isFinite(parsed.solutionReports)
+        || !Number.isFinite(parsed.solutionResolutionMs) || !Array.isArray(parsed.bestsats)
+        || !Number.isFinite(parsed.bestsatsReports) || !Number.isFinite(parsed.bestsatsResolutionMs)) {
         return null;
       }
       return parsed;
@@ -594,6 +713,30 @@ class InterferenceArchive extends EventEmitter {
       if (!sample || !Number.isFinite(sample.t) || sample.t < from || sample.t > to) continue;
       this.samples.push(sample);
     }
+    this.solutionResolutionMs = Math.max(this.solutionResolutionMs, summary.solutionResolutionMs);
+    for (const sample of summary.solution) {
+      if (sample.end < from || sample.t > to) continue;
+      this.solution.push({ ...sample, t: Math.max(from, sample.t), end: Math.min(to, sample.end) });
+    }
+    if (this.solution.length > this.options.maxSamples) {
+      this.solution.sort((a, b) => a.t - b.t);
+      do {
+        this.solutionResolutionMs *= 2;
+        this.solution = reduceSolutions(this.solution, this.solutionResolutionMs);
+      } while (this.solution.length > this.options.maxSamples * 0.75);
+    }
+    this.bestsatsResolutionMs = Math.max(this.bestsatsResolutionMs, summary.bestsatsResolutionMs);
+    for (const sample of summary.bestsats) {
+      if (sample.end < from || sample.t > to) continue;
+      this.bestsats.push({ ...sample, t: Math.max(from, sample.t), end: Math.min(to, sample.end) });
+    }
+    if (this.bestsats.length > this.options.maxSamples) {
+      this.bestsats.sort((a, b) => a.t - b.t);
+      do {
+        this.bestsatsResolutionMs *= 2;
+        this.bestsats = reduceSolutions(this.bestsats, this.bestsatsResolutionMs);
+      } while (this.bestsats.length > this.options.maxSamples * 0.75);
+    }
     this.sorted = false;
     if (this.samples.length > this.options.maxSamples) this.coarsen();
   }
@@ -616,6 +759,8 @@ class InterferenceArchive extends EventEmitter {
   ensureSorted() {
     if (this.sorted) return;
     this.samples.sort((a, b) => a.t - b.t);
+    this.solution.sort((a, b) => a.t - b.t);
+    this.bestsats.sort((a, b) => a.t - b.t);
     this.coverage.sort((a, b) => a[0] - b[0]);
     const merged = [];
     for (const run of this.coverage) {
@@ -676,6 +821,16 @@ class InterferenceArchive extends EventEmitter {
       detectionSamples,
       coverage,
       samples: [...chosen.values()].sort((a, b) => a.t - b.t),
+      solutionResolutionMs: this.solutionResolutionMs,
+      solution: reduceSolutions(this.solution
+        .filter((sample) => sample.end >= start && sample.t <= end)
+        .map((sample) => ({ ...sample, t: Math.max(start, sample.t), end: Math.min(end, sample.end) })),
+      Math.max(bucketMs, this.solutionResolutionMs)),
+      bestsats: reduceSolutions(this.bestsats
+        .filter((sample) => sample.end >= start && sample.t <= end)
+        .map((sample) => ({ ...sample, t: Math.max(start, sample.t), end: Math.min(end, sample.end) })),
+      Math.max(bucketMs, this.bestsatsResolutionMs)),
+      bestsatsResolutionMs: this.bestsatsResolutionMs,
     };
   }
 }

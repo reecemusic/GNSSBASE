@@ -179,4 +179,4 @@ function isValidSkyPosition(elevation, azimuth) {
     && Number.isFinite(azimuth) && azimuth >= 0 && azimuth < 360;
 }
 
-module.exports = { History, SOLUTION_HEARTBEAT_MS };
+module.exports = { History, SOLUTION_HEARTBEAT_MS, solutionSample };

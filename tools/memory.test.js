@@ -799,7 +799,7 @@ test('power chart plots measured power only, preserves gaps and shares its exact
   assert(points[0].attributes.cy > points[1].attributes.cy);
   assert.equal(get('timeline-mode').textContent, 'Historical view');
   const nowLine = chart.children.find((child) => child.attributes.class === 'tl-now-line');
-  assert(Math.abs(nowLine.attributes.x1 - (142 + 0.9 * 746)) < 1e-9, 'NOW is inset from the right edge');
+  assert(Math.abs(nowLine.attributes.x1 - (168 + 0.9 * (900 - 168 - 72))) < 1e-9, 'NOW is inset from the right edge');
   assert(chart.children.some((child) => child.attributes.class === 'tl-now-label' && child.textContent === 'NOW'));
   const agoLabels = chart.children.filter((child) => child.attributes.class === 'tl-axis-ago');
   assert(agoLabels.length > 1 && agoLabels.every((child) => / ago$/.test(child.textContent)));
