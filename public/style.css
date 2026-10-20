@@ -427,6 +427,32 @@ select {
 .swatch.moderate { background: #ffb02e; }
 .swatch.weak { background: #ffd98a; }
 .swatch.clear { background: rgba(61, 220, 132, .45); }
+.swatch.archive { background: transparent; border: 1.5px dashed #ffb02e; }
+
+/* Historic archive -------------------------------------------------------- */
+.archive-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .6rem .9rem; margin: 1rem 0; }
+.archive-panel[aria-busy="true"] { border-color: var(--warn); }
+.archive-panel > summary { cursor: pointer; font-weight: 600; display: flex; align-items: center; gap: .6rem; }
+.archive-badge { font-size: .75rem; font-weight: 600; padding: .1rem .55rem; border-radius: 999px; border: 1px solid currentColor; }
+.archive-badge.idle { color: var(--muted); }
+.archive-badge.busy { color: var(--warn); background: rgba(255, 176, 46, .12); }
+.archive-badge.ready { color: var(--ok); background: rgba(61, 220, 132, .12); }
+.archive-badge.warning { color: var(--warn); }
+.archive-badge.error { color: var(--bad); background: rgba(255, 95, 86, .12); }
+.archive-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: .6rem 1rem; margin-top: .6rem; }
+.archive-form label { display: flex; flex-direction: column; gap: .2rem; font-size: .8rem; color: var(--muted); }
+.archive-form .archive-root { flex: 1 1 22rem; }
+.archive-form .archive-root input { width: 100%; font-family: Consolas, monospace; }
+.archive-form .archive-show { flex-direction: row; align-items: center; gap: .35rem; color: var(--text); }
+.archive-actions { display: flex; flex-wrap: wrap; gap: .4rem; }
+.archive-progress { width: 100%; height: .5rem; margin-top: .6rem; accent-color: var(--warn); }
+.archive-status { margin-top: .4rem; font-size: .85rem; overflow-wrap: anywhere; }
+.archive-panel code { color: var(--text); }
+.tl-archive-coverage { fill: rgba(61, 220, 132, .14); }
+.tl-archive-status { opacity: .75; }
+.tl-archive-line { stroke-width: 1.25; stroke-dasharray: 4 3; opacity: .8; }
+.tl-archive-point { fill: var(--bg); stroke-width: 1.5; }
+.spectrum-detection.archive { fill: rgba(255, 176, 46, .25); stroke: #ffb02e; stroke-dasharray: 2 1; }
 
 .band-stats { margin-top: .55rem; font-size: .72rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .45rem; }
 .band-stats.has-hits { color: var(--warn); }

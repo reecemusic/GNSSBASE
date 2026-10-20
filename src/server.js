@@ -9,6 +9,7 @@ const config = require('./config');
 const { ReceiverClient } = require('./receiver');
 const { decode } = require('./messages');
 const { History } = require('./history');
+const { InterferenceArchive } = require('./archive');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const HTTP_HEADERS_TIMEOUT_MS = 15_000;
@@ -43,6 +44,16 @@ const history = new History({
 history.load();
 setInterval(() => history.prune(), 60000).unref();
 if (config.historyFile) setInterval(() => history.save(), config.historySaveSeconds * 1000).unref();
+
+const archive = new InterferenceArchive({
+  defaultRoot: config.archiveRoot,
+  defaultDays: config.archiveDefaultDays,
+  maxDays: config.archiveMaxDays,
+  maxSamples: config.archiveMaxSamples,
+  cacheDir: config.archiveCacheDir,
+  settingsFile: config.archiveSettingsFile,
+});
+archive.on('status', (status) => broadcast('archive', status));
 
 const receiver = new ReceiverClient(config);
 
@@ -154,7 +165,14 @@ function snapshot() {
     satvisBySystem: store.satvisBySystem,
     rawLog: store.rawLog,
     historyRetentionMinutes: config.historyRetentionMinutes,
+    archive: archive.status(),
   };
+}
+
+function sendJson(res, status, body) {
+  if (res.destroyed || res.writableEnded) return;
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+  res.end(JSON.stringify(body));
 }
 
 function serveStatic(req, res) {
@@ -402,6 +420,44 @@ function handleRequest(req, res) {
     return;
   }
 
+  if (route === '/api/archive' && req.method === 'GET') {
+    sendJson(res, 200, archive.info());
+    return;
+  }
+
+  if (route === '/api/archive/load' && req.method === 'POST') {
+    readJsonBody(req, res, (body) => {
+      try {
+        sendJson(res, 200, archive.load({ root: body.root, days: body.days }));
+      } catch (error) {
+        sendJson(res, 400, { error: error.message });
+      }
+    });
+    return;
+  }
+
+  if (route === '/api/archive/cancel' && req.method === 'POST') {
+    sendJson(res, 200, archive.cancel());
+    return;
+  }
+
+  if (route === '/api/archive/clear' && req.method === 'POST') {
+    sendJson(res, 200, archive.clear());
+    return;
+  }
+
+  if (route === '/api/archive/interference' && req.method === 'GET') {
+    const parameters = new URL(req.url, 'http://localhost').searchParams;
+    try {
+      sendJson(res, 200, archive.query({
+        from: parameters.get('from'), to: parameters.get('to'), buckets: parameters.get('buckets'),
+      }));
+    } catch (error) {
+      sendJson(res, 400, { error: error.message });
+    }
+    return;
+  }
+
   serveStatic(req, res);
 }
 
@@ -432,6 +488,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     if (shuttingDown) return;
     shuttingDown = true;
     receiver.stop();
+    archive.cancel();
     history.save();
     const shutdownTimer = setTimeout(() => {
       console.error(`[shutdown] forcing exit after ${SHUTDOWN_TIMEOUT_MS} ms`);

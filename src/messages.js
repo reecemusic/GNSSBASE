@@ -1,6 +1,6 @@
 'use strict';
 
-const { interpretItDetectStatus } = require('./novatel');
+const { interpretItDetectStatus, decodeItDetectStatusBinary } = require('./novatel');
 
 // --- enum tables (OEM7) -----------------------------------------------------
 
@@ -365,6 +365,7 @@ function decodeRangeBinary(body) {
 }
 
 const BINARY_DECODERS = {
+  ITDETECTSTATUS: decodeItDetectStatusBinary,
   BESTPOS: decodeBestPosBinary,
   BESTGNSSPOS: decodeBestPosBinary,
   RXSTATUS: decodeRxStatusBinary,

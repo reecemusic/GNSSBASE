@@ -1,0 +1,4 @@
+node_modules/
+data/archive-cache/
+data/archive-settings.json
+data/*.tmp

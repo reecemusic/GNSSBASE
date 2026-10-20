@@ -368,6 +368,7 @@ function connectStream() {
   source.addEventListener('status', (event) => handleStreamEvent('Receiver status', event, renderStatus));
   source.addEventListener('snapshot', (event) => handleStreamEvent('Loading live snapshot', event, applySnapshot));
   source.addEventListener('message', (event) => handleStreamEvent('Reading live report', event, applyPayload));
+  source.addEventListener('archive', (event) => handleStreamEvent('Archive status', event, applyArchiveStatus));
   source.addEventListener('open', () => {
     connection.offline = false;
     renderConnectionBar();
@@ -380,6 +381,7 @@ function connectStream() {
 
 function applySnapshot(snap) {
   if (snap.status) renderStatus(snap.status);
+  if (snap.archive) applyArchiveStatus(snap.archive);
   state.counts = snap.counts || {};
   state.ephemeris = snap.ephemeris || {};
   state.itBySignal = snap.itdetectBySignal || {};
@@ -713,6 +715,7 @@ state.windowMinutes = readPreference(HISTORY_WINDOW_KEY, 60, (value) => {
 state.tracks = {};
 state.interferenceHistory = [];
 state.showTraces = readPreference('showTraces', 'true') !== 'false';
+state.archive = { status: null, data: null, shown: readPreference('archiveShown', 'true') !== 'false' };
 
 $('history-window').value = String(state.windowMinutes);
 $('show-traces').checked = state.showTraces;
@@ -849,18 +852,27 @@ const TIMELINE_BAND_INFO = {
 
 function timelineViewport(now = Date.now()) {
   const historyMs = state.windowMinutes * 60000;
-  const windowMs = Math.min(historyMs, Math.max(10000, state.timelineView?.windowMs || historyMs));
-  const end = state.timelineView
-    ? Math.max(now - historyMs + windowMs, Math.min(now, state.timelineView.end))
+  const spanMs = timelineSpanMs(now);
+  const windowMs = Math.min(spanMs, Math.max(10000, state.timelineView?.windowMs || historyMs));
+  const end = state.timelineView && !state.timelineView.follow
+    ? Math.max(now - spanMs + windowMs, Math.min(now, state.timelineView.end))
     : now;
   return { start: end - windowMs, end, windowMs };
+}
+
+/** Navigable time span: the live history window, extended back to the start of a shown archive. */
+function timelineSpanMs(now = Date.now()) {
+  const historyMs = state.windowMinutes * 60000;
+  const archive = state.archive?.status;
+  if (!state.archive?.shown || !archive || archive.state === 'idle' || !Number.isFinite(archive.from)) return historyMs;
+  return Math.max(historyMs, now - archive.from);
 }
 
 // Fraction of the time axis kept to the right of the viewport end so "now" sits inset from the edge.
 const TIMELINE_NOW_INSET = 0.1;
 const TIMELINE_TICK_STEPS = [
   10e3, 15e3, 30e3, 60e3, 120e3, 300e3, 600e3, 900e3, 1800e3,
-  3600e3, 7200e3, 10800e3, 21600e3, 43200e3, 86400e3,
+  3600e3, 7200e3, 10800e3, 21600e3, 43200e3, 86400e3, 172800e3, 345600e3, 604800e3,
 ];
 
 function timelineAxisMs(windowMs) {
@@ -886,6 +898,11 @@ function formatTimeSince(ms) {
   if (minutes < 60) return `${minutes} min ago`;
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
+  if (hours >= 48) {
+    const days = Math.floor(hours / 24);
+    const restHours = hours % 24;
+    return `${days} days${restHours ? ` ${restHours} hr` : ''} ago`;
+  }
   return `${hours} hr${hours === 1 ? '' : 's'}${rest ? ` ${rest} min` : ''} ago`;
 }
 
@@ -934,7 +951,7 @@ function setTimelineView(end, windowMs) {
 
 function zoomTimeline(factor, fraction = 0.5) {
   const view = timelineViewport();
-  const windowMs = Math.max(10000, Math.min(state.windowMinutes * 60000, view.windowMs * factor));
+  const windowMs = Math.max(10000, Math.min(timelineSpanMs(), view.windowMs * factor));
   const anchor = view.start + fraction * timelineAxisMs(view.windowMs);
   setTimelineView(anchor - fraction * timelineAxisMs(windowMs) + windowMs, windowMs);
 }
@@ -1017,7 +1034,12 @@ function renderTimeline() {
     && (sample.signal === 'ALL' || bandIds.includes(classifyBand(sample.signal, []))))
     .sort((a, b) => a.t - b.t);
   $('timeline-range').textContent = `(${samples.length} samples, ${(windowMs / 1000).toFixed(0)} s window)`;
-  $('timeline-mode').textContent = state.timelineView ? 'Historical view' : 'Live';
+  $('timeline-mode').textContent = !state.timelineView ? 'Live'
+    : state.timelineView.follow ? 'Live + archive' : 'Historical view';
+  const archive = timelineArchiveSamples(start, axis.dataEnd);
+  if (state.archive) ensureArchiveData(start, axis.dataEnd, plotWidth);
+  if (archive) $('timeline-range').textContent = `(${samples.length} live samples, ${archive.samples.length} archive points, `
+    + `${formatSpan(windowMs)} window)`;
 
   bandIds.forEach((bandId, index) => {
     const y = TIMELINE.top + index * rowHeight;
@@ -1041,6 +1063,8 @@ function renderTimeline() {
     }
     chart.append(svg('text', { x: TIMELINE.left - 8, y: y + rowHeight - 13, class: 'tl-label' }, 'Status'));
   });
+
+  if (archive) drawArchiveTimeline(chart, axis, archive, bandIds, rowHeight, width);
 
   for (const [index, band] of bandIds.entries()) {
     const pixels = new Map();
@@ -1105,6 +1129,84 @@ function renderTimeline() {
 
   chart.append(svg('text', { x: TIMELINE.left, y: TIMELINE.height - 5, class: 'tl-title' },
     state.timeZone === 'Asia/Dubai' ? 'UAE' : state.timeZone));
+}
+
+function formatSpan(ms) {
+  if (ms < 120000) return `${Math.round(ms / 1000)} s`;
+  if (ms < 7200000) return `${Math.round(ms / 60000)} min`;
+  if (ms < 172800000) return `${Math.round(ms / 3600000)} h`;
+  return `${(ms / 86400000).toFixed(1).replace(/\.0$/, '')} days`;
+}
+
+/** Archive coverage and detection samples inside [start, end], or null when no archive is shown. */
+function timelineArchiveSamples(start, end) {
+  const data = state.archive?.shown ? state.archive.data : null;
+  if (!data) return null;
+  return {
+    bucketMs: data.bucketMs,
+    coverage: data.coverage.filter(([runStart, runEnd]) => runEnd >= start && runStart <= end),
+    samples: data.samples.filter((sample) => sample.t >= start && sample.t <= end),
+  };
+}
+
+/** Draws archive coverage and detections beneath live data: faint coverage, hollow points, dashed lines. */
+function drawArchiveTimeline(chart, axis, archive, bandIds, rowHeight, width) {
+  const minX = TIMELINE.left;
+  const maxX = width - TIMELINE.right;
+  const xFor = (time) => TIMELINE.left + axis.x(time);
+  const gapMs = Math.max(15000, archive.bucketMs * 1.5);
+  bandIds.forEach((band, index) => {
+    const y = TIMELINE.top + index * rowHeight;
+    for (const [runStart, runEnd] of archive.coverage) {
+      const x1 = Math.max(minX, xFor(runStart));
+      const x2 = Math.min(maxX, xFor(runEnd));
+      if (x2 < minX || x1 > maxX) continue;
+      const rect = svg('rect', {
+        x: x1, y: y + rowHeight - 26, width: Math.max(1, x2 - x1), height: 18, class: 'tl-archive-coverage',
+      });
+      rect.append(svg('title', {}, `Archive, ${band}: reports ${formatTimestamp(runStart, true)} – ${formatTimestamp(runEnd, true)}`
+        + ' (clear unless marked)'));
+      chart.append(rect);
+    }
+    const pixels = new Map();
+    for (const sample of archive.samples) {
+      if (sample.count <= 0 || classifyBand(sample.signal, []) !== band) continue;
+      const pixel = Math.round(axis.x(sample.t));
+      const previous = pixels.get(pixel);
+      if (!previous || (Number.isFinite(sample.maxPower)
+        && (!Number.isFinite(previous.maxPower) || sample.maxPower > previous.maxPower))) {
+        pixels.set(pixel, sample);
+      }
+    }
+    let previous = null;
+    for (const sample of [...pixels.values()].sort((a, b) => a.t - b.t)) {
+      const x = xFor(sample.t);
+      const color = powerColour(sample.maxPower);
+      const description = `Archive, ${band}, ${formatTimestamp(sample.t, true)}: `
+        + (Number.isFinite(sample.maxPower) ? `${sample.maxPower} dBm` : 'Power unknown')
+        + (archive.bucketMs > 1000 ? ` (strongest in ${formatSpan(archive.bucketMs)})` : '');
+      const status = svg('rect', {
+        x: Math.max(minX, Math.min(maxX - 3, x - 1.5)), y: y + rowHeight - 26, width: 3, height: 18,
+        fill: color, class: 'tl-archive-status',
+      });
+      status.append(svg('title', {}, description));
+      chart.append(status);
+      const py = timelinePowerY(sample.maxPower, index, rowHeight);
+      if (py === null) {
+        previous = null;
+        continue;
+      }
+      if (previous && sample.t - previous.t <= gapMs) {
+        chart.append(svg('line', {
+          x1: previous.x, y1: previous.y, x2: x, y2: py, stroke: color, class: 'tl-archive-line',
+        }));
+      }
+      const point = svg('circle', { cx: x, cy: py, r: 3, stroke: color, class: 'tl-archive-point' });
+      point.append(svg('title', {}, description));
+      chart.append(point);
+      previous = { x, y: py, t: sample.t };
+    }
+  });
 }
 
 const SPECTRUM_PLOTS = [
@@ -1175,6 +1277,9 @@ function renderSpectrumPlots(start, end, windowMs) {
   const axis = timelineAxis(start, windowMs, availableWidth - left - right, now);
   const historyHits = state.interferenceHistory.filter((sample) => sample.t >= start && sample.t <= axis.dataEnd
     && sample.count > 0);
+  const archiveData = state.archive?.shown ? state.archive.data : null;
+  const archiveHits = archiveData
+    ? archiveData.samples.filter((sample) => sample.t >= start && sample.t <= axis.dataEnd && sample.count > 0) : [];
 
   for (const plot of SPECTRUM_PLOTS) {
     const top = 18;
@@ -1276,23 +1381,37 @@ function renderSpectrumPlots(start, end, windowMs) {
       });
     }
 
-    const plotHits = [];
-    for (const sample of historyHits) {
-      const detections = Array.isArray(sample.detections) && sample.detections.length
-        ? sample.detections
-        : Number.isFinite(sample.freq) ? [{ freq: sample.freq, bandwidth: null, power: sample.maxPower }] : [];
-      for (const detection of detections) {
-        if (!Number.isFinite(detection.freq)) continue;
-        const halfBandwidth = Number.isFinite(detection.bandwidth) && detection.bandwidth > 0 ? detection.bandwidth / 2e6 : 0;
-        if (detection.freq / 1e6 + halfBandwidth < plot.min || detection.freq / 1e6 - halfBandwidth > plot.max) continue;
-        plotHits.push({ sample, detection });
+    const hitsIn = (samples) => {
+      const hits = [];
+      for (const sample of samples) {
+        const detections = Array.isArray(sample.detections) && sample.detections.length
+          ? sample.detections
+          : Number.isFinite(sample.freq) ? [{ freq: sample.freq, bandwidth: null, power: sample.maxPower }] : [];
+        for (const detection of detections) {
+          if (!Number.isFinite(detection.freq)) continue;
+          const halfBandwidth = Number.isFinite(detection.bandwidth) && detection.bandwidth > 0 ? detection.bandwidth / 2e6 : 0;
+          if (detection.freq / 1e6 + halfBandwidth < plot.min || detection.freq / 1e6 - halfBandwidth > plot.max) continue;
+          hits.push({ sample, detection });
+        }
       }
-    }
+      return hits;
+    };
+    const plotHits = hitsIn(historyHits);
+    const archivePlotHits = hitsIn(archiveHits);
     const visibleHits = plotHits.slice(-400);
+    const visibleArchiveHits = archivePlotHits.slice(-400);
     hitSummary.textContent = plotHits.length ? `${plotHits.length} hit${plotHits.length === 1 ? '' : 's'}` : 'No frequency hits';
     if (plotHits.length > visibleHits.length) hitSummary.textContent += ` · showing latest ${visibleHits.length}`;
+    if (archivePlotHits.length) {
+      hitSummary.textContent += ` · ${archivePlotHits.length} archive`
+        + (archivePlotHits.length > visibleArchiveHits.length ? ` (latest ${visibleArchiveHits.length} shown)` : '');
+    }
 
-    for (const { sample, detection } of visibleHits) {
+    const hitMarkers = [
+      ...visibleArchiveHits.map((hit) => ({ ...hit, archive: true })),
+      ...visibleHits.map((hit) => ({ ...hit, archive: false })),
+    ];
+    for (const { sample, detection, archive } of hitMarkers) {
       const centerMHz = detection.freq / 1e6;
       const halfBandwidthMHz = Number.isFinite(detection.bandwidth) && detection.bandwidth > 0
         ? detection.bandwidth / 2e6
@@ -1305,9 +1424,9 @@ function renderSpectrumPlots(start, end, windowMs) {
         y: Math.max(top, Math.min(top + plotHeight - markerHeight, y1)),
         width: 4,
         height: markerHeight,
-        class: 'spectrum-detection',
+        class: archive ? 'spectrum-detection archive' : 'spectrum-detection',
       });
-      const title = svg('title', {}, `${sample.signal}: ${centerMHz.toFixed(3)} MHz`
+      const title = svg('title', {}, `${archive ? 'Archive ' : ''}${sample.signal}: ${centerMHz.toFixed(3)} MHz`
         + (Number.isFinite(detection.bandwidth) ? `, ${(detection.bandwidth / 1e6).toFixed(3)} MHz bandwidth` : '')
         + (Number.isFinite(detection.power) ? `, ${detection.power.toFixed(1)} dBm` : '')
         + `, ${formatTimestamp(sample.t, true)}`);
@@ -1340,6 +1459,7 @@ function timelineTimeLabel(timestamp, windowMs) {
   return dateFormatter({
     timeZone: state.timeZone, hour: '2-digit', minute: '2-digit',
     ...(windowMs < 3600000 ? { second: '2-digit' } : {}),
+    ...(windowMs > 86400000 ? { day: '2-digit', month: 'short' } : {}),
     hourCycle: 'h23',
   }).format(new Date(timestamp));
 }
@@ -1362,6 +1482,263 @@ function timeAgo(timestamp) {
   if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
   return `${Math.round(seconds / 3600)}h ago`;
 }
+
+// --- historic archive -------------------------------------------------------
+
+const ARCHIVE_BUSY = new Set(['listing', 'scanning']);
+const archiveFetch = { timer: null, delay: 0, controller: null, wanted: null, generation: 0, startedAt: 0 };
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '?';
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`;
+  return `${Math.round(bytes / 1e3)} kB`;
+}
+
+function formatDuration(ms) {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} min ${seconds % 60} s`;
+  return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+}
+
+function applyArchiveStatus(status) {
+  if (typeof status.state !== 'string') throw new Error('Invalid archive status');
+  const previous = state.archive.status;
+  if (!previous || previous.generation !== status.generation) archiveFetch.startedAt = Date.now();
+  state.archive.status = status;
+  if (status.state === 'idle' || (state.archive.data && state.archive.data.generation !== status.generation)) {
+    state.archive.data = null;
+    archiveFetch.controller?.abort();
+  }
+  // A page opened while an archive is loaded starts by showing the whole range.
+  if (!previous && status.state !== 'idle' && state.archive.shown && !state.timelineView) showWholeArchive();
+  renderArchiveStatus();
+  timelineDirty = true;
+}
+
+function renderArchiveStatus() {
+  const status = state.archive.status;
+  const known = Boolean(status);
+  const busy = known && ARCHIVE_BUSY.has(status.state);
+  const pending = state.archive.requestPending;
+  $('archive-root').disabled = !known || pending;
+  $('archive-days').disabled = !known || pending;
+  $('archive-load').disabled = !known || pending;
+  $('archive-load').textContent = busy ? 'Restart load' : status && status.state !== 'idle' ? 'Reload' : 'Load history';
+  $('archive-cancel').disabled = !busy || pending;
+  $('archive-clear').disabled = !known || status.state === 'idle' || pending;
+  $('archive-default').disabled = !state.archive.defaults || pending;
+  $('archive-show').checked = state.archive.shown;
+
+  const badge = $('archive-badge');
+  const badgeState = !known ? 'idle' : busy ? 'busy' : status.state === 'error' ? 'error'
+    : status.state === 'idle' ? 'idle' : status.errors?.length || status.state === 'cancelled' ? 'warning' : 'ready';
+  badge.className = `archive-badge ${badgeState}`;
+  badge.textContent = !known ? 'Unavailable' : {
+    idle: 'Not loaded', listing: 'Searching…', scanning: 'Loading…', ready: 'Loaded', cancelled: 'Partly loaded', error: 'Failed',
+  }[status.state] || status.state;
+  $('archive-panel').setAttribute('aria-busy', String(busy));
+
+  const progress = $('archive-progress');
+  progress.hidden = !busy;
+  if (status?.state === 'scanning' && status.bytesTotal > 0) {
+    progress.max = status.bytesTotal;
+    progress.value = Math.min(status.bytesTotal, status.bytesDone);
+  } else {
+    progress.removeAttribute('value');
+  }
+
+  const parts = [];
+  if (!known) {
+    parts.push('Archive status unavailable.');
+  } else if (status.state === 'idle') {
+    parts.push(status.message || 'No archive loaded. Choose a folder and how many days to load, then select Load history.');
+  } else {
+    const dateLabel = (time) => dateFormatter({
+      timeZone: state.timeZone, hourCycle: 'h23', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+    }).format(new Date(time));
+    const range = Number.isFinite(status.from) ? `${dateLabel(status.from)} – ${dateLabel(status.to)}` : '';
+    if (status.state === 'listing') parts.push(status.message || 'Searching for log files…');
+    if (status.state === 'scanning') {
+      const elapsed = Date.now() - archiveFetch.startedAt;
+      const remaining = status.bytesDone > 0 && elapsed > 3000
+        ? elapsed * (status.bytesTotal - status.bytesDone) / status.bytesDone : null;
+      parts.push(`Reading file ${Math.min(status.filesDone + 1, status.filesTotal)} of ${status.filesTotal}`
+        + `${status.filesCached ? ` (${status.filesCached} from cache)` : ''}`
+        + ` · ${formatBytes(status.bytesDone)} of ${formatBytes(status.bytesTotal)}`
+        + (Number.isFinite(remaining) ? ` · about ${formatDuration(remaining)} left` : '')
+        + (status.currentFile ? ` · ${status.currentFile.split(/[\\/]/).pop()}.` : '.'));
+    }
+    if (status.state === 'ready' || status.state === 'cancelled') {
+      if (status.message) parts.push(status.message);
+      parts.push(`${status.filesDone} of ${status.filesTotal} files read${status.filesCached ? ` (${status.filesCached} from cache)` : ''}`
+        + `${Number.isFinite(status.finishedAt) && Number.isFinite(status.startedAt)
+          ? ` in ${formatDuration(status.finishedAt - status.startedAt)}` : ''}.`);
+    }
+    if (status.state === 'error') parts.push(status.message || 'Archive loading failed.');
+    if (status.state !== 'listing') {
+      parts.push(`${status.reports.toLocaleString()} status reports, ${status.samples.toLocaleString()} seconds with detections`
+        + `${status.resolutionMs > 1000 ? ` (stored at ${formatSpan(status.resolutionMs)} resolution)` : ''}`
+        + `${range ? ` · ${range}` : ''}.`);
+    }
+    if (status.crcErrors) parts.push(`${status.crcErrors} corrupt reports skipped.`);
+    if (status.errors?.length) parts.push(`${status.errors.length} problem${status.errors.length === 1 ? '' : 's'}: ${status.errors.slice(0, 3).join('; ')}`);
+  }
+  $('archive-status').textContent = parts.join(' ');
+}
+
+/** Fetches archive data for the visible range (debounced), at roughly one bucket per pixel. */
+function ensureArchiveData(start, end, plotWidth) {
+  const archive = state.archive;
+  const status = archive.status;
+  if (!archive.shown || !status || status.state === 'idle' || !Number.isFinite(status.from)) return;
+  const from = Math.max(start, status.from);
+  const to = Math.min(end, status.to);
+  if (to <= from) return;
+  const wantedBucket = Math.max(1000, (end - start) / Math.max(100, plotWidth));
+  const data = archive.data;
+  const covers = data && data.generation === status.generation && data.from <= from && data.to >= to
+    && data.bucketMs <= Math.max(wantedBucket * 1.5, data.resolutionMs);
+  if (covers && data.revision === status.revision && data.resolutionMs === status.resolutionMs) return;
+  archiveFetch.wanted = { start, end, plotWidth };
+  // New data arriving during a scan is refreshed slowly; navigating to an unfetched range is fast.
+  const delay = covers ? 1500 : 150;
+  if (archiveFetch.timer && archiveFetch.delay <= delay) return;
+  clearTimeout(archiveFetch.timer);
+  archiveFetch.delay = delay;
+  archiveFetch.timer = setTimeout(fetchArchiveData, delay);
+}
+
+async function fetchArchiveData() {
+  archiveFetch.timer = null;
+  const status = state.archive.status;
+  const wanted = archiveFetch.wanted;
+  if (!wanted || !status || status.state === 'idle') return;
+  const span = wanted.end - wanted.start;
+  const from = Math.max(status.from, wanted.start - span / 2);
+  const to = Math.min(status.to, wanted.end + span / 2);
+  if (to <= from) return;
+  const buckets = Math.min(4000, Math.max(10, Math.round(wanted.plotWidth * (to - from) / span)));
+  archiveFetch.controller?.abort();
+  const controller = new AbortController();
+  archiveFetch.controller = controller;
+  const generation = status.generation;
+  try {
+    const data = await request(`/api/archive/interference?from=${Math.floor(from)}&to=${Math.ceil(to)}&buckets=${buckets}`,
+      { signal: controller.signal }, true);
+    if (controller.signal.aborted || state.archive.status?.generation !== generation) return;
+    if (!data || !Array.isArray(data.samples) || !Array.isArray(data.coverage) || !Number.isFinite(data.bucketMs)
+      || data.samples.some((sample) => !sample || !Number.isFinite(sample.t) || typeof sample.signal !== 'string'
+        || !Number.isFinite(sample.count) || (sample.detections !== undefined && !Array.isArray(sample.detections)))) {
+      throw new Error('Invalid archive response');
+    }
+    state.archive.data = { ...data, generation };
+    timelineDirty = true;
+  } catch (error) {
+    if (!controller.signal.aborted) reportClientError('Could not load archive data', error);
+  } finally {
+    if (archiveFetch.controller === controller) archiveFetch.controller = null;
+  }
+}
+
+async function archiveRequest(url, body) {
+  state.archive.requestPending = true;
+  renderArchiveStatus();
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+    applyArchiveStatus(data);
+    return data;
+  } finally {
+    state.archive.requestPending = false;
+    renderArchiveStatus();
+  }
+}
+
+/** Shows the whole loaded range while following live time. */
+function showWholeArchive() {
+  const status = state.archive.status;
+  if (!status || !Number.isFinite(status.from)) return;
+  state.timelineView = { end: Date.now(), windowMs: Date.now() - status.from, follow: true };
+  timelineDirty = true;
+}
+
+async function loadArchiveSettings() {
+  try {
+    const info = await request('/api/archive', {}, true);
+    state.archive.defaults = info.defaults;
+    const maxDays = info.limits?.maxDays || 31;
+    const select = $('archive-days');
+    for (const option of [...select.options]) {
+      if (Number(option.value) > maxDays) option.remove();
+    }
+    const days = String(info.settings?.days || 1);
+    if (![...select.options].some((option) => option.value === days)) {
+      select.append(new Option(`Last ${days} days`, days));
+    }
+    select.value = days;
+    $('archive-root').value = info.settings?.root || '';
+    applyArchiveStatus(info.status);
+  } catch (error) {
+    $('archive-status').textContent = `Could not read archive settings: ${error.message}`;
+  }
+}
+
+$('archive-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    await archiveRequest('/api/archive/load', { root: $('archive-root').value.trim(), days: Number($('archive-days').value) });
+    state.archive.data = null;
+    if (!state.archive.shown) {
+      state.archive.shown = true;
+      writePreference('archiveShown', 'true');
+    }
+    showWholeArchive();
+    flushUpdates(true);
+  } catch (error) {
+    $('archive-status').textContent = `Could not start loading: ${error.message}`;
+    $('archive-badge').className = 'archive-badge error';
+    $('archive-badge').textContent = 'Failed';
+  }
+});
+
+$('archive-cancel').addEventListener('click', () => {
+  archiveRequest('/api/archive/cancel').catch((error) => { $('archive-status').textContent = error.message; });
+});
+
+$('archive-clear').addEventListener('click', () => {
+  archiveRequest('/api/archive/clear').then(() => {
+    state.timelineView = null;
+    flushUpdates(true);
+  }).catch((error) => { $('archive-status').textContent = error.message; });
+});
+
+$('archive-default').addEventListener('click', () => {
+  if (!state.archive.defaults) return;
+  $('archive-root').value = state.archive.defaults.root;
+  $('archive-days').value = String(state.archive.defaults.days);
+});
+
+$('archive-show').addEventListener('change', (event) => {
+  state.archive.shown = event.target.checked;
+  writePreference('archiveShown', String(state.archive.shown));
+  if (state.archive.shown) showWholeArchive();
+  else state.timelineView = null;
+  flushUpdates(true);
+});
+
+renderArchiveStatus();
+loadArchiveSettings();
+setInterval(() => {
+  if (ARCHIVE_BUSY.has(state.archive.status?.state)) renderArchiveStatus();
+}, 1000);
 
 function renderSkyplot() {
   const satellites = buildSatelliteList();

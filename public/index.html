@@ -236,6 +236,42 @@
       <div class="card"><span class="label">Status messages</span><span id="it-total" class="value">0</span></div>
     </div>
 
+    <details id="archive-panel" class="archive-panel" open>
+      <summary>
+        Historic archive
+        <span id="archive-badge" class="archive-badge idle">Not loaded</span>
+      </summary>
+      <form id="archive-form" class="archive-form">
+        <label class="archive-root">Network folder
+          <input id="archive-root" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="\\20.20.20.1\novatel\pwrpak1" disabled>
+        </label>
+        <label>Days to load
+          <select id="archive-days" disabled>
+            <option value="1">Last 24 hours</option>
+            <option value="2">Last 2 days</option>
+            <option value="3">Last 3 days</option>
+            <option value="7">Last 7 days</option>
+            <option value="14">Last 14 days</option>
+            <option value="30">Last 30 days</option>
+          </select>
+        </label>
+        <div class="archive-actions">
+          <button id="archive-load" type="submit" disabled>Load history</button>
+          <button id="archive-cancel" type="button" disabled>Cancel</button>
+          <button id="archive-clear" type="button" disabled>Unload</button>
+          <button id="archive-default" type="button" disabled>Default folder</button>
+        </div>
+        <label class="archive-show"><input id="archive-show" type="checkbox" checked> Show archive on plots</label>
+      </form>
+      <progress id="archive-progress" class="archive-progress" max="1" value="0" hidden></progress>
+      <div id="archive-status" class="archive-status" role="status" aria-live="polite">Archive status unavailable.</div>
+      <p class="plot-help">The server searches <code>&lt;folder&gt;\YYYY\DDD\*.LOG</code> (DDD = day of year) for ITDETECTSTATUS
+        reports and reads one file at a time. Each file is summarised once and cached locally, so reloading or
+        extending the range only reads new files (about 400&nbsp;MB per day the first time). Archive data is
+        drawn with hollow markers and dashed lines beneath the live data.</p>
+    </details>
+
     <h2>
       Power over time <span id="timeline-range" class="muted"></span>
       <span class="scale">
@@ -243,6 +279,7 @@
         <span class="scale-item"><i class="swatch moderate"></i>&minus;95 to &minus;110</span>
         <span class="scale-item"><i class="swatch weak"></i>&lt; &minus;110</span>
         <span class="scale-item"><i class="swatch clear"></i>clear report</span>
+        <span class="scale-item"><i class="swatch archive"></i>archive</span>
       </span>
     </h2>
     <div class="timeline-controls" role="group" aria-label="Linked chart navigation">

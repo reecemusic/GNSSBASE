@@ -77,6 +77,24 @@ const config = {
     ? require('node:path').join(__dirname, '..', 'data', 'history.json')
     : process.env.HISTORY_FILE || null,
   historySaveSeconds: integerSetting('HISTORY_SAVE_SEC', 60, 1),
+
+  // Historic interference archive: root\YYYY\DDD\*.LOG on a network share, loaded on demand.
+  archiveRoot: process.env.NOVATEL_ARCHIVE_ROOT || '\\\\20.20.20.1\\novatel\\pwrpak1',
+  archiveDefaultDays: integerSetting('ARCHIVE_DAYS', 1, 1, 366),
+  archiveMaxDays: integerSetting('ARCHIVE_MAX_DAYS', 31, 1, 366),
+  // Upper bound on detection samples kept in memory; resolution is coarsened beyond this.
+  archiveMaxSamples: integerSetting('ARCHIVE_MAX_SAMPLES', 300000, 1000),
+  // Per-file summaries so each NAS file is only read once. Set ARCHIVE_CACHE_DIR='' to disable.
+  archiveCacheDir: process.env.ARCHIVE_CACHE_DIR === undefined
+    ? require('node:path').join(__dirname, '..', 'data', 'archive-cache')
+    : process.env.ARCHIVE_CACHE_DIR || null,
+  archiveSettingsFile: process.env.ARCHIVE_SETTINGS_FILE === undefined
+    ? require('node:path').join(__dirname, '..', 'data', 'archive-settings.json')
+    : process.env.ARCHIVE_SETTINGS_FILE || null,
 };
+
+if (config.archiveDefaultDays > config.archiveMaxDays) {
+  throw new Error('ARCHIVE_DAYS must not exceed ARCHIVE_MAX_DAYS');
+}
 
 module.exports = config;

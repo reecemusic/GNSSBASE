@@ -134,6 +134,45 @@ visible. Initial clear reports are omitted, and CRC-failed clear reports do not
 change the last valid detection state. This filtering affects only the message
 list, not report counters, live status or chart history.
 
+## Historic Archive
+
+The **Historic archive** panel on the Interference tab loads ITDETECTSTATUS history
+from the receiver's recorded `.LOG` files on the network store and draws it on the same
+power and frequency plots as live data. The default folder is
+`\\20.20.20.1\novatel\pwrpak1`; change it in the panel (it is remembered on the server)
+or set `NOVATEL_ARCHIVE_ROOT`. **Default folder** restores the configured default.
+
+Expected layout: `<folder>\YYYY\DDD\*.LOG`, where `DDD` is the day of year, for example
+`\\20.20.20.1\novatel\pwrpak1\2026\275\NMUT23450006R_2026-10-02_00-43-27.LOG`. Both
+recording formats are read: binary `ITDETECTSTATUSB` (message 2065) and ASCII
+`#ITDETECTSTATUSA` lines mixed with binary logs. Only the primary antenna is used
+(`ITDETECTSTATUS_1` is ignored), times come from each report's GPS header (file and
+folder names are only used to choose which files to open), and CRC failures are skipped.
+
+Choose how many days to load (1 to `ARCHIVE_MAX_DAYS`) and select **Load history**.
+Loading never starts automatically. Safeguards keep the NAS, server and browser responsive:
+
+- Files are streamed one at a time in 1 MB chunks; only ITDETECTSTATUS frames are
+  decoded and other logs (RANGE, ephemerides, …) are skipped by length.
+- Each file is reduced to a compact summary — coverage runs for clear reporting and the
+  strongest detection per band per second — cached in `data/archive-cache/`. The NAS is
+  read once per file (about 40 s and 475 MB per day the first time); reloading or
+  extending the range only reads new or changed files, and a cached day reloads in well
+  under a second.
+- At most `ARCHIVE_MAX_SAMPLES` detection seconds are kept in memory; beyond that, older
+  detail is merged into wider time buckets, keeping the strongest report.
+- The browser only requests the visible range at about one point per pixel (at most 4,000
+  buckets), so a 30-day view returns tens of kilobytes rather than millions of reports.
+- Progress, cache hits, an estimated time remaining and any unreadable files are shown in
+  the panel. **Cancel** stops reading and keeps what was already loaded; **Unload** frees it.
+
+Archive data appears as faint green status bars where reports were received (clear unless
+marked), hollow power markers joined by dashed lines, and dashed amber frequency markers.
+Live data is drawn on top in the usual style. After loading, the plots show the whole
+range while following live time; zoom and pan work as usual, and **Reset / Live** returns
+to the live window. Untick **Show archive on plots** to hide it without unloading.
+Band cards and statistics remain live-only.
+
 ## Configuration (environment variables)
 
 | Variable | Default | Purpose |
@@ -152,6 +191,11 @@ list, not report counters, live status or chart history.
 | `MAX_IT_SAMPLES` | `50000` | Hard cap on stored interference samples |
 | `HISTORY_FILE` | `data/history.json` | Where history is persisted. Set to an empty string for memory-only. |
 | `HISTORY_SAVE_SEC` | `60` | How often history is written to disk |
+| `NOVATEL_ARCHIVE_ROOT` | `\\20.20.20.1\novatel\pwrpak1` | Default historic archive folder (`YYYY\DDD\*.LOG`). The folder chosen in the UI is saved in `data/archive-settings.json` and takes precedence. |
+| `ARCHIVE_DAYS` / `ARCHIVE_MAX_DAYS` | `1` / `31` | Default and maximum number of days the UI may load |
+| `ARCHIVE_MAX_SAMPLES` | `300000` | Detection seconds kept in memory before archive resolution is coarsened |
+| `ARCHIVE_CACHE_DIR` | `data/archive-cache` | Per-file summary cache. Set to an empty string to re-read the NAS every time. |
+| `ARCHIVE_SETTINGS_FILE` | `data/archive-settings.json` | Where the chosen folder and days are remembered. Empty string disables saving. |
 
 The requested logs are listed in [src/config.js](src/config.js). They are requested in
 ASCII on this tool's own port only — the profile's binary `LOG FILE ...` recording is
@@ -182,13 +226,17 @@ ITDETECTSTATUS and all seven ephemeris logs.
 - [src/novatel.js](src/novatel.js) — ASCII and binary framing, CRC32, GPS-time conversion, message-ID table
 - [src/messages.js](src/messages.js) — per-log decoders and receiver-status bit names
 - [src/receiver.js](src/receiver.js) — TCP client, stream framing, auto-reconnect
-- [src/server.js](src/server.js) — state store, Server-Sent Events, `/api/snapshot`
+- [src/server.js](src/server.js) — state store, Server-Sent Events, `/api/snapshot`, `/api/archive/*`
+- [src/archive.js](src/archive.js) — historic `.LOG` scanner, per-file cache and archive queries
 - [public/](public/) — browser UI
 
 ## Notes on decoding
 
 - `ITDETECTSTATUS` detection block size varies by OEM7 firmware, so it is derived at
   runtime and values are classified heuristically; raw fields are always shown.
-- Binary logs have dedicated decoders for BESTPOS, BESTGNSSPOS, RANGE and RXSTATUS.
+- Binary `ITDETECTSTATUSB` (message 2065) is decoded into the same shape: RF path
+  (2 = L1, 3 = L2, 5 = L5), detection type, and for spectrum analysis the centre
+  frequency, bandwidth and power.
+- Binary logs have dedicated decoders for BESTPOS, BESTGNSSPOS, RANGE, RXSTATUS and ITDETECTSTATUS.
   Other binary logs are framed, named and CRC-checked but their bodies are not expanded —
   request the ASCII form (the default) for full field detail.

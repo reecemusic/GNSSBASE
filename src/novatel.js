@@ -41,11 +41,15 @@ const TIME_STATUS_NAMES = new Set([
 const GPS_EPOCH_MS = Date.UTC(1980, 0, 6);
 const LEAP_SECONDS = 18;
 
-function gpsToUtc(week, seconds) {
+function gpsToMs(week, seconds) {
   if (!Number.isFinite(week) || !Number.isFinite(seconds)) return null;
   const ms = GPS_EPOCH_MS + week * 604800000 + (seconds - LEAP_SECONDS) * 1000;
-  if (!Number.isFinite(ms) || Math.abs(ms) > 8640000000000000) return null;
-  return new Date(ms).toISOString();
+  return Number.isFinite(ms) && Math.abs(ms) <= 8640000000000000 ? ms : null;
+}
+
+function gpsToUtc(week, seconds) {
+  const ms = gpsToMs(week, seconds);
+  return ms === null ? null : new Date(ms).toISOString();
 }
 
 /**
@@ -209,6 +213,43 @@ function describeDetection(block) {
   };
 }
 
+const IT_RF_PATHS = { 2: 'L1', 3: 'L2', 5: 'L5' };
+const IT_DETECTION_TYPES = { 0: 'SPECTRUMANALYSIS', 1: 'STATISTICANALYSIS' };
+const IT_ENTRY_BYTES = 36;
+const IT_MAX_ENTRIES = 256;
+
+/** Decodes an OEM7 binary ITDETECTSTATUS body (message ID 2065) into the ASCII decoder's shape. */
+function decodeItDetectStatusBinary(body) {
+  if (!body || body.length < 4) return { detectionCount: 0, detections: [], extraFields: [] };
+  const declared = body.readUInt32LE(0);
+  const count = Math.min(declared, IT_MAX_ENTRIES, Math.floor((body.length - 4) / IT_ENTRY_BYTES));
+  const detections = [];
+  for (let index = 0; index < count; index++) {
+    const offset = 4 + index * IT_ENTRY_BYTES;
+    const rfPath = body.readUInt32LE(offset);
+    const typeCode = body.readUInt32LE(offset + 4);
+    const spectrum = typeCode === 0;
+    const parameter = (byte) => {
+      const value = body.readFloatLE(offset + byte);
+      return spectrum && Number.isFinite(value) ? value : null;
+    };
+    const centerMHz = parameter(8);
+    const bandwidthMHz = parameter(12);
+    detections.push({
+      fields: [],
+      signalType: IT_RF_PATHS[rfPath] || `RF${rfPath}`,
+      type: IT_DETECTION_TYPES[typeCode] || String(typeCode),
+      centerFrequencyHz: centerMHz === null ? null : centerMHz * 1e6,
+      bandwidthHz: bandwidthMHz === null ? null : bandwidthMHz * 1e6,
+      powerDbm: parameter(16),
+      noiseFloorDbm: null,
+      metrics: [],
+      affectedSignals: [],
+    });
+  }
+  return { detectionCount: declared, detections, extraFields: [] };
+}
+
 const SYNC_LONG = Buffer.from([0xaa, 0x44, 0x12]);
 const SYNC_SHORT = Buffer.from([0xaa, 0x44, 0x13]);
 const LONG_HEADER_LENGTH = 28;
@@ -233,8 +274,8 @@ const MESSAGE_NAMES_BY_ID = {
   1310: 'GALFNAVEPHEMERIS',
   1336: 'QZSSEPHEMERIS',
   1429: 'BESTGNSSPOS',
-  1532: 'ITDETECTSTATUS',
   1696: 'BDSEPHEMERIS',
+  2065: 'ITDETECTSTATUS',
   2123: 'NAVICEPHEMERIS',
 };
 
@@ -306,9 +347,11 @@ module.exports = {
   novatelCrc32Buffer,
   parseAsciiLog,
   interpretItDetectStatus,
+  decodeItDetectStatusBinary,
   splitFields,
   readBinaryLog,
   findSyncIndex,
   gpsToUtc,
+  gpsToMs,
   MESSAGE_NAMES_BY_ID,
 };
