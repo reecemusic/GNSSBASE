@@ -1071,8 +1071,7 @@ function renderTimeline() {
   const now = Date.now();
   const axis = timelineAxis(start, windowMs, plotWidth, now);
 
-  const samples = state.interferenceHistory.filter((sample) => sample.t >= start && sample.t <= axis.dataEnd
-    && (sample.signal === 'ALL' || bandIds.includes(classifyBand(sample.signal, []))))
+  const samples = state.interferenceHistory.filter((sample) => sample.t >= start && sample.t <= axis.dataEnd)
     .sort((a, b) => a.t - b.t);
   $('timeline-range').textContent = `(${samples.length} samples, ${(windowMs / 1000).toFixed(0)} s window)`;
   $('timeline-mode').textContent = !state.timelineView ? 'Live'
@@ -1111,8 +1110,7 @@ function renderTimeline() {
     const pixels = new Map();
     let segment = 0;
     let lastTime = null;
-    for (const sample of samples) {
-      if (sample.signal !== 'ALL' && classifyBand(sample.signal, []) !== band) continue;
+    for (const sample of timelineBandSamples(samples, band)) {
       if (!sample.count || !Number.isFinite(sample.maxPower) || (lastTime !== null && sample.t - lastTime > 15000)) {
         segment++;
       }
@@ -1171,6 +1169,34 @@ function renderTimeline() {
 
   chart.append(svg('text', { x: TIMELINE.left, y: TIMELINE.height - 5, class: 'tl-title' },
     state.timeZone === 'Asia/Dubai' ? 'UAE' : state.timeZone));
+}
+
+// Detection samples this close together came from one ITDETECTSTATUS report (one sample is stored per
+// signal type). A clear ('ALL') sample is always a report of its own.
+const TIMELINE_REPORT_MS = 50;
+
+/**
+ * Samples for one band from time-sorted history. A report that detected interference only in other bands
+ * still proves this band was monitored, so it becomes a clear sample here rather than a gap.
+ */
+function timelineBandSamples(samples, band) {
+  const result = [];
+  let index = 0;
+  while (index < samples.length) {
+    const first = samples[index];
+    let hit = false;
+    if (first.signal === 'ALL') index++;
+    for (; index < samples.length && samples[index].signal !== 'ALL'
+      && samples[index].t - first.t <= TIMELINE_REPORT_MS; index++) {
+      const sample = samples[index];
+      if (sample.count > 0 && classifyBand(sample.signal, []) === band) {
+        result.push(sample);
+        hit = true;
+      }
+    }
+    if (!hit) result.push({ t: first.t, signal: 'ALL', count: 0, maxPower: null });
+  }
+  return result;
 }
 
 function formatSpan(ms) {

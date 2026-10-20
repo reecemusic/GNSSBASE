@@ -105,12 +105,13 @@ function processReceiverLog(message) {
       signalDetections.push(detection);
       bySignal.set(detection.signalType, signalDetections);
     }
+    const reportTime = Date.now();
     if (bySignal.size) {
       for (const [signal, signalDetections] of bySignal) {
-        history.addInterference(signal, signalDetections);
+        history.addInterference(signal, signalDetections, reportTime);
       }
     } else {
-      history.addInterference('ALL', []);
+      history.addInterference('ALL', [], reportTime);
     }
   }
 

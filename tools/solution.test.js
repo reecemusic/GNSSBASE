@@ -111,3 +111,22 @@ test('timeline geometry keeps the band rows and adds two solution rows above the
   const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
   assert.match(html, new RegExp(`id="timeline" viewBox="0 0 900 ${TIMELINE.height}"`));
 });
+
+test('a report with interference in one band shows clear status in the other bands', () => {
+  const context = vm.createContext({
+    classifyBand: (signal) => (/L2/.test(signal) ? 'L2' : /L5/.test(signal) ? 'L5' : /L1/.test(signal) ? 'L1' : 'OTHER'),
+  });
+  loadFunctions(browserCode, 'const TIMELINE_REPORT_MS =', 'function formatSpan(', context);
+  const samples = [
+    { t: 0, signal: 'ALL', count: 0, maxPower: null },
+    { t: 1000, signal: 'GPSL2C', count: 1, maxPower: -90 },
+    { t: 2000, signal: 'GPSL2C', count: 1, maxPower: -88 },
+    { t: 2001, signal: 'GALE6', count: 1, maxPower: -100 },
+    { t: 3000, signal: 'GPSL1CA', count: 1, maxPower: -95 },
+    { t: 3000, signal: 'GPSL2C', count: 2, maxPower: -85 },
+  ];
+  const summary = (band) => plain(context.timelineBandSamples(samples, band).map((s) => [s.t, s.count]));
+  assert.deepEqual(summary('L1'), [[0, 0], [1000, 0], [2000, 0], [3000, 1]]);
+  assert.deepEqual(summary('L2'), [[0, 0], [1000, 1], [2000, 1], [3000, 2]]);
+  assert.deepEqual(summary('L5'), [[0, 0], [1000, 0], [2000, 0], [3000, 0]], 'one clear sample per report');
+});
