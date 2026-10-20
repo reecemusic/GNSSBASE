@@ -90,15 +90,15 @@ class History {
 
   save() {
     if (!this.filePath) return;
-    this.prune();
-    const payload = JSON.stringify({
-      version: 1,
-      satvisFieldLayout: 2,
-      savedAt: Date.now(),
-      tracks: Object.fromEntries(this.tracks),
-      interference: this.interference,
-    });
     try {
+      this.prune();
+      const payload = JSON.stringify({
+        version: 1,
+        satvisFieldLayout: 2,
+        savedAt: Date.now(),
+        tracks: Object.fromEntries(this.tracks),
+        interference: this.interference,
+      });
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
       const temporary = `${this.filePath}.tmp`;
       fs.writeFileSync(temporary, payload);
@@ -113,7 +113,7 @@ class History {
     try {
       if (fs.statSync(this.filePath).size > 64 * 1024 * 1024) throw new Error('History file exceeds the 64 MiB load limit');
       const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-      if (parsed.version !== 1) throw new Error('Unsupported history file version');
+      if (!parsed || parsed.version !== 1) throw new Error('Unsupported history file version');
       this.tracks = parsed.satvisFieldLayout === 2
         ? new Map(Object.entries(parsed.tracks || {}))
         : new Map();

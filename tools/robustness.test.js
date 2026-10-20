@@ -4,9 +4,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const net = require('node:net');
+const { EventEmitter } = require('node:events');
 const { test } = require('node:test');
+const { ReceiverClient } = require('../src/receiver');
 const { History } = require('../src/history');
-const { parseAsciiLog } = require('../src/novatel');
+const { parseAsciiLog, readBinaryLog } = require('../src/novatel');
 const code = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
 
 function load(context, start, end) {
@@ -83,9 +86,11 @@ test('requests reject HTTP errors and time out while waiting for the response bo
   await assert.rejects(context.request('/api/history', {}, true), /503/);
   context.fetch = async (url, { signal }) => ({
     ok: true,
-    json: () => new Promise((resolve, reject) => {
-      signal.addEventListener('abort', () => reject(new Error('Request aborted')));
-    }),
+    json: () => signal.aborted
+      ? Promise.reject(new Error('Request aborted'))
+      : new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('Request aborted')), { once: true });
+      }),
   });
   const pending = context.request('/api/history', {}, true);
   await Promise.resolve();
@@ -141,4 +146,151 @@ test('out-of-range GPS timestamps cannot throw during receiver parsing', () => {
     const result = parseAsciiLog('%TESTA,1e300,1e300;0');
     assert.equal(result.header.utc, null);
   });
+});
+
+test('receiver isolates valid logs, reports connection state and disconnects cleanly', async () => {
+  const receivedCommands = [];
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    socket.on('data', (chunk) => {
+      receivedCommands.push(chunk.toString('ascii'));
+      socket.write('#TESTA,COM1,0,0,FINESTEERING,2200,1.0,00000000,00000000;ok\n');
+    });
+
+    test('a failed log handler does not corrupt the following frame', () => {
+      const receiver = new ReceiverClient({});
+      const logs = [];
+      receiver.on('log', (message) => {
+        if (message.header.messageName === 'FIRST') throw new Error('Bad log handler');
+        logs.push(message.header.messageName);
+      });
+      receiver.ingest(Buffer.from('%FIRSTA,2200,1;0\n%SECONDA,2200,2;0\n'));
+      assert.deepEqual(logs, ['SECOND']);
+      assert.match(receiver.state.lastError, /Bad log handler/);
+      assert.equal(receiver.buffer.length, 0);
+    });
+
+    test('invalid binary header lengths are rejected without unsafe reads', () => {
+      const frame = Buffer.alloc(28);
+      frame.set([0xaa, 0x44, 0x12, 1]);
+      assert.equal(readBinaryLog(frame), null);
+    });
+
+    test('failed serial opens release the port and schedule another attempt', () => {
+      const ports = [];
+      const timers = [];
+      class FakePort extends EventEmitter {
+        constructor() {
+          super();
+          ports.push(this);
+        }
+        open(callback) { this.openCallback = callback; }
+      }
+      const context = vm.createContext({
+        Buffer, console, module: { exports: {} },
+        setTimeout(callback) { timers.push(callback); return timers.length; },
+        clearTimeout() {},
+        require: (name) => name === 'serialport' ? { SerialPort: FakePort }
+          : name === './novatel' ? require('../src/novatel') : require(name),
+      });
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
+      const receiver = new context.module.exports.ReceiverClient({
+        transport: 'serial', serialPath: 'TEST', serialBaudRate: 115200, reconnectDelayMs: 100,
+      });
+      receiver.start();
+      ports[0].openCallback(new Error('Port unavailable'));
+      assert.equal(receiver.port, null);
+      assert.match(receiver.state.lastError, /Port unavailable/);
+      assert.equal(timers.length, 1);
+      timers[0]();
+      assert.equal(ports.length, 2);
+      receiver.stop();
+    });
+
+    test('JSON body errors produce one explicit response without invoking the handler', () => {
+      const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+      const context = vm.createContext({ Buffer, console });
+      const start = serverCode.indexOf('function readJsonBody(');
+      const end = serverCode.indexOf('function connectionSettings()', start);
+      vm.runInContext(serverCode.slice(start, end), context);
+      for (const [body, status] of [['{bad', 400], ['[]', 400], ['x'.repeat(4097), 413]]) {
+        const req = Object.assign(new EventEmitter(), { headers: {}, resume() {} });
+        const res = {
+          responses: 0,
+          writeHead(code) { this.status = code; return this; },
+          end() { this.responses++; this.writableEnded = true; },
+        };
+        let invoked = false;
+        context.readJsonBody(req, res, () => { invoked = true; });
+        req.emit('data', Buffer.from(body));
+        req.emit('data', Buffer.from(' '));
+        req.emit('end');
+        assert.equal(res.status, status);
+        assert.equal(res.responses, 1);
+        assert.equal(invoked, false);
+      }
+    });
+
+    test('history serialization failures are logged rather than escaping the save timer', () => {
+      const warnings = [];
+      const context = vm.createContext({
+        module: { exports: {} }, require,
+        console: { warn: (message) => warnings.push(message) },
+      });
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'history.js'), 'utf8'), context);
+      const history = new context.module.exports.History({
+        filePath: 'unused.json', retentionMs: 60000, maxInterferenceSamples: 10,
+      });
+      const sample = { t: Date.now() };
+      sample.circular = sample;
+      history.interference.push(sample);
+      assert.doesNotThrow(() => history.save());
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /could not save/);
+    });
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+
+  const receiver = new ReceiverClient({
+    transport: 'tcp',
+    receiverHost: '127.0.0.1',
+    receiverPort: server.address().port,
+    reconnectDelayMs: 10,
+    idleTimeoutMs: 10000,
+    ephemerisLogCommands: [],
+    sendLogCommands: false,
+  });
+  try {
+    const message = new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Receiver did not deliver a test log')), 2000);
+      receiver.once('log', (log) => {
+        clearTimeout(timeout);
+        resolve(log);
+      });
+    });
+    receiver.start();
+    const log = await message;
+    assert.equal(log.header.messageName, 'TEST');
+    assert(receiver.state.connected);
+    assert(receivedCommands.some((command) => command.includes('LOG ITDETECTSTATUSA ONTIME 1')));
+    await receiver.disconnect();
+    assert.equal(receiver.state.connected, false);
+    assert.equal(receiver.stopped, true);
+  } finally {
+    receiver.stop();
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Test TCP server did not close within 2 seconds')), 2000);
+      server.close((error) => {
+        clearTimeout(timeout);
+        if (error) reject(error);
+        else resolve();
+      });
+      for (const socket of sockets) socket.destroy();
+    });
+  }
 });

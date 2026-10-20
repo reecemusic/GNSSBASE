@@ -11,6 +11,9 @@ const { decode } = require('./messages');
 const { History } = require('./history');
 
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const HTTP_HEADERS_TIMEOUT_MS = 15_000;
+const HTTP_REQUEST_TIMEOUT_MS = 30_000;
+const SHUTDOWN_TIMEOUT_MS = 5_000;
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -45,14 +48,24 @@ const receiver = new ReceiverClient(config);
 
 receiver.on('status', (state) => {
   latestStatus = state;
-  console.log(`[receiver] ${state.connected ? 'connected to' : 'disconnected from'} ${state.host}:${state.port}${state.lastError ? ` (${state.lastError})` : ''}`);
+  const target = state.transport === 'serial'
+    ? `${state.serialPath} @ ${state.baudRate}`
+    : `${state.host}:${state.port}`;
+  console.log(`[receiver] ${state.connected ? 'connected to' : 'disconnected from'} ${target}${state.lastError ? ` (${state.lastError})` : ''}`);
   broadcast('status', state);
 });
 
 receiver.on('log', (message) => {
+  try {
+    processReceiverLog(message);
+  } catch (error) {
+    console.error(`[receiver] could not process log: ${error.stack || error.message}`);
+  }
+});
+
+function processReceiverLog(message) {
   const record = decode(message);
   const name = record.name;
-
   store.latest[name] = record;
   store.counts[name] = (store.counts[name] || 0) + 1;
 
@@ -100,17 +113,29 @@ receiver.on('log', (message) => {
     counts: store.counts,
     ephemeris: record.kind === 'ephemeris' ? store.ephemeris : undefined,
   });
-});
+}
 
 function broadcast(event, data) {
   if (!clients.size) return;
-  const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  let payload;
+  try {
+    payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  } catch (error) {
+    console.error(`[stream] could not encode ${event} event: ${error.message}`);
+    return;
+  }
   for (const res of clients) {
     if (res.destroyed || res.writableLength > 256 * 1024) {
       clients.delete(res);
       res.destroy();
     } else {
-      res.write(payload);
+      try {
+        res.write(payload);
+      } catch (error) {
+        console.warn(`[stream] closing client after write failure: ${error.message}`);
+        clients.delete(res);
+        res.destroy();
+      }
     }
   }
 }
@@ -130,20 +155,24 @@ function snapshot() {
 }
 
 function serveStatic(req, res) {
-  const requested = req.url === '/' ? '/index.html' : req.url.split('?')[0];
-  const filePath = path.join(PUBLIC_DIR, path.normalize(requested));
+  const pathname = req.url.split('?')[0];
+  const requested = pathname === '/' ? 'index.html' : pathname.replace(/^[/\\]+/, '');
+  const filePath = path.resolve(PUBLIC_DIR, requested);
 
-  // Keep path traversal (`../`) from escaping the public directory.
-  if (!filePath.startsWith(PUBLIC_DIR + path.sep)) {
+  const relativePath = path.relative(PUBLIC_DIR, filePath);
+  if (relativePath === '..' || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
     res.writeHead(403).end('Forbidden');
     return;
   }
 
   fs.readFile(filePath, (err, data) => {
     if (err) {
-      res.writeHead(404).end('Not found');
+      if (res.destroyed || res.writableEnded) return;
+      const notFound = err.code === 'ENOENT' || err.code === 'ENOTDIR';
+      res.writeHead(notFound ? 404 : 500).end(notFound ? 'Not found' : 'Could not read requested file');
       return;
     }
+    if (res.destroyed || res.writableEnded) return;
     res.writeHead(200, {
       'Content-Type': CONTENT_TYPES[path.extname(filePath)] || 'application/octet-stream',
       'Cache-Control': 'no-store',
@@ -153,28 +182,59 @@ function serveStatic(req, res) {
 }
 
 function readJsonBody(req, res, callback) {
-  let body = '';
+  const chunks = [];
+  let size = 0;
+  let responded = false;
+  const badRequest = (status, message) => {
+    if (responded || res.destroyed || res.writableEnded) return;
+    responded = true;
+    res.writeHead(status).end(message);
+  };
+  const declaredLength = Number(req.headers['content-length']);
   req.on('data', (chunk) => {
-    body += chunk;
-    if (body.length > 4096) {
-      res.writeHead(413).end('Request too large');
-      req.destroy();
+    if (responded) return;
+    size += chunk.length;
+    if (size > 4096) {
+      badRequest(413, 'Request too large');
+      chunks.length = 0;
+      req.resume();
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('error', (error) => {
+    if (!res.destroyed && !res.writableEnded) {
+      console.warn(`[http] request body failed: ${error.message}`);
+      badRequest(400, 'Could not read request body');
     }
   });
+  req.on('aborted', () => {
+    responded = true;
+  });
+  if (Number.isFinite(declaredLength) && declaredLength > 4096) {
+    badRequest(413, 'Request too large');
+    req.resume();
+    return;
+  }
   req.on('end', () => {
-    if (res.writableEnded) return;
+    if (responded || res.destroyed || res.writableEnded) return;
     let data;
     try {
-      data = JSON.parse(body);
+      data = JSON.parse(Buffer.concat(chunks).toString('utf8'));
     } catch {
-      res.writeHead(400).end('Invalid JSON');
+      badRequest(400, 'Invalid JSON');
       return;
     }
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
-      res.writeHead(400).end('Expected a JSON object');
+      badRequest(400, 'Expected a JSON object');
       return;
     }
-    callback(data);
+    try {
+      callback(data);
+    } catch (error) {
+      console.error(`[http] could not process request body: ${error.stack || error.message}`);
+      badRequest(500, 'Could not process request');
+    }
   });
 }
 
@@ -189,8 +249,22 @@ function connectionSettings() {
 }
 
 const server = http.createServer((req, res) => {
-  const route = req.url.split('?')[0];
+  try {
+    handleRequest(req, res);
+  } catch (error) {
+    console.error(`[http] request failed: ${error.stack || error.message}`);
+    if (!res.headersSent && !res.destroyed) {
+      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' }).end('Internal server error');
+    } else if (!res.destroyed) {
+      res.destroy(error);
+    }
+  }
+});
+server.headersTimeout = HTTP_HEADERS_TIMEOUT_MS;
+server.requestTimeout = HTTP_REQUEST_TIMEOUT_MS;
 
+function handleRequest(req, res) {
+  const route = (req.url || '/').split('?')[0];
   if (route === '/api/connection' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(connectionSettings()));
@@ -198,9 +272,12 @@ const server = http.createServer((req, res) => {
   }
 
   if (route === '/api/disconnect' && req.method === 'POST') {
-    receiver.disconnect().then(() => {
+    Promise.resolve().then(() => receiver.disconnect()).then(() => {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ disconnected: true }));
+    }).catch((error) => {
+      console.error(`[http] disconnect failed: ${error.stack || error.message}`);
+      if (!res.destroyed && !res.writableEnded) res.writeHead(500).end('Could not disconnect receiver');
     });
     return;
   }
@@ -236,11 +313,14 @@ const server = http.createServer((req, res) => {
 
   if (route === '/api/serial-ports' && req.method === 'GET') {
     SerialPort.list().then((ports) => {
+      if (res.destroyed || res.writableEnded) return;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(ports.map(({ path: portPath, manufacturer }) => ({ path: portPath, manufacturer }))));
     }).catch((err) => {
+      console.error(`[http] could not list serial ports: ${err.message}`);
+      if (res.destroyed || res.writableEnded) return;
       res.writeHead(500, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+      res.end(JSON.stringify({ error: 'Could not list serial ports' }));
     });
     return;
   }
@@ -265,10 +345,16 @@ const server = http.createServer((req, res) => {
         clients.delete(res);
         res.destroy();
       } else {
-        res.write(': ping\n\n');
+        try {
+          res.write(': ping\n\n');
+        } catch (error) {
+          console.warn(`[stream] closing client after keep-alive failure: ${error.message}`);
+          clients.delete(res);
+          res.destroy();
+        }
       }
     }, 15000);
-    req.on('close', () => {
+    res.on('close', () => {
       clearInterval(keepAlive);
       clients.delete(res);
     });
@@ -296,6 +382,17 @@ const server = http.createServer((req, res) => {
   }
 
   serveStatic(req, res);
+}
+
+server.on('clientError', (error, socket) => {
+  console.warn(`[http] malformed client request: ${error.message}`);
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+  else socket.destroy();
+});
+server.on('error', (error) => {
+  console.error(`[http] server error: ${error.stack || error.message}`);
+  receiver.stop();
+  process.exitCode = 1;
 });
 
 server.listen(config.webPort, config.webHost, () => {
@@ -305,10 +402,23 @@ server.listen(config.webPort, config.webHost, () => {
   receiver.start();
 });
 
+let shuttingDown = false;
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     receiver.stop();
     history.save();
-    server.close(() => process.exit(0));
+    const shutdownTimer = setTimeout(() => {
+      console.error(`[shutdown] forcing exit after ${SHUTDOWN_TIMEOUT_MS} ms`);
+      if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
+      process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    server.close(() => {
+      clearTimeout(shutdownTimer);
+      process.exit(0);
+    });
+    for (const client of clients) client.destroy();
+    clients.clear();
   });
 }

@@ -2,16 +2,14 @@
 
 const net = require('node:net');
 const { EventEmitter } = require('node:events');
+const { SerialPort } = require('serialport');
 const { parseAsciiLog, readBinaryLog, findSyncIndex } = require('./novatel');
 
-const MAX_BUFFER_BYTES = 1 << 20; // guard against a peer that never sends a delimiter
+const MAX_BUFFER_BYTES = 1 << 20;
 const NEWLINE = 0x0a;
 
 /**
- * Maintains a TCP connection to the receiver and splits the stream into logs.
- * The stream may mix ASCII sentences with binary (0xAA 0x44 0x12) logs, so both
- * framings are handled in one pass.
- *
+ * Maintains a TCP or serial connection to the receiver and splits its stream into logs.
  * Events: 'status' (connection state), 'log' (parsed message).
  */
 class ReceiverClient extends EventEmitter {
@@ -19,13 +17,24 @@ class ReceiverClient extends EventEmitter {
     super();
     this.options = options;
     this.socket = null;
+    this.port = null;
     this.buffer = Buffer.alloc(0);
     this.reconnectTimer = null;
-    this.stopped = false;
-    this.state = { connected: false, host: options.receiverHost, port: options.receiverPort, lastError: null, lastDataAt: null };
+    this.stopped = true;
+    this.state = {
+      connected: false,
+      transport: options.transport || 'tcp',
+      host: options.receiverHost,
+      port: options.receiverPort,
+      serialPath: options.serialPath,
+      baudRate: options.serialBaudRate,
+      lastError: null,
+      lastDataAt: null,
+    };
   }
 
   start() {
+    if (!this.stopped) return;
     this.stopped = false;
     this.connect();
   }
@@ -33,87 +42,216 @@ class ReceiverClient extends EventEmitter {
   stop() {
     this.stopped = true;
     clearTimeout(this.reconnectTimer);
-    if (this.socket) this.socket.destroy();
+    this.reconnectTimer = null;
+    this.closeCurrentTransport();
+  }
+
+  disconnect() {
+    this.stop();
+    this.updateState({ connected: false });
+    return Promise.resolve();
+  }
+
+  reconfigure(settings) {
+    this.stop();
+    Object.assign(this.options, settings);
+    this.buffer = Buffer.alloc(0);
+    this.updateState({
+      transport: this.options.transport,
+      host: this.options.receiverHost,
+      port: this.options.receiverPort,
+      serialPath: this.options.serialPath,
+      baudRate: this.options.serialBaudRate,
+      connected: false,
+      lastError: null,
+    });
+    this.stopped = false;
+    this.connect();
+  }
+
+  closeCurrentTransport() {
+    const socket = this.socket;
+    const port = this.port;
+    this.socket = null;
+    this.port = null;
+    if (socket && !socket.destroyed) socket.destroy();
+    if (port && port.isOpen) {
+      try {
+        port.close((error) => {
+          if (error && error.code !== 'ERR_PORT_NOT_OPEN') this.setError(error);
+        });
+      } catch (error) {
+        this.setError(error);
+      }
+    }
   }
 
   connect() {
-    const { receiverHost, receiverPort, idleTimeoutMs } = this.options;
+    this.stopped = false;
+    if (this.socket || this.port) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = null;
     this.buffer = Buffer.alloc(0);
+    try {
+      if (this.options.transport === 'serial') this.connectSerial();
+      else this.connectTcp();
+    } catch (error) {
+      this.closeCurrentTransport();
+      this.setError(error);
+      this.scheduleReconnect();
+    }
+  }
 
+  connectTcp() {
+    const { receiverHost, receiverPort, idleTimeoutMs } = this.options;
     const socket = net.createConnection({ host: receiverHost, port: receiverPort });
     this.socket = socket;
     socket.setKeepAlive(true, 10000);
     socket.setTimeout(idleTimeoutMs);
 
     socket.on('connect', () => {
-      this.updateState({ connected: true, lastError: null });
-      for (const command of this.options.ephemerisLogCommands || []) {
-        socket.write(`${command}\r\n`);
-      }
-      if (this.options.sendLogCommands) {
-        for (const command of this.options.logCommands) {
-          socket.write(`${command}\r\n`);
-        }
-      }
+      if (socket !== this.socket || this.stopped) return;
+      this.onConnected();
+      this.sendConfiguredCommands(socket);
     });
-
     socket.on('data', (chunk) => {
-      this.state.lastDataAt = Date.now();
-      this.ingest(chunk);
+      if (socket === this.socket) this.onData(chunk);
     });
-
     socket.on('timeout', () => {
       socket.destroy(new Error(`No data received for ${idleTimeoutMs} ms`));
     });
-
-    socket.on('error', (err) => {
-      this.updateState({ lastError: err.message });
+    socket.on('error', (error) => {
+      if (socket === this.socket) this.setError(error);
     });
+    socket.on('close', () => this.onClosed(socket));
+  }
 
-    socket.on('close', () => {
-      this.updateState({ connected: false });
-      this.scheduleReconnect();
+  connectSerial() {
+    const { serialPath, serialBaudRate } = this.options;
+    const port = new SerialPort({ path: serialPath, baudRate: serialBaudRate, autoOpen: false });
+    this.port = port;
+    port.on('data', (chunk) => {
+      if (port === this.port) this.onData(chunk);
+    });
+    port.on('error', (error) => {
+      if (port === this.port) this.setError(error);
+    });
+    port.on('close', () => this.onClosed(port));
+    port.open((error) => {
+      if (port !== this.port || this.stopped) {
+        if (!error && port.isOpen) {
+          port.close((closeError) => {
+            if (closeError) console.warn(`[receiver] could not close superseded serial port: ${closeError.message}`);
+          });
+        }
+        return;
+      }
+      if (error) {
+        this.port = null;
+        this.setError(error);
+        this.scheduleReconnect();
+        return;
+      }
+      this.onConnected();
+      this.sendConfiguredCommands(port);
     });
   }
 
+  sendConfiguredCommands(transport) {
+    const profileCommands = this.options.sendLogCommands
+      ? (this.options.logCommands || []).filter((command) => !/^LOG ITDETECTSTATUS[A-Z]? /i.test(command))
+      : [];
+    const commands = [
+      ...(this.options.ephemerisLogCommands || []),
+      ...profileCommands,
+      'LOG ITDETECTSTATUSA ONTIME 1',
+    ];
+    for (const command of commands) {
+      try {
+        transport.write(`${command}\r\n`, (error) => {
+          if (error && transport === (this.socket || this.port)) this.setError(error);
+        });
+      } catch (error) {
+        this.setError(error);
+      }
+    }
+  }
+
+  onConnected() {
+    this.updateState({
+      connected: true,
+      transport: this.options.transport || 'tcp',
+      host: this.options.receiverHost,
+      port: this.options.receiverPort,
+      serialPath: this.options.serialPath,
+      baudRate: this.options.serialBaudRate,
+      lastError: null,
+    });
+  }
+
+  onData(chunk) {
+    this.state.lastDataAt = Date.now();
+    this.ingest(chunk);
+  }
+
+  onClosed(transport) {
+    if (transport !== this.socket && transport !== this.port) return;
+    if (transport === this.socket) this.socket = null;
+    if (transport === this.port) this.port = null;
+    this.updateState({ connected: false });
+    this.scheduleReconnect();
+  }
+
   scheduleReconnect() {
-    if (this.stopped) return;
-    clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = setTimeout(() => this.connect(), this.options.reconnectDelayMs);
+    if (this.stopped || this.reconnectTimer) return;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      this.connect();
+    }, this.options.reconnectDelayMs);
+  }
+
+  setError(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (this.state.lastError !== message) this.updateState({ lastError: message });
   }
 
   ingest(chunk) {
     this.buffer = this.buffer.length ? Buffer.concat([this.buffer, chunk]) : chunk;
     if (this.buffer.length > MAX_BUFFER_BYTES) {
       this.buffer = this.buffer.subarray(this.buffer.length - MAX_BUFFER_BYTES);
+      this.setError(new Error('Receiver input exceeded the 1 MiB frame buffer; older bytes were discarded'));
     }
 
     while (this.buffer.length) {
-      const binary = readBinaryLog(this.buffer);
-      if (binary) {
-        if (binary.need) break; // rest of this log has not arrived yet
-        this.buffer = this.buffer.subarray(binary.consumed);
-        this.emit('log', binary.message);
-        continue;
+      const previousBuffer = this.buffer;
+      try {
+        const binary = readBinaryLog(this.buffer);
+        if (binary) {
+          if (binary.need) break;
+          this.buffer = this.buffer.subarray(binary.consumed);
+          this.emit('log', binary.message);
+          continue;
+        }
+
+        const newlineIndex = this.buffer.indexOf(NEWLINE);
+        const syncIndex = findSyncIndex(this.buffer);
+        if (newlineIndex !== -1 && (syncIndex === -1 || newlineIndex < syncIndex)) {
+          const line = this.buffer.toString('ascii', 0, newlineIndex);
+          this.buffer = this.buffer.subarray(newlineIndex + 1);
+          const message = parseAsciiLog(line);
+          if (message) this.emit('log', message);
+          continue;
+        }
+
+        if (syncIndex > 0) {
+          this.buffer = this.buffer.subarray(syncIndex);
+          continue;
+        }
+        break;
+      } catch (error) {
+        this.setError(error);
+        if (this.buffer === previousBuffer) this.buffer = this.buffer.subarray(1);
       }
-
-      const newlineIndex = this.buffer.indexOf(NEWLINE);
-      const syncIndex = findSyncIndex(this.buffer);
-
-      if (newlineIndex !== -1 && (syncIndex === -1 || newlineIndex < syncIndex)) {
-        const line = this.buffer.toString('ascii', 0, newlineIndex);
-        this.buffer = this.buffer.subarray(newlineIndex + 1);
-        const message = parseAsciiLog(line);
-        if (message) this.emit('log', message);
-        continue;
-      }
-
-      if (syncIndex > 0) {
-        this.buffer = this.buffer.subarray(syncIndex); // drop leading noise
-        continue;
-      }
-
-      break; // incomplete frame
     }
   }
 

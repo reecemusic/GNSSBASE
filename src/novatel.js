@@ -250,6 +250,7 @@ function readBinaryLog(buf) {
 
   const headerLength = isLong ? (buf.length > 3 ? buf[3] : LONG_HEADER_LENGTH) : SHORT_HEADER_LENGTH;
   const minimum = isLong ? LONG_HEADER_LENGTH : SHORT_HEADER_LENGTH;
+  if (headerLength < minimum) return null;
   if (buf.length < minimum) return { need: minimum };
 
   const messageLength = isLong ? buf.readUInt16LE(8) : buf[3];
