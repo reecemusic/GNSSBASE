@@ -114,6 +114,8 @@ function processReceiverLog(message) {
     }
   }
 
+  if (name === 'BESTPOS' && record.data) history.addSolution(record.data);
+
   if (name === 'SATVIS2' && record.data && record.data.system) {
     store.satvisBySystem[record.data.system] = record;
     history.addSatellites(record.data.system, record.data.satellites || []);

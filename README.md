@@ -80,6 +80,24 @@ reporting gaps longer than 15 seconds, so separate interference events are not
 joined across missing data. The chart resizes with the browser and when switching
 tabs.
 
+Two further rows under the L1, L2 and L5 power rows share the same time axis, pan
+and zoom:
+
+- **Satellites** is a stepped trace of the number of satellites used in the
+  BESTPOS solution, auto-scaled to the visible maximum. Hover it for the count of
+  satellites used and tracked.
+- **Fix type** has one lane per solution quality tier: **No fix**, **Single**,
+  **Differential**, **Float** and **Fixed**. These are the same tiers as the
+  Position tab's quality badge. A solution status other than `SOL_COMPUTED`
+  counts as No fix. Hover a bar for the exact solution status and position type
+  (for example `SOL_COMPUTED / FIXEDPOS`).
+
+Both rows come from live BESTPOS logs and are saved with the local history. The
+server stores a sample when the solution changes, or at least every 10 seconds
+while it is unchanged. A row breaks when no BESTPOS has been received for 35
+seconds. The NAS archive logs contain no BESTPOS, so these rows have no archive
+data.
+
 The GNSS frequency overlays below the band cards use the same visible time
 window and time axis as **Power over time**, including its pan and zoom. Drag
 **any** plot to pan, or scroll over it to zoom around the pointer. The shared

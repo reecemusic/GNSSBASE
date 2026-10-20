@@ -410,6 +410,7 @@ function applyPayload(payload) {
     queueRecord(pendingInterference, payload.record, MAX_IT_ROWS);
     timelineDirty = true;
   }
+  if (payload.record.name === 'BESTPOS') timelineDirty = true;
   if (!state.paused) queueRecord(pendingRaw, rawDisplayRecord(payload.record), MAX_RAW_ROWS);
   countsDirty = true;
   if (payload.ephemeris) ephemerisDirty = true;
@@ -714,6 +715,7 @@ state.windowMinutes = readPreference(HISTORY_WINDOW_KEY, 60, (value) => {
 });
 state.tracks = {};
 state.interferenceHistory = [];
+state.solutionHistory = [];
 state.showTraces = readPreference('showTraces', 'true') !== 'false';
 state.archive = { status: null, data: null, shown: readPreference('archiveShown', 'true') !== 'false' };
 
@@ -759,6 +761,13 @@ async function loadHistory() {
     state.interferenceHistory = [...savedInterference, ...arrivedDuringRequest.filter((sample) =>
       !keys.has(`${sample.t}:${sample.signal}:${sample.count}:${sample.maxPower}`))];
     state.interferenceHistory.sort((a, b) => a.t - b.t);
+    if (Array.isArray(data.solution)) {
+      const savedSolution = data.solution.slice(-MAX_INTERFERENCE_SAMPLES)
+        .map((sample) => solutionSample(sample, sample?.t)).filter(Boolean).sort((a, b) => a.t - b.t);
+      const lastSaved = savedSolution.length ? savedSolution[savedSolution.length - 1].t : -Infinity;
+      const solutionDuringRequest = (state.solutionHistory || []).filter((sample) => sample.t >= requestedAt && sample.t > lastSaved);
+      state.solutionHistory = [...savedSolution, ...solutionDuringRequest];
+    }
     pruneClientHistory();
     capHistoryWindow(data.retentionMinutes);
   } catch (error) {
@@ -780,6 +789,10 @@ function capHistoryWindow(retentionMinutes) {
 function pruneClientHistory() {
   const cutoff = Date.now() - state.windowMinutes * 60000;
   state.interferenceHistory = state.interferenceHistory.filter((s) => Number.isFinite(s.t) && s.t >= cutoff).slice(-MAX_INTERFERENCE_SAMPLES);
+  if (state.solutionHistory) {
+    state.solutionHistory = state.solutionHistory.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff)
+      .slice(-MAX_INTERFERENCE_SAMPLES);
+  }
   const tracks = Object.entries(state.tracks);
   for (const [index, [key, samples]] of tracks.entries()) {
     if (index >= MAX_TRACKS || !Array.isArray(samples)) {
@@ -838,11 +851,38 @@ function recordLiveHistory(record) {
   if (state.interferenceHistory.length > MAX_INTERFERENCE_SAMPLES) {
     state.interferenceHistory.splice(0, state.interferenceHistory.length - MAX_INTERFERENCE_SAMPLES);
   }
+  if (record.name === 'BESTPOS' && record.data) recordSolution(record.data, now);
+}
+
+// Unchanged solutions are thinned to one sample per heartbeat, matching the server history.
+const SOLUTION_HEARTBEAT_MS = 10000;
+
+function solutionSample(data, t) {
+  if (!data || !Number.isFinite(t)) return null;
+  const count = (value) => (Number.isInteger(value) && value >= 0 && value <= 255 ? value : null);
+  const text = (value) => (typeof value === 'string' && value ? value.slice(0, 32) : null);
+  const sample = {
+    t, used: count(data.used ?? data.satellitesUsed), tracked: count(data.tracked ?? data.satellitesTracked),
+    status: text(data.status ?? data.solutionStatus), type: text(data.type ?? data.positionType),
+  };
+  return sample.used === null && sample.type === null ? null : sample;
+}
+
+function recordSolution(data, now) {
+  const sample = solutionSample(data, now);
+  if (!sample) return;
+  const history = state.solutionHistory || (state.solutionHistory = []);
+  const last = history[history.length - 1];
+  if (last && now - last.t < SOLUTION_HEARTBEAT_MS && last.used === sample.used && last.tracked === sample.tracked
+    && last.status === sample.status && last.type === sample.type) return;
+  history.push(sample);
+  if (history.length > MAX_INTERFERENCE_SAMPLES) history.splice(0, history.length - MAX_INTERFERENCE_SAMPLES);
 }
 
 // --- interference timeline --------------------------------------------------
 
-const TIMELINE = { width: 900, height: 500, left: 142, right: 12, top: 28, bottom: 46 };
+const TIMELINE = { width: 900, height: 680, left: 142, right: 12, top: 28, bottom: 46, solutionRow: 90 };
+const TIMELINE_SOLUTION_ROWS = 2;
 const TIMELINE_BANDS = ['L1', 'L2', 'L5'];
 const TIMELINE_BAND_INFO = {
   L1: { coverage: 'E1 / B1 / G1', range: '1559–1610 MHz' },
@@ -1025,7 +1065,8 @@ function renderTimeline() {
   chart.setAttribute('viewBox', `0 0 ${width} ${TIMELINE.height}`);
   const { start, end, windowMs } = timelineViewport();
   const bandIds = TIMELINE_BANDS;
-  const rowHeight = (TIMELINE.height - TIMELINE.top - TIMELINE.bottom) / bandIds.length;
+  const rowHeight = (TIMELINE.height - TIMELINE.top - TIMELINE.bottom
+    - TIMELINE_SOLUTION_ROWS * TIMELINE.solutionRow) / bandIds.length;
   const plotWidth = width - TIMELINE.left - TIMELINE.right;
   const now = Date.now();
   const axis = timelineAxis(start, windowMs, plotWidth, now);
@@ -1116,6 +1157,7 @@ function renderTimeline() {
   }
 
   renderSpectrumPlots(start, end, windowMs);
+  drawSolutionTimeline(chart, axis, TIMELINE.top + bandIds.length * rowHeight, width);
 
   appendTimeAxis(chart, axis, {
     left: TIMELINE.left,
@@ -1207,6 +1249,123 @@ function drawArchiveTimeline(chart, axis, archive, bandIds, rowHeight, width) {
       previous = { x, y: py, t: sample.t };
     }
   });
+}
+
+// A reported solution is drawn for at most this long after its sample, so lost BESTPOS output shows as a gap.
+const SOLUTION_HOLD_MS = 35000;
+const FIX_TIERS = [
+  { id: 'none', label: 'No fix', colour: '#ff5f56' },
+  { id: 'single', label: 'Single', colour: '#8c94a4' },
+  { id: 'diff', label: 'Differential', colour: '#6aa9ff' },
+  { id: 'float', label: 'Float', colour: '#ffb02e' },
+  { id: 'fixed', label: 'Fixed', colour: '#3ddc84' },
+];
+
+/** Fix-quality tier index (0 = no fix … 4 = fixed), using the same tiers as the Position tab. */
+function fixTier(sample) {
+  if (!sample.type || (sample.status && sample.status !== 'SOL_COMPUTED')) return 0;
+  const known = typeof POSITION_TYPE_TEXT === 'undefined' ? null : POSITION_TYPE_TEXT[sample.type];
+  const index = FIX_TIERS.findIndex((tier) => tier.id === (known ? known[1] : 'single'));
+  return Math.max(0, index);
+}
+
+/**
+ * Merges consecutive samples with the same key into runs clipped to [start, end]. A run ends at the next
+ * sample or SOLUTION_HOLD_MS after its last sample, whichever is first; null keys leave a gap.
+ */
+function solutionRuns(samples, start, end, key) {
+  const runs = [];
+  for (let index = 0; index < samples.length; index++) {
+    const sample = samples[index];
+    if (sample.t > end) break;
+    const next = samples[index + 1];
+    const stop = Math.min(next ? next.t : end, sample.t + SOLUTION_HOLD_MS, end);
+    const value = key(sample);
+    if (stop <= start || value === null) continue;
+    const last = runs[runs.length - 1];
+    if (last && last.value === value && last.end >= sample.t) {
+      last.end = stop;
+      last.last = sample;
+    } else {
+      runs.push({ start: Math.max(start, sample.t), end: stop, value, first: sample, last: sample });
+    }
+  }
+  return runs;
+}
+
+/** Satellites used and fix type from BESTPOS, drawn as two rows beneath the band rows on the shared time axis. */
+function drawSolutionTimeline(chart, axis, top, width) {
+  const rowHeight = TIMELINE.solutionRow;
+  const right = width - TIMELINE.right;
+  const xFor = (time) => Math.max(TIMELINE.left, Math.min(right, TIMELINE.left + axis.x(time)));
+  const samples = (state.solutionHistory || []).filter((sample) => sample.t >= axis.start - SOLUTION_HOLD_MS
+    && sample.t <= axis.dataEnd);
+  const range = (run) => `${formatTimestamp(run.start, true)} – ${formatTimestamp(run.end, true)}`;
+  const rows = [
+    ['Satellites', 'used in solution'],
+    ['Fix type', 'BESTPOS'],
+  ];
+  rows.forEach(([name, detail], index) => {
+    const y = top + index * rowHeight;
+    chart.append(svg('rect', { x: TIMELINE.left, y: y + 1, width: right - TIMELINE.left, height: rowHeight - 2, class: 'tl-row' }));
+    chart.append(svg('rect', { x: 3, y: y + 2, width: width - 6, height: rowHeight - 4, rx: 6, class: 'tl-band-box' }));
+    chart.append(svg('text', { x: 8, y: y + rowHeight / 2 - 4, class: 'tl-band-name' }, name));
+    chart.append(svg('text', { x: 8, y: y + rowHeight / 2 + 12, class: 'tl-band-coverage' }, detail));
+  });
+  if (!samples.length) {
+    for (let index = 0; index < rows.length; index++) {
+      chart.append(svg('text', {
+        x: (TIMELINE.left + right) / 2, y: top + index * rowHeight + rowHeight / 2 + 4, class: 'tl-solution-empty',
+      }, 'No BESTPOS solution data in this window'));
+    }
+    return;
+  }
+
+  // Satellites used: stepped trace over a lightly filled area, auto-scaled to the visible maximum.
+  const satTop = top + 14;
+  const satBottom = top + rowHeight - 10;
+  const usedRuns = solutionRuns(samples, axis.start, axis.dataEnd, (sample) => sample.used);
+  const maxUsed = Math.max(5, Math.ceil(Math.max(0, ...usedRuns.map((run) => run.value)) / 5) * 5);
+  const satY = (count) => satBottom - count / maxUsed * (satBottom - satTop);
+  for (const count of [0, Math.round(maxUsed / 2), maxUsed]) {
+    const y = satY(count);
+    chart.append(svg('line', { x1: TIMELINE.left, x2: right, y1: y, y2: y, class: 'tl-grid' }));
+    chart.append(svg('text', { x: TIMELINE.left - 8, y: y + 4, class: 'tl-label' }, String(count)));
+  }
+  let path = '';
+  let previous = null;
+  for (const run of usedRuns) {
+    const x1 = xFor(run.start);
+    const x2 = Math.max(x1 + 1, xFor(run.end));
+    const y = satY(run.value);
+    path += previous && previous.end >= run.start ? ` V ${y} H ${x2}` : ` M ${x1} ${y} H ${x2}`;
+    previous = run;
+    const area = svg('rect', { x: x1, y, width: x2 - x1, height: satBottom - y, class: 'tl-sats-area' });
+    const tracked = Number.isInteger(run.last.tracked) ? ` of ${run.last.tracked} tracked` : '';
+    area.append(svg('title', {}, `${run.value} satellites used${tracked}, ${range(run)}`));
+    chart.append(area);
+  }
+  if (path) chart.append(svg('path', { d: path.trim(), class: 'tl-sats-line' }));
+
+  // Fix type: one lane per quality tier, coloured bars where the solution was in that tier.
+  const fixTop = top + rowHeight + 6;
+  const laneHeight = (rowHeight - 12) / FIX_TIERS.length;
+  const laneY = (tier) => fixTop + (FIX_TIERS.length - 1 - tier) * laneHeight;
+  FIX_TIERS.forEach((tier, index) => {
+    chart.append(svg('text', { x: TIMELINE.left - 8, y: laneY(index) + laneHeight / 2 + 3, class: 'tl-label tl-fix-label' }, tier.label));
+  });
+  const fixRuns = solutionRuns(samples, axis.start, axis.dataEnd, (sample) => (sample.type || sample.status
+    ? `${fixTier(sample)}|${sample.status || ''}|${sample.type || ''}` : null));
+  for (const run of fixRuns) {
+    const tier = fixTier(run.first);
+    const x1 = xFor(run.start);
+    const bar = svg('rect', {
+      x: x1, y: laneY(tier) + 1, width: Math.max(1, xFor(run.end) - x1), height: laneHeight - 2,
+      fill: FIX_TIERS[tier].colour, class: 'tl-fix-bar',
+    });
+    bar.append(svg('title', {}, `${FIX_TIERS[tier].label}: ${run.first.status || '—'} / ${run.first.type || '—'}, ${range(run)}`));
+    chart.append(bar);
+  }
 }
 
 const SPECTRUM_PLOTS = [

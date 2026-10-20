@@ -375,7 +375,7 @@ select {
 
 #timeline {
   width: 100%;
-  height: 500px;
+  height: 680px;
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -394,6 +394,11 @@ select {
 .tl-now-line { stroke: #4fc3f7; stroke-width: 2; stroke-dasharray: 5 3; }
 .tl-now-label { fill: #4fc3f7; font-size: 11px; font-weight: 700; letter-spacing: .08em; }
 .tl-now-time { fill: #4fc3f7; font-size: 10px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tl-sats-line { fill: none; stroke: #4fc3f7; stroke-width: 1.75; stroke-linejoin: round; pointer-events: none; }
+.tl-sats-area { fill: rgba(79, 195, 247, .14); }
+.tl-fix-bar { opacity: .85; }
+.tl-fix-label { font-size: 9px; }
+.tl-solution-empty { fill: var(--muted); font-size: 11px; font-style: italic; text-anchor: middle; }
 .timeline-controls { display: flex; align-items: center; flex-wrap: wrap; gap: .4rem; }
 .plot-help { color: var(--muted); font-size: .75rem; }
 #timeline, .spectrum-chart svg { touch-action: none; user-select: none; cursor: grab; }

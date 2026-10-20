@@ -18,6 +18,23 @@ class History {
     this.filePath = options.filePath;
     this.tracks = new Map();
     this.interference = [];
+    this.solution = [];
+  }
+
+  /**
+   * Records satellites used and fix type from BESTPOS. Unchanged solutions are thinned to one
+   * sample per SOLUTION_HEARTBEAT_MS so a 1 Hz log costs a few thousand samples per day.
+   */
+  addSolution(data, timestamp = Date.now()) {
+    const sample = solutionSample(data, timestamp);
+    if (!sample) return;
+    const last = this.solution[this.solution.length - 1];
+    if (last && timestamp - last.t < SOLUTION_HEARTBEAT_MS && last.used === sample.used
+      && last.tracked === sample.tracked && last.status === sample.status && last.type === sample.type) return;
+    this.solution.push(sample);
+    if (this.solution.length > this.maxInterferenceSamples) {
+      this.solution.splice(0, this.solution.length - this.maxInterferenceSamples);
+    }
   }
 
   addSatellites(system, satellites, timestamp = Date.now()) {
@@ -71,6 +88,9 @@ class History {
     }
     this.interference = this.interference.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff)
       .slice(-this.maxInterferenceSamples);
+    this.solution = (Array.isArray(this.solution) ? this.solution : [])
+      .filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff)
+      .slice(-this.maxInterferenceSamples);
   }
 
   /** History no older than `windowMs`, capped by the configured retention. */
@@ -85,6 +105,7 @@ class History {
       retentionMinutes: Math.round(this.retentionMs / 60000),
       tracks,
       interference: this.interference.filter((s) => s.t >= cutoff).slice(-limit),
+      solution: this.solution.filter((s) => s.t >= cutoff).slice(-limit),
     };
   }
 
@@ -98,6 +119,7 @@ class History {
         savedAt: Date.now(),
         tracks: Object.fromEntries(this.tracks),
         interference: this.interference,
+        solution: this.solution,
       });
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
       const temporary = `${this.filePath}.tmp`;
@@ -118,14 +140,33 @@ class History {
         ? new Map(Object.entries(parsed.tracks || {}))
         : new Map();
       this.interference = Array.isArray(parsed.interference) ? parsed.interference : [];
+      this.solution = Array.isArray(parsed.solution) ? parsed.solution : [];
       this.prune();
-      console.log(`[history] restored ${this.tracks.size} satellite tracks, ${this.interference.length} interference samples`);
+      console.log(`[history] restored ${this.tracks.size} satellite tracks, ${this.interference.length} interference samples, `
+        + `${this.solution.length} solution samples`);
     } catch (err) {
       console.warn(`[history] could not load: ${err.message}`);
       this.tracks = new Map();
       this.interference = [];
+      this.solution = [];
     }
   }
+}
+
+const SOLUTION_HEARTBEAT_MS = 10000;
+
+function solutionSample(data, timestamp) {
+  if (!data || !Number.isFinite(timestamp)) return null;
+  const count = (value) => (Number.isInteger(value) && value >= 0 && value <= 255 ? value : null);
+  const text = (value) => (typeof value === 'string' && value ? value.slice(0, 32) : null);
+  const sample = {
+    t: timestamp,
+    used: count(data.satellitesUsed),
+    tracked: count(data.satellitesTracked),
+    status: text(data.solutionStatus),
+    type: text(data.positionType),
+  };
+  return sample.used === null && sample.type === null ? null : sample;
 }
 
 function round(value, digits) {
@@ -138,4 +179,4 @@ function isValidSkyPosition(elevation, azimuth) {
     && Number.isFinite(azimuth) && azimuth >= 0 && azimuth < 360;
 }
 
-module.exports = { History };
+module.exports = { History, SOLUTION_HEARTBEAT_MS };
