@@ -12,6 +12,13 @@ npm start                       # tries COM11 @ 9600, then 20.20.20.50:3001; UI 
 
 ## What is displayed
 
+The connection box is green when the receiver port is open, amber while connecting,
+retrying or processing a connection command, and red when disconnected or the monitor
+server is unreachable. Its label explains the current state, active serial/TCP target,
+automatic TCP fallback and retry countdown. **Disconnect** stops automatic retries;
+**Connect** starts them again. Editing connection settings shows **Apply & reconnect**;
+changes only take effect when that button is pressed.
+
 | Tab | Logs |
 | --- | --- |
 | Overview | Per-log counters, format, last-seen time, CRC result |

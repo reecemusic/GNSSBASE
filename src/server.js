@@ -46,12 +46,15 @@ if (config.historyFile) setInterval(() => history.save(), config.historySaveSeco
 
 const receiver = new ReceiverClient(config);
 
+let lastStatusLog = '';
 receiver.on('status', (state) => {
   latestStatus = state;
   const target = state.transport === 'serial'
     ? `${state.serialPath} @ ${state.baudRate}`
     : `${state.host}:${state.port}`;
-  console.log(`[receiver] ${state.connected ? 'connected to' : 'disconnected from'} ${target}${state.lastError ? ` (${state.lastError})` : ''}`);
+  const line = `[receiver] ${state.connected ? 'connected to' : 'disconnected from'} ${target}${state.lastError ? ` (${state.lastError})` : ''}`;
+  if (line !== lastStatusLog) console.log(line);
+  lastStatusLog = line;
   broadcast('status', state);
 });
 

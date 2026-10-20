@@ -141,32 +141,42 @@ $('raw-filter').addEventListener('change', (event) => {
 const connectionForm = $('connection-form');
 const connectionTransport = $('connection-transport');
 const serialPathSelect = $('serial-path');
+// Latest receiver status plus local UI state used to colour the connection bar.
+const connection = { status: null, offline: false, dirty: false, busy: null };
+let connectionCountdown = null;
 
 connectionTransport.addEventListener('change', () => {
   updateConnectionFields();
   if (connectionTransport.value !== 'tcp') refreshSerialPorts();
 });
 
+for (const eventName of ['input', 'change']) {
+  connectionForm.addEventListener(eventName, (event) => {
+    if (!event.target.matches('input, select')) return;
+    connection.dirty = true;
+    renderConnectionBar();
+  });
+}
+
 $('disconnect').addEventListener('click', async () => {
   const message = $('connection-message');
-  const button = $('disconnect');
-  button.disabled = true;
-  message.textContent = 'Disconnecting...';
+  connection.busy = 'disconnect';
+  renderConnectionBar();
+  message.textContent = '';
   try {
     const response = await request('/api/disconnect', { method: 'POST' });
     if (!response.ok) throw new Error(await response.text());
-    message.textContent = 'Disconnected; connection closed';
   } catch (error) {
-    message.textContent = error.message;
+    message.textContent = `Disconnect failed: ${error.message}`;
   } finally {
-    button.disabled = false;
+    connection.busy = null;
+    renderConnectionBar();
   }
 });
 
 connectionForm.addEventListener('submit', async (event) => {
   event.preventDefault();
   const message = $('connection-message');
-  const button = connectionForm.querySelector('button[type="submit"]');
   const transport = connectionTransport.value;
   const serial = {
     serialPath: serialPathSelect.value,
@@ -180,8 +190,9 @@ connectionForm.addEventListener('submit', async (event) => {
     : transport === 'tcp' ? { transport, ...tcp }
       : { transport: 'auto', ...serial, ...tcp };
 
-  button.disabled = true;
-  message.textContent = 'Applying connection settings...';
+  connection.busy = 'connect';
+  renderConnectionBar();
+  message.textContent = '';
   try {
     const response = await request('/api/connection', {
       method: 'POST',
@@ -189,11 +200,12 @@ connectionForm.addEventListener('submit', async (event) => {
       body: JSON.stringify(settings),
     });
     if (!response.ok) throw new Error(await response.text());
-    message.textContent = 'Connection settings applied';
+    connection.dirty = false;
   } catch (error) {
-    message.textContent = error.message;
+    message.textContent = `Could not apply settings: ${error.message}`;
   } finally {
-    button.disabled = false;
+    connection.busy = null;
+    renderConnectionBar();
   }
 });
 
@@ -201,6 +213,97 @@ function updateConnectionFields() {
   const transport = connectionTransport.value;
   $('tcp-fields').hidden = transport === 'serial';
   $('serial-fields').hidden = transport === 'tcp';
+}
+
+function connectionPhase() {
+  const status = connection.status;
+  if (connection.offline) return 'offline';
+  if (!status) return 'connecting';
+  if (status.connected) return 'connected';
+  return status.phase || 'waiting';
+}
+
+function connectionTarget(status, transport = status.transport) {
+  return transport === 'serial'
+    ? `USB serial ${status.serialPath} @ ${status.baudRate} baud`
+    : `TCP ${status.host}:${status.port}`;
+}
+
+/** Colours the connection bar and sets button labels/emphasis for the current phase. */
+function renderConnectionBar() {
+  const status = connection.status;
+  const phase = connectionPhase();
+  const auto = status?.mode === 'auto';
+  const visualPhase = phase === 'offline' ? phase
+    : connection.busy === 'disconnect' ? 'disconnecting'
+      : connection.busy === 'connect' ? 'connecting' : phase;
+  let title;
+  let detail;
+  if (phase === 'offline') {
+    title = 'Monitor server unreachable';
+    detail = 'This page lost contact with the local server — retrying…';
+  } else if (phase === 'connected') {
+    title = 'Connected';
+    detail = `Receiver port open via ${connectionTarget(status)}`
+      + (auto && status.transport === 'tcp' ? ' · USB serial unavailable, using TCP fallback' : '');
+  } else if (phase === 'stopped') {
+    title = 'Disconnected';
+    detail = 'Receiver connection closed. Press Connect to start.';
+  } else if (!status) {
+    title = 'Connecting…';
+    detail = 'Waiting for the monitor server';
+  } else if (phase === 'connecting') {
+    title = 'Connecting…';
+    detail = `Trying ${connectionTarget(status)}`
+      + (auto && status.transport === 'serial' ? `, then ${connectionTarget(status, 'tcp')}` : '');
+  } else {
+    const seconds = Number.isFinite(status.retryAt) ? Math.max(0, Math.ceil((status.retryAt - Date.now()) / 1000)) : null;
+    title = 'Not connected — retrying';
+    detail = `${status.lastError || `Lost ${connectionTarget(status)}`}`
+      + (seconds !== null ? ` · next attempt in ${seconds} s` : '');
+  }
+
+  if (phase !== 'offline' && connection.busy) {
+    title = connection.busy === 'disconnect' ? 'Disconnecting…' : 'Applying connection settings…';
+    detail = 'Waiting for the monitor server to confirm the request.';
+  }
+  if (connection.dirty) detail += ' · Settings changed — press Apply & reconnect to use them.';
+
+  connectionForm.className = `connection-bar conn-${visualPhase}`;
+  connectionForm.setAttribute('aria-busy', String(connection.busy !== null));
+  $('status').className = `status ${visualPhase}`;
+  $('status-text').textContent = title;
+  $('status').title = detail;
+  $('connection-state-title').textContent = title;
+  $('connection-state-detail').textContent = detail;
+
+  for (const fields of [$('serial-fields'), $('tcp-fields')]) {
+    const active = status && status.transport === fields.dataset.transport;
+    fields.classList.toggle('in-use', Boolean(active) && visualPhase === 'connected');
+    fields.classList.toggle('trying', Boolean(active) && (visualPhase === 'connecting' || visualPhase === 'waiting'));
+  }
+
+  const connect = $('connect');
+  const disconnect = $('disconnect');
+  connect.disabled = phase === 'offline' || !status || connection.busy !== null;
+  disconnect.disabled = phase === 'offline' || !status || connection.busy !== null || phase === 'stopped';
+  connect.textContent = connection.busy === 'connect' ? 'Applying…'
+    : connection.dirty ? 'Apply & reconnect'
+      : phase === 'connected' ? 'Reconnect'
+        : phase === 'stopped' ? 'Connect'
+          : 'Retry now';
+  connect.dataset.emphasis = connection.dirty ? 'apply' : phase === 'connected' ? 'neutral' : 'go';
+  disconnect.textContent = connection.busy === 'disconnect' ? 'Disconnecting…'
+    : phase === 'connected' ? 'Disconnect'
+      : phase === 'stopped' ? 'Disconnected'
+        : 'Stop trying';
+
+  const counting = phase === 'waiting' && Number.isFinite(status?.retryAt);
+  if (counting && !connectionCountdown) connectionCountdown = setInterval(renderConnectionBar, 1000);
+  if (!counting && connectionCountdown) {
+    clearInterval(connectionCountdown);
+    connectionCountdown = null;
+  }
 }
 
 async function refreshSerialPorts(selectedPath = serialPathSelect.value) {
@@ -241,6 +344,7 @@ async function loadConnectionSettings() {
   }
 }
 
+renderConnectionBar();
 loadConnectionSettings();
 
 // --- stream -----------------------------------------------------------------
@@ -264,9 +368,13 @@ function connectStream() {
   source.addEventListener('status', (event) => handleStreamEvent('Receiver status', event, renderStatus));
   source.addEventListener('snapshot', (event) => handleStreamEvent('Loading live snapshot', event, applySnapshot));
   source.addEventListener('message', (event) => handleStreamEvent('Reading live report', event, applyPayload));
+  source.addEventListener('open', () => {
+    connection.offline = false;
+    renderConnectionBar();
+  });
   source.addEventListener('error', () => {
-    $('status').className = 'status disconnected';
-    $('status-text').textContent = 'Lost connection to local server — retrying...';
+    connection.offline = true;
+    renderConnectionBar();
   });
 }
 
@@ -372,14 +480,9 @@ function flushUpdates(force = false) {
 }
 
 function renderStatus(status) {
-  $('status').className = `status ${status.connected ? 'connected' : 'disconnected'}`;
-  const target = status.transport === 'serial'
-    ? `${status.serialPath} @ ${status.baudRate}`
-    : `${status.host}:${status.port}`;
-  const via = status.mode === 'auto' ? `${target} (auto${status.transport === 'tcp' ? ', TCP fallback' : ''})` : target;
-  $('status-text').textContent = status.connected
-    ? `Connected via ${via}`
-    : `Disconnected from ${via}${status.lastError ? ` — ${status.lastError}` : ''}`;
+  connection.status = status;
+  connection.offline = false;
+  renderConnectionBar();
 }
 
 function applyRecord(record) {

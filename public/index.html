@@ -33,8 +33,8 @@
           <option value="1440">24 hours</option>
         </select>
       </label>
-      <div id="status" class="status disconnected">
-        <span class="dot"></span>
+      <div id="status" class="status connecting">
+        <span class="dot" aria-hidden="true"></span>
         <span id="status-text">Connecting...</span>
       </div>
     </div>
@@ -44,7 +44,14 @@
       <button id="retry-display" type="button" class="secondary">Retry display</button>
     </div>
 
-  <form id="connection-form" class="connection-bar">
+  <form id="connection-form" class="connection-bar conn-connecting">
+    <div id="connection-state" class="connection-state" role="status" aria-live="polite">
+      <span class="conn-light" aria-hidden="true"></span>
+      <span class="conn-text">
+        <strong id="connection-state-title">Connecting…</strong>
+        <span id="connection-state-detail">Waiting for the monitor server</span>
+      </span>
+    </div>
     <label>
       Connection
       <select id="connection-transport">
@@ -53,11 +60,8 @@
         <option value="tcp">TCP</option>
       </select>
     </label>
-    <div id="tcp-fields" class="connection-fields">
-      <label>Receiver IP <input id="receiver-host" type="text" value="20.20.20.50" autocomplete="off" required /></label>
-      <label>Port <input id="receiver-port" type="number" value="3001" min="1" max="65535" required /></label>
-    </div>
-    <div id="serial-fields" class="connection-fields">
+    <div id="serial-fields" class="connection-fields" data-transport="serial">
+      <span class="fields-tag">USB serial</span>
       <label>COM port <select id="serial-path"><option value="COM11">COM11</option></select></label>
       <label>Baud rate
         <select id="serial-baud-rate">
@@ -70,9 +74,16 @@
         </select>
       </label>
     </div>
-    <button type="submit">Connect</button>
-    <button id="disconnect" type="button" class="secondary">Disconnect</button>
-    <span id="connection-message" role="status" aria-live="polite"></span>
+    <div id="tcp-fields" class="connection-fields" data-transport="tcp">
+      <span class="fields-tag">TCP</span>
+      <label>Receiver IP <input id="receiver-host" type="text" value="20.20.20.50" autocomplete="off" required /></label>
+      <label>Port <input id="receiver-port" type="number" value="3001" min="1" max="65535" required /></label>
+    </div>
+    <div class="connection-actions">
+      <button id="connect" type="submit" disabled>Connect</button>
+      <button id="disconnect" type="button" class="secondary" disabled>Disconnect</button>
+    </div>
+    <span id="connection-message" aria-live="polite"></span>
   </form>
 
   <nav class="tabs">

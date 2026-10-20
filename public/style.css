@@ -61,20 +61,61 @@ h2:first-child { margin-top: 0; }
 .client-notice { margin: .4rem 1rem; color: var(--bad); font-size: .8rem; }
 .client-notice:has(#client-error[hidden]) { display: none; }
 .connection-bar {
+  --conn-color: var(--muted);
   display: flex;
   align-items: end;
   flex-wrap: wrap;
   gap: .75rem 1rem;
-  padding: .75rem 0;
-  margin-bottom: .75rem;
-  border-bottom: 1px solid var(--line);
+  padding: .75rem .9rem;
+  margin: .5rem 0 .75rem;
+  border: 1px solid var(--conn-color);
+  border-left: 5px solid var(--conn-color);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--conn-color) 12%, var(--panel));
+  transition: border-color .2s, background .2s;
 }
+.connection-bar.conn-connected { --conn-color: var(--ok); }
+.connection-bar.conn-connecting, .connection-bar.conn-waiting, .connection-bar.conn-disconnecting { --conn-color: var(--warn); }
+.connection-bar.conn-stopped, .connection-bar.conn-offline { --conn-color: var(--bad); }
+.connection-state { display: flex; align-items: center; gap: .6rem; min-width: 15rem; max-width: 26rem; align-self: center; }
+.conn-light { flex: none; width: .85rem; height: .85rem; border-radius: 50%; background: var(--conn-color); box-shadow: 0 0 10px var(--conn-color); }
+.conn-stopped .conn-light { box-shadow: none; background: transparent; border: 2px solid var(--conn-color); }
+.conn-connecting .conn-light, .conn-waiting .conn-light, .conn-disconnecting .conn-light, .conn-offline .conn-light { animation: conn-pulse 1.2s ease-in-out infinite; }
+@keyframes conn-pulse { 50% { opacity: .3; } }
+@media (prefers-reduced-motion: reduce) {
+  .connection-bar .conn-light { animation: none; }
+}
+@media (max-width: 600px) {
+  .connection-state { min-width: 0; max-width: 100%; width: 100%; }
+  .connection-fields { min-width: 0; max-width: 100%; }
+  .connection-bar input { max-width: 100%; }
+}
+.conn-text { display: flex; flex-direction: column; gap: .1rem; min-width: 0; }
+#connection-state-title { color: var(--conn-color); font-size: 1rem; letter-spacing: .04em; text-transform: uppercase; }
+#connection-state-detail { color: var(--text); font-size: .75rem; overflow-wrap: anywhere; }
 .connection-bar label { display: flex; flex-direction: column; gap: .2rem; color: var(--muted); font-size: .68rem; text-transform: uppercase; }
 .connection-bar input, .connection-bar select { min-height: 2rem; min-width: 8rem; font-size: .8rem; }
 .connection-bar input { width: 13rem; background: var(--line); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: .35rem .5rem; }
-.connection-fields { display: flex; align-items: end; flex-wrap: wrap; gap: .75rem; }
-.connection-bar button { min-height: 2rem; margin: 0; background: var(--ok); color: #12151a; font-weight: 600; }
-#connection-message { min-height: 1.4rem; align-self: center; color: var(--muted); font-size: .78rem; }
+.connection-fields { position: relative; display: flex; align-items: end; flex-wrap: wrap; gap: .75rem; padding: .9rem .6rem .45rem; border: 1px dashed var(--line); border-radius: 6px; }
+.connection-fields[hidden] { display: none; }
+.fields-tag { position: absolute; top: -.55rem; left: .5rem; padding: 0 .35rem; background: var(--bg); color: var(--muted); font-size: .62rem; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.connection-fields.in-use { border: 1px solid var(--ok); }
+.connection-fields.in-use .fields-tag { color: var(--ok); }
+.connection-fields.in-use .fields-tag::after { content: ' · in use'; }
+.connection-fields.trying { border: 1px solid var(--warn); }
+.connection-fields.trying .fields-tag { color: var(--warn); }
+.connection-fields.trying .fields-tag::after { content: ' · trying'; }
+.connection-actions { display: flex; gap: .5rem; }
+.connection-bar button { min-height: 2rem; min-width: 6.5rem; margin: 0; font-weight: 600; border: 1px solid transparent; }
+#connect[data-emphasis="go"] { background: var(--ok); color: #12151a; }
+#connect[data-emphasis="apply"] { background: #4fc3f7; color: #12151a; }
+#connect[data-emphasis="neutral"] { background: var(--line); color: var(--text); border-color: #3a4353; }
+#disconnect { background: var(--bad); color: #12151a; }
+#disconnect:disabled { background: transparent; color: var(--muted); border-color: var(--line); }
+.connection-bar button:disabled { cursor: not-allowed; opacity: .75; }
+.connection-bar button:not(:disabled):hover { filter: brightness(1.12); }
+#connection-message { min-height: 1.4rem; align-self: center; color: var(--bad); font-size: .78rem; }
+.status.connecting .dot, .status.waiting .dot, .status.disconnecting .dot { background: var(--warn); }
 .history-control { display: flex; align-items: center; gap: .4rem; color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
 .checkbox { display: flex; align-items: center; gap: .35rem; color: var(--muted); font-size: .75rem; text-transform: none; letter-spacing: 0; font-weight: 400; cursor: pointer; }
 .checkbox input { accent-color: var(--ok); }

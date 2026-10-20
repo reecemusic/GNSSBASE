@@ -26,6 +26,8 @@ class ReceiverClient extends EventEmitter {
     this.autoTarget = 'serial';
     this.state = {
       connected: false,
+      phase: 'stopped',
+      retryAt: null,
       mode: options.transport || 'tcp',
       transport: this.activeTransport(),
       host: options.receiverHost,
@@ -58,7 +60,7 @@ class ReceiverClient extends EventEmitter {
 
   disconnect() {
     this.stop();
-    this.updateState({ connected: false });
+    this.updateState({ connected: false, phase: 'stopped', retryAt: null });
     return Promise.resolve();
   }
 
@@ -67,6 +69,7 @@ class ReceiverClient extends EventEmitter {
     Object.assign(this.options, settings);
     this.buffer = Buffer.alloc(0);
     this.autoTarget = 'serial';
+    this.stopped = false;
     this.updateState({
       mode: this.options.transport,
       transport: this.activeTransport(),
@@ -75,9 +78,10 @@ class ReceiverClient extends EventEmitter {
       serialPath: this.options.serialPath,
       baudRate: this.options.serialBaudRate,
       connected: false,
+      phase: 'connecting',
+      retryAt: null,
       lastError: null,
     });
-    this.stopped = false;
     this.connect();
   }
 
@@ -106,7 +110,7 @@ class ReceiverClient extends EventEmitter {
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.buffer = Buffer.alloc(0);
-    this.state.transport = this.activeTransport();
+    this.updateState({ transport: this.activeTransport(), phase: 'connecting', retryAt: null });
     try {
       if (this.state.transport === 'serial') this.connectSerial();
       else this.connectTcp();
@@ -193,7 +197,7 @@ class ReceiverClient extends EventEmitter {
       this.probeTimer = null;
       if (port !== this.port || this.stopped) return;
       this.closeCurrentTransport();
-      this.updateState({ connected: false });
+      this.updateState({ connected: false, phase: this.stopped ? 'stopped' : 'waiting', retryAt: null });
       this.onAttemptFailed(new Error(
         `No NovAtel logs on ${this.options.serialPath} @ ${this.options.serialBaudRate} within ${probeMs} ms`,
       ));
@@ -231,6 +235,8 @@ class ReceiverClient extends EventEmitter {
   onConnected() {
     this.updateState({
       connected: true,
+      phase: 'connected',
+      retryAt: null,
       mode: this.options.transport || 'tcp',
       transport: this.activeTransport(),
       host: this.options.receiverHost,
@@ -253,16 +259,18 @@ class ReceiverClient extends EventEmitter {
     clearTimeout(this.probeTimer);
     this.probeTimer = null;
     this.autoTarget = 'serial';
-    this.updateState({ connected: false });
+    this.updateState({ connected: false, phase: this.stopped ? 'stopped' : 'waiting', retryAt: null });
     this.scheduleReconnect();
   }
 
   scheduleReconnect() {
     if (this.stopped || this.reconnectTimer) return;
+    const delay = this.options.reconnectDelayMs;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.connect();
-    }, this.options.reconnectDelayMs);
+    }, delay);
+    this.updateState({ phase: 'waiting', retryAt: Date.now() + delay });
   }
 
   setError(error) {

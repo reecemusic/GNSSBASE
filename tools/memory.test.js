@@ -44,6 +44,141 @@ function loadFunctions(code, start, end, context) {
   vm.runInContext(code.slice(code.indexOf(start), code.indexOf(end)), context);
 }
 
+test('receiver phases track connecting, connected, retrying and manual disconnect', async () => {
+  const { EventEmitter } = require('node:events');
+  const timers = new Set();
+  const states = [];
+  let socket;
+  const context = vm.createContext({
+    Buffer, module: { exports: {} },
+    setTimeout: (callback) => { timers.add(callback); return callback; },
+    clearTimeout: (callback) => timers.delete(callback),
+    require: (name) => name === 'node:net' ? {
+      createConnection() {
+        socket = new EventEmitter();
+        socket.setKeepAlive = socket.setTimeout = socket.write = () => {};
+        socket.destroy = () => { socket.destroyed = true; };
+        return socket;
+      },
+    } : name === './novatel' ? require('../src/novatel') : require(name),
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/receiver.js'), 'utf8'), context);
+  const receiver = new context.module.exports.ReceiverClient({
+    transport: 'tcp', receiverHost: '127.0.0.1', receiverPort: 3001, reconnectDelayMs: 3000,
+  });
+  receiver.on('status', (status) => {
+    states.push({ ...status });
+    assert.equal(status.phase === 'connected', status.connected);
+  });
+  assert.equal(receiver.state.phase, 'stopped');
+  receiver.start();
+  assert.equal(receiver.state.phase, 'connecting');
+  socket.emit('connect');
+  assert.equal(receiver.state.phase, 'connected');
+  socket.emit('close');
+  assert.equal(receiver.state.phase, 'waiting');
+  assert(receiver.state.retryAt >= Date.now());
+  assert.equal(timers.size, 1);
+  await receiver.disconnect();
+  assert.equal(receiver.state.phase, 'stopped');
+  assert.equal(receiver.state.retryAt, null);
+  assert.equal(timers.size, 0);
+  receiver.reconfigure({ receiverPort: 3002 });
+  assert.equal(receiver.state.phase, 'connecting');
+  socket.emit('connect');
+  receiver.reconfigure({ receiverPort: 3003 });
+  assert.equal(receiver.state.phase, 'connecting');
+  assert.equal(receiver.state.retryAt, null);
+  assert(states.some((status) => status.phase === 'waiting'));
+  await receiver.disconnect();
+});
+
+function connectionContext() {
+  const elements = new Map();
+  const context = vm.createContext({
+    Date,
+    connection: { status: null, offline: false, dirty: false, busy: null },
+    connectionCountdown: null,
+    setInterval: () => 1,
+    clearInterval() {},
+    $: (id) => {
+      if (!elements.has(id)) elements.set(id, {
+        dataset: { transport: id === 'serial-fields' ? 'serial' : 'tcp' },
+        classList: { toggle() {} },
+        setAttribute(name, value) { this[name] = value; },
+      });
+      return elements.get(id);
+    },
+  });
+  context.connectionForm = context.$('connection-form');
+  loadFunctions(browserCode, 'function connectionPhase()', 'async function refreshSerialPorts(', context);
+  loadFunctions(browserCode, 'function renderStatus(', 'function applyRecord(', context);
+  return context;
+}
+
+test('connection controls distinguish startup, connected, retrying and stopped states', () => {
+  const context = connectionContext();
+  const $ = context.$;
+  context.renderConnectionBar();
+  assert.equal($('connect').disabled, true);
+  assert.equal($('disconnect').disabled, true);
+  const status = {
+    connected: true, phase: 'connected', mode: 'auto', transport: 'tcp',
+    host: '127.0.0.1', port: 3001, serialPath: 'COM11', baudRate: 9600,
+  };
+  context.renderStatus(status);
+  assert.equal($('connection-form').className, 'connection-bar conn-connected');
+  assert.equal($('status-text').textContent, 'Connected');
+  assert.match($('connection-state-detail').textContent, /TCP 127.0.0.1:3001.*TCP fallback/);
+  assert.equal($('connect').textContent, 'Reconnect');
+  assert.equal($('disconnect').textContent, 'Disconnect');
+
+  context.renderStatus({ ...status, connected: false, phase: 'waiting', lastError: 'Port unavailable', retryAt: Date.now() + 3000 });
+  assert.equal($('connection-form').className, 'connection-bar conn-waiting');
+  assert.match($('connection-state-detail').textContent, /Port unavailable.*next attempt in 3 s/);
+  assert.equal($('status-text').textContent, 'Not connected — retrying');
+  assert.equal($('disconnect').textContent, 'Stop trying');
+  assert.equal(context.connectionCountdown, 1);
+
+  context.renderStatus({ ...status, connected: false, phase: 'connecting' });
+  assert.equal($('status-text').textContent, 'Connecting…');
+  assert.equal(context.connectionCountdown, null);
+  context.renderStatus({ ...status, connected: false, phase: 'stopped' });
+  assert.equal($('connection-form').className, 'connection-bar conn-stopped');
+  assert.equal($('status-text').textContent, 'Disconnected');
+  assert.equal($('connect').textContent, 'Connect');
+  assert.equal($('connect').dataset.emphasis, 'go');
+  assert.equal($('disconnect').disabled, true);
+});
+
+test('connection controls explain pending edits, command progress and server loss consistently', () => {
+  const context = connectionContext();
+  const $ = context.$;
+  context.renderStatus({ connected: true, phase: 'connected', transport: 'serial', serialPath: 'COM11', baudRate: 9600 });
+  context.connection.dirty = true;
+  context.renderConnectionBar();
+  assert.equal($('connect').textContent, 'Apply & reconnect');
+  assert.match($('connection-state-detail').textContent, /Settings changed/);
+  for (const busy of ['connect', 'disconnect']) {
+    context.connection.busy = busy;
+    context.renderConnectionBar();
+    assert.equal($('connect').disabled, true);
+    assert.equal($('disconnect').disabled, true);
+    assert.equal($('connection-form')['aria-busy'], 'true');
+    assert.equal($('status-text').textContent, $('connection-state-title').textContent);
+    assert.equal($('connection-form').className, `connection-bar conn-${busy === 'connect' ? 'connecting' : 'disconnecting'}`);
+  }
+  context.connection.busy = null;
+  context.connection.offline = true;
+  context.renderConnectionBar();
+  assert.equal($('connection-form').className, 'connection-bar conn-offline');
+  assert.equal($('status').className, 'status offline');
+  assert.equal($('status-text').textContent, 'Monitor server unreachable');
+  assert.equal($('connect').disabled, true);
+  assert.equal($('disconnect').disabled, true);
+  assert.equal($('connection-form')['aria-busy'], 'false');
+});
+
 function historyContext() {
   const context = vm.createContext({
     Date,
