@@ -1287,9 +1287,9 @@ function drawArchiveTimeline(chart, axis, archive, bandIds, rowHeight, width) {
 const SOLUTION_HOLD_MS = 35000;
 const FIX_TIERS = [
   { id: 'none', label: 'No fix', colour: '#ff5f56' },
-  { id: 'single', label: 'Single', colour: '#8c94a4' },
-  { id: 'diff', label: 'Differential', colour: '#6aa9ff' },
-  { id: 'float', label: 'Float', colour: '#ffb02e' },
+  { id: 'single', label: 'Single', colour: '#3ddc84' },
+  { id: 'diff', label: 'Differential', colour: '#3ddc84' },
+  { id: 'float', label: 'Float', colour: '#3ddc84' },
   { id: 'fixed', label: 'Fixed', colour: '#3ddc84' },
 ];
 

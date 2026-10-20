@@ -89,7 +89,9 @@ and zoom:
 - **Fix type** has one lane per solution quality tier: **No fix**, **Single**,
   **Differential**, **Float** and **Fixed**. These are the same tiers as the
   Position tab's quality badge. A solution status other than `SOL_COMPUTED`
-  counts as No fix. Hover a bar for the exact solution status and position type
+  counts as No fix. On this plot and its live readout, **No fix is red** and
+  **all other fix types are green**; the separate lanes still distinguish quality.
+  Hover a bar for the exact solution status and position type
   (for example `SOL_COMPUTED / FIXEDPOS`).
 
 Both rows come from live BESTPOS logs and are saved with the local history. The

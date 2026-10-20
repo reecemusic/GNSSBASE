@@ -79,6 +79,16 @@ test('browser solution runs merge repeats, break on lost output and map fix tier
   assert.equal(context.fixTier(sample(0, 10, 'SOMETHING_NEW')), 1, 'unknown computed types count as single');
 });
 
+test('fix plot colours no fix red and every other quality tier green', () => {
+  const context = vm.createContext({});
+  loadFunctions(browserCode, 'const SOLUTION_HOLD_MS =', 'function drawSolutionTimeline(', context);
+  const tiers = vm.runInContext('FIX_TIERS', context);
+  assert.equal(tiers[0].id, 'none');
+  assert.equal(tiers[0].colour, '#ff5f56');
+  assert.deepEqual(plain(tiers.slice(1).map((tier) => tier.colour)),
+    ['#3ddc84', '#3ddc84', '#3ddc84', '#3ddc84']);
+});
+
 test('browser records live BESTPOS with the same thinning and history merge as the server', () => {
   const context = vm.createContext({
     Date, MAX_INTERFERENCE_SAMPLES: 10000, MAX_TRACK_SAMPLES: 1081, MAX_TRACKS: 512,
@@ -233,7 +243,7 @@ test('live solution readouts show the current count and fix type, roll on change
   live = draw();
   assert.equal(live['tl-live-value'].textContent, '22');
   assert.equal(live['tl-live-fix'].textContent, 'SINGLE');
-  assert.equal(live['tl-live-fix'].attributes.fill, '#8c94a4');
+  assert.equal(live['tl-live-fix'].attributes.fill, '#3ddc84');
 
   now += 1000;
   context.state.solutionHistory.push({ t: now, used: 19, tracked: 30, status: 'SOL_COMPUTED', type: 'NARROW_FLOAT' });
