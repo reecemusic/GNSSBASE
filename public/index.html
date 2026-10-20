@@ -37,6 +37,8 @@
         <span class="dot" aria-hidden="true"></span>
         <span id="status-text">Connecting...</span>
       </div>
+      <button id="wall-toggle" type="button" class="wall-toggle" aria-pressed="false"
+              title="Full-screen view of the interference status, band summaries and live L1/L2/L5 plot for a large display. Bookmark with ?wall=1 to open directly.">&#9974; Wall display</button>
     </div>
   </header>
     <div class="client-notice">
@@ -221,10 +223,15 @@
 
   <!-- Interference --------------------------------------------------------->
   <section id="tab-interference" class="panel">
-    <details id="archive-panel" class="archive-panel" open>
-      <summary>
-        Historic archive
+    <details id="archive-panel" class="archive-panel">
+      <summary title="Show or hide the archive settings">
+        <span class="archive-title">Historic archive</span>
         <span id="archive-badge" class="archive-badge idle">Not loaded</span>
+        <span id="archive-summary" class="archive-summary"></span>
+        <progress id="archive-progress" class="archive-progress" max="1" value="0" hidden></progress>
+        <label class="archive-show archive-show-inline" title="Draw the loaded archive under the live data">
+          <input id="archive-show" type="checkbox" checked> Show on plots</label>
+        <span class="archive-expand" aria-hidden="true">Settings</span>
       </summary>
       <form id="archive-form" class="archive-form">
         <label class="archive-root">Network folder
@@ -247,12 +254,12 @@
           <button id="archive-clear" type="button" disabled>Unload</button>
           <button id="archive-default" type="button" disabled>Default folder</button>
         </div>
-        <label class="archive-show"><input id="archive-show" type="checkbox" checked> Show archive on plots</label>
         <label class="archive-show" title="Reloads the selected days in the background at server start-up and every few minutes; the shown data stays visible while it refreshes">
           <input id="archive-auto" type="checkbox" disabled> Keep loaded (rolling, auto-refresh)</label>
       </form>
-      <progress id="archive-progress" class="archive-progress" max="1" value="0" hidden></progress>
       <div id="archive-status" class="archive-status" role="status" aria-live="polite">Archive status unavailable.</div>
+      <details class="help-details">
+        <summary>About the archive</summary>
       <p class="plot-help">The server searches <code>&lt;folder&gt;\YYYY\DDD\*.LOG</code> (DDD = day of year) for ITDETECTSTATUS
         and BESTPOS/BESTSATS reports and reads one file at a time. BESTPOS supplies satellite count and fix type;
         BESTSATS supplies a satellite-count fallback only. Each file is summarised once and cached locally, so reloading or
@@ -261,6 +268,7 @@
         reloads the selected days every few minutes so the archive window rolls forward; the NAS receives each
         hourly file hours late, and the server keeps 24&nbsp;hours of live history to cover those newest hours.
         Choose <em>History: 24 hours</em> to see the whole day combined. An unreachable NAS times out and is retried later.</p>
+      </details>
     </details>
 
     <div id="it-banner" class="banner idle">
@@ -278,7 +286,7 @@
       <div class="card"><span class="label">Status messages</span><span id="it-total" class="value">0</span></div>
     </div>
 
-    <h2>
+    <h2 id="timeline-heading">
       Power over time <span id="timeline-range" class="muted"></span>
       <span class="scale">
         <span class="scale-item"><i class="swatch strong"></i>&gt; &minus;95 dBm</span>
@@ -289,17 +297,41 @@
       </span>
     </h2>
     <div class="timeline-controls" role="group" aria-label="Linked chart navigation">
-      <button id="timeline-earlier" type="button">Earlier</button>
-      <button id="timeline-later" type="button">Later</button>
-      <button id="timeline-zoom-in" type="button">Zoom in</button>
-      <button id="timeline-zoom-out" type="button">Zoom out</button>
-      <button id="timeline-live" type="button">Reset / Live</button>
-      <span id="timeline-mode" role="status">Live</span>
+      <label class="timeline-preset-label">View
+        <select id="timeline-preset" title="Time range shown on all plots">
+          <option value="live">Live (history window)</option>
+          <option value="900000">Last 15 min</option>
+          <option value="3600000">Last 1 hour</option>
+          <option value="21600000">Last 6 hours</option>
+          <option value="86400000">Last 24 hours</option>
+          <option value="259200000">Last 3 days</option>
+          <option value="604800000">Last 7 days</option>
+          <option value="archive">Whole archive</option>
+          <option value="custom" disabled hidden>Custom (zoomed / panned)</option>
+        </select>
+      </label>
+      <span class="icon-group" role="group" aria-label="Pan and zoom">
+        <button id="timeline-earlier" type="button" class="icon-button" title="Earlier" aria-label="Earlier">&#9664;</button>
+        <button id="timeline-later" type="button" class="icon-button" title="Later" aria-label="Later">&#9654;</button>
+        <button id="timeline-zoom-out" type="button" class="icon-button" title="Zoom out" aria-label="Zoom out">&minus;</button>
+        <button id="timeline-zoom-in" type="button" class="icon-button" title="Zoom in" aria-label="Zoom in">+</button>
+      </span>
+      <button id="timeline-live" type="button" title="Reset to the live window">&#10227; Live</button>
+      <button id="timeline-select" type="button" aria-pressed="false" title="Click data points to inspect them (Esc to exit)">&#8598; Select point</button>
+      <span id="timeline-mode" class="timeline-mode" role="status">Live</span>
     </div>
-    <p class="plot-help">Drag any plot to pan; scroll to zoom around the pointer. All plots share the same time window and selected time zone.
+    <div id="timeline-selection" class="timeline-selection" hidden>
+      <span class="timeline-selection-label">Selected</span>
+      <span id="timeline-selection-text"></span>
+      <button id="timeline-selection-clear" type="button">Clear</button>
+    </div>
+    <details class="help-details">
+      <summary>How to use these plots</summary>
+    <p class="plot-help">Use <b>View</b> to jump to a time range; the arrows pan and &minus;/+ zoom. Drag any plot to pan; scroll to zoom around the pointer. Turn on <b>Select point</b> to click a data point and pin its details instead of panning; press Esc or the button again to go back to panning. All plots share the same time window and selected time zone.
       Signal buttons toggle frequency overlays only; detected energy remains visible in red.
       Overlapping allocations use alternating colour stripes; hover for full signal bounds.
       The bottom two rows show satellites used in the BESTPOS solution and its fix type (live and saved history only).</p>
+    </details>
     <svg id="timeline" viewBox="0 0 900 680" role="img" aria-label="Interference power, satellites used and fix type over time"></svg>
     <h2>Current band status</h2>
     <div id="bands" class="bands"></div>

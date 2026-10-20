@@ -121,7 +121,7 @@ satellite, fix-type and frequency plots.
 The GNSS frequency overlays below the band cards use the same visible time
 window and time axis as **Power over time**, including its pan and zoom. Drag
 **any** plot to pan, or scroll over it to zoom around the pointer. The shared
-**Earlier / Later**, **Zoom in / Zoom out** and **Reset / Live** buttons work
+**View** dropdown, ◀ / ▶ (earlier / later), − / + (zoom) and **⟳ Live** controls work
 for all four plots. All plot labels and hover times use the selected time zone.
 The vertical axis is frequency in MHz. Each signal has its own high-contrast
 colour within its group and a matching, keyboard-accessible toggle button.
@@ -138,13 +138,25 @@ interference detection's center frequency and bandwidth at its report time
 (hover for details). The grouped plots are titled **L1 / E1 / B1 / G1**,
 **L2 / G2 / B3**, and **L5 / E5 / B2**.
 
-Drag the power plot or use **Earlier / Later** to pan. Use **Zoom in / Zoom out**
+The **View** dropdown jumps straight to a time range that follows live time: the
+History window (**Live**), the last 15 min, 1 h, 6 h, 24 h, 3 or 7 days (ranges longer
+than the available data are disabled), or the **Whole archive** when one is loaded. It
+shows **Custom** after you pan or zoom. Drag the power plot or use ◀ / ▶ to pan. Use − / +
 or the mouse wheel to zoom (down to a 10-second window). Navigation is bounded by
-the selected History window. Panning or zooming holds a historical view; **Reset /
+the selected History window. Panning or zooming holds a historical view; **⟳
 Live** restores the full window and follows incoming reports. Hover a power or
 status marker to inspect its band, timestamp and reported power. Clear and
 unknown-power reports are identified without inventing a power value. Stored
-timestamps and receiver data are unchanged.
+timestamps and receiver data are unchanged. Usage notes are folded under **How to
+use these plots** to keep the plots near the top of the page.
+
+To pick out a data point, select **↖ Select point**. While it is on (highlighted
+violet), the cursor is an arrow, dragging no longer pans, and clicking any plot pins the
+nearest data point (power, status, satellites, fix type or frequency marker, within
+about 14 px): a ring marks it, a dashed violet time cursor is drawn across all linked
+plots, and its details are shown above the plot. Clicking empty space or **Clear**
+removes the selection. Press **Esc** or the button again to return to panning; the
+pinned selection stays until cleared. Mouse-wheel zoom works in both modes.
 
 The header's **Time zone** selector defaults to **United Arab Emirates
 (Asia/Dubai, UTC+04:00)**. Choose UTC or another named time zone; the choice is
@@ -172,6 +184,27 @@ visible. Initial clear reports are omitted, and CRC-failed clear reports do not
 change the last valid detection state. This filtering affects only the message
 list, not report counters, live status or chart history.
 
+### Wall display (large screens)
+
+**⛶ Wall display** (top right) turns the Interference tab into a single, full-screen view
+for a large TV, readable from across a room. It shows the overall interference banner, the
+live L1/L2/L5 power-over-time plot, and the L1/L2/L5 band summaries stacked beside their
+plot rows. Other bands (L6, SBAS, …) appear only while they have detections.
+
+- To open it directly on the TV browser, bookmark `http://<server>:8080/?wall=1`
+  (press F11 for full screen when opening from a bookmark). The button removes the
+  parameter and returns to the normal page; Esc does not exit wall mode.
+- Text and plots scale with the screen (about 20 px base text at 1080p, 40 px at 4K), so
+  the page fits one screen with no scrolling. Use the TV at 100 % browser zoom.
+- The plot opens on the live view (the same as **View → Live**), following current time
+  over the history window, including any loaded archive.
+- To keep the plot as large as possible, wall mode hides the satellites-used and fix-type
+  rows, the frequency plots, connection settings, archive panel, navigation controls and
+  the recent changes list.
+- The mouse pointer hides after 4 s without movement. The browser is asked to keep the
+  screen awake; this needs HTTPS or `localhost`, so over plain HTTP on the LAN also turn
+  off the TV/PC sleep timer.
+
 ## Historic Archive
 
 The **Historic archive** panel at the top of the Interference tab loads ITDETECTSTATUS and BESTPOS history
@@ -179,6 +212,11 @@ from the receiver's recorded `.LOG` files on the network store and draws it on t
 power and frequency plots as live data. The default folder is
 `\\20.20.20.1\novatel\pwrpak1`; change it in the panel (it is remembered on the server)
 or set `NOVATEL_ARCHIVE_ROOT`. **Default folder** restores the configured default.
+
+The panel is collapsed to a single line by default so the plots stay near the top: it
+shows the status badge, the loaded time range, auto-refresh and progress while loading,
+and a **Show on plots** tickbox. Select the line (or **Settings**) to expand the folder,
+days and load controls; the browser remembers whether it was left open.
 
 Expected layout: `<folder>\YYYY\DDD\*.LOG`, where `DDD` is the day of year, for example
 `\\20.20.20.1\novatel\pwrpak1\2026\275\NMUT23450006R_2026-10-02_00-43-27.LOG`. Both
@@ -237,8 +275,8 @@ Safeguards keep the NAS, server and browser responsive:
 Archive data appears as faint green status bars where reports were received (clear unless
 marked), hollow power markers joined by dashed lines, and dashed amber frequency markers.
 Live data is drawn on top in the usual style. After loading, the plots show the whole
-range while following live time; zoom and pan work as usual, and **Reset / Live** returns
-to the live window. Untick **Show archive on plots** to hide it without unloading.
+range while following live time (**View: Whole archive**); zoom and pan work as usual, and **⟳ Live** returns
+to the live window. Untick **Show on plots** to hide it without unloading.
 Band cards and statistics remain live-only.
 
 ## Configuration (environment variables)

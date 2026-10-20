@@ -88,6 +88,7 @@ const state = {
   filter: '',
   heightDatum: readPreference('heightDatum', 'msl') === 'ellipsoidal' ? 'ellipsoidal' : 'msl',
   ephemerisConstellation: readPreference('ephemerisConstellation', ''),
+  wall: false,
 };
 
 // --- tabs -------------------------------------------------------------------
@@ -984,6 +985,48 @@ function appendTimeAxis(chart, axis, layout, now = Date.now()) {
   chart.append(svg('text', { x, y: labelY + 12, class: 'tl-now-time', style: `text-anchor:${anchor}` }, 'now'));
 }
 
+/** Pinned selection: a time cursor on every linked plot plus a ring on the selected point. */
+function appendSelectionMarker(chart, plotKey, axis, top, bottom) {
+  chart.timeAxis = axis;
+  chart.plotKey = plotKey;
+  const selection = state.timelineSelection;
+  if (!selection || selection.t < axis.start || selection.t > axis.end) return;
+  const x = TIMELINE.left + axis.x(selection.t);
+  chart.append(svg('line', { x1: x, x2: x, y1: top, y2: bottom, class: 'tl-selected-line' }));
+  if (selection.plot === plotKey) {
+    chart.append(svg('circle', { cx: x, cy: selection.y, r: 7, class: 'tl-selected-ring' }));
+  }
+}
+
+/** Keeps the View dropdown in step with the current viewport; pan/zoom shows "Custom". */
+function syncTimelinePreset(now = Date.now()) {
+  const select = $('timeline-preset');
+  if (!select?.options) return;
+  const view = state.timelineView;
+  const spanMs = timelineSpanMs(now);
+  const archive = state.archive?.status;
+  const archiveShown = Boolean(state.archive?.shown && archive && archive.state !== 'idle' && Number.isFinite(archive.from));
+  let custom = null;
+  for (const option of select.options) {
+    if (option.value === 'custom') custom = option;
+    else if (option.value === 'archive') option.disabled = !archiveShown;
+    else if (option.value !== 'live') option.disabled = Number(option.value) > spanMs + 60000;
+  }
+  const value = !view ? 'live' : view.follow && view.preset ? String(view.preset) : 'custom';
+  if (custom) custom.hidden = value !== 'custom';
+  if (select.value !== value) select.value = value;
+}
+
+function applyTimelinePreset(value) {
+  if (value === 'live') state.timelineView = null;
+  else if (value === 'archive') showWholeArchive();
+  else if (Number(value) > 0) {
+    const windowMs = Math.min(Number(value), timelineSpanMs());
+    state.timelineView = { end: Date.now(), windowMs, follow: true, preset: value };
+  }
+  renderTimeline();
+}
+
 function setTimelineView(end, windowMs) {
   state.timelineView = { end, windowMs };
   const view = timelineViewport();
@@ -1016,6 +1059,7 @@ function initTimelineControls() {
 
 function initTimePlotNavigation(chart) {
   let drag = null;
+  if (state.selectMode) chart.classList.add('select-mode');
   const geometry = () => {
     const rect = chart.getBoundingClientRect();
     const width = chart.viewBox.baseVal.width;
@@ -1032,6 +1076,10 @@ function initTimePlotNavigation(chart) {
   chart.addEventListener('pointerdown', (event) => {
     const area = geometry();
     if (event.button !== 0 || event.clientX < area.left || event.clientX > area.left + area.width) return;
+    if (state.selectMode) {
+      selectTimePlotPoint(chart, event.clientX, event.clientY);
+      return;
+    }
     drag = { id: event.pointerId, x: event.clientX, width: area.width, view: timelineViewport() };
     chart.setPointerCapture(event.pointerId);
     chart.classList.add('panning');
@@ -1065,16 +1113,33 @@ function appendYLabel(chart, y, text, width, className = 'tl-label') {
   chart.append(svg('text', { x: width - TIMELINE.right + 8, y, class: `${className} tl-label-right` }, text));
 }
 
+/**
+ * Wall display: the SVG is drawn in fewer user units than screen pixels so text and markers scale up with
+ * the screen, while keeping at least WALL_MIN_HEIGHT units for the three band rows.
+ */
+const WALL_DESIGN_WIDTH = 900;
+const WALL_MIN_HEIGHT = 400;
+
+function timelineSize(chart) {
+  const rect = chart.getBoundingClientRect();
+  if (state.wall && rect.width > 0 && rect.height > 0) {
+    const scale = Math.max(1, Math.min(rect.width / WALL_DESIGN_WIDTH, rect.height / WALL_MIN_HEIGHT));
+    return { width: Math.round(rect.width / scale), height: Math.round(rect.height / scale), solutionRows: 0 };
+  }
+  const width = Math.min(1920, Math.max(360, Math.round(rect.width) || TIMELINE.width));
+  return { width, height: TIMELINE.height, solutionRows: TIMELINE_SOLUTION_ROWS };
+}
+
 function renderTimeline() {
   const chart = $('timeline');
   chart.replaceChildren();
 
-  const width = Math.min(1920, Math.max(360, Math.round(chart.getBoundingClientRect().width) || TIMELINE.width));
-  chart.setAttribute('viewBox', `0 0 ${width} ${TIMELINE.height}`);
+  const { width, height, solutionRows } = timelineSize(chart);
+  chart.setAttribute('viewBox', `0 0 ${width} ${height}`);
   const { start, end, windowMs } = timelineViewport();
   const bandIds = TIMELINE_BANDS;
-  const rowHeight = (TIMELINE.height - TIMELINE.top - TIMELINE.bottom
-    - TIMELINE_SOLUTION_ROWS * TIMELINE.solutionRow) / bandIds.length;
+  const rowHeight = (height - TIMELINE.top - TIMELINE.bottom
+    - solutionRows * TIMELINE.solutionRow) / bandIds.length;
   const plotWidth = width - TIMELINE.left - TIMELINE.right;
   const now = Date.now();
   const axis = timelineAxis(start, windowMs, plotWidth, now);
@@ -1084,6 +1149,7 @@ function renderTimeline() {
   $('timeline-range').textContent = `(${samples.length} samples, ${(windowMs / 1000).toFixed(0)} s window)`;
   $('timeline-mode').textContent = !state.timelineView ? 'Live'
     : state.timelineView.follow ? 'Live + archive' : 'Historical view';
+  syncTimelinePreset(now);
   const archive = timelineArchiveSamples(start, axis.dataEnd);
   if (state.archive) ensureArchiveData(start, axis.dataEnd, plotWidth);
   if (archive) $('timeline-range').textContent = `(${samples.length} live samples, ${archive.samples.length} archive points, `
@@ -1162,20 +1228,21 @@ function renderTimeline() {
     }
   }
 
-  renderSpectrumPlots(start, end, windowMs);
-  drawSolutionTimeline(chart, axis, TIMELINE.top + bandIds.length * rowHeight, width);
+  if (!state.wall) renderSpectrumPlots(start, end, windowMs);
+  if (solutionRows) drawSolutionTimeline(chart, axis, TIMELINE.top + bandIds.length * rowHeight, width);
+  appendSelectionMarker(chart, 'timeline', axis, TIMELINE.top, height - TIMELINE.bottom);
 
   appendTimeAxis(chart, axis, {
     left: TIMELINE.left,
     top: TIMELINE.top,
-    bottom: TIMELINE.height - TIMELINE.bottom,
-    labelY: TIMELINE.height - 32,
+    bottom: height - TIMELINE.bottom,
+    labelY: height - 32,
     nowLabelY: TIMELINE.top - 8,
     gridClass: 'tl-grid',
     labelClass: 'tl-axis',
   }, now);
 
-  chart.append(svg('text', { x: TIMELINE.left, y: TIMELINE.height - 5, class: 'tl-title' },
+  chart.append(svg('text', { x: TIMELINE.left, y: height - 5, class: 'tl-title' },
     state.timeZone === 'Asia/Dubai' ? 'UAE' : state.timeZone));
 }
 
@@ -1743,6 +1810,7 @@ function renderSpectrumPlots(start, end, windowMs) {
         svgChart.append(svg('text', { x, y: yFor(frequency) + 4, class: className }, frequency.toFixed(1)));
       }
     }
+    appendSelectionMarker(svgChart, `spectrum-${plot.id}`, axis, top, top + plotHeight);
     appendTimeAxis(svgChart, axis, {
       left, top, bottom: top + plotHeight,
       labelY: height - 19,
@@ -1786,6 +1854,143 @@ function timeAgo(timestamp) {
   if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
   return `${Math.round(seconds / 3600)}h ago`;
 }
+
+// --- point selection ----------------------------------------------------------
+
+const SELECT_RADIUS_PX = 14;
+
+function setSelectMode(enabled) {
+  state.selectMode = Boolean(enabled);
+  const button = $('timeline-select');
+  button.setAttribute('aria-pressed', String(state.selectMode));
+  button.classList.toggle('active', state.selectMode);
+  button.innerHTML = state.selectMode ? '&#8598; Selecting (Esc to stop)' : '&#8598; Select point';
+  for (const chart of timePlotCharts()) chart.classList.toggle('select-mode', state.selectMode);
+}
+
+function timePlotCharts() {
+  return [$('timeline'), ...[...spectrumCharts.values()].map(({ svgChart }) => svgChart)];
+}
+
+function setTimelineSelection(selection) {
+  state.timelineSelection = selection;
+  const panel = $('timeline-selection');
+  panel.hidden = !selection;
+  $('timeline-selection-text').textContent = selection ? selection.text : '';
+  renderTimeline();
+}
+
+/** Finds the titled data element nearest the click (within SELECT_RADIUS_PX), preferring the smallest hit. */
+function pickTimePlotElement(chart, clientX, clientY) {
+  let best = null;
+  for (const title of chart.querySelectorAll('title')) {
+    const element = title.parentNode;
+    if (!element || element === chart || element.tagName === 'text' || element.classList.contains('tl-now-line')) continue;
+    const rect = element.getBoundingClientRect();
+    if (!rect.width && !rect.height) continue;
+    const dx = Math.max(rect.left - clientX, 0, clientX - rect.right);
+    const dy = Math.max(rect.top - clientY, 0, clientY - rect.bottom);
+    const distance = Math.hypot(dx, dy);
+    if (distance > SELECT_RADIUS_PX) continue;
+    const area = rect.width * rect.height;
+    if (!best || distance < best.distance - 0.5 || (Math.abs(distance - best.distance) <= 0.5 && area < best.area)) {
+      best = { element, rect, distance, area, text: title.textContent };
+    }
+  }
+  return best;
+}
+
+function selectTimePlotPoint(chart, clientX, clientY) {
+  const axis = chart.timeAxis;
+  const hit = pickTimePlotElement(chart, clientX, clientY);
+  if (!axis || !hit) {
+    setTimelineSelection(null);
+    return;
+  }
+  // Narrow markers snap to their centre; wide bars and areas keep the clicked position.
+  const narrow = hit.rect.width <= 12;
+  const pointX = narrow ? (hit.rect.left + hit.rect.right) / 2 : Math.max(hit.rect.left, Math.min(hit.rect.right, clientX));
+  const pointY = hit.rect.height <= 12 ? (hit.rect.top + hit.rect.bottom) / 2 : clientY;
+  const matrix = chart.getScreenCTM();
+  if (!matrix) return;
+  const local = new DOMPoint(pointX, pointY).matrixTransform(matrix.inverse());
+  const t = axis.start + (local.x - TIMELINE.left) / axis.plotWidth * axis.axisMs;
+  setTimelineSelection({ plot: chart.plotKey, t, y: local.y, text: hit.text });
+}
+
+$('timeline-select').addEventListener('click', () => setSelectMode(!state.selectMode));
+$('timeline-selection-clear').addEventListener('click', () => setTimelineSelection(null));
+document.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape' || !$('tab-interference')?.classList.contains('active')) return;
+  if (state.selectMode) setSelectMode(false);
+  else if (state.timelineSelection) setTimelineSelection(null);
+});
+$('timeline-preset').addEventListener('change', (event) => applyTimelinePreset(event.target.value));
+
+// --- wall display -------------------------------------------------------------
+
+let wallWakeLock = null;
+let wallCursorTimer = null;
+
+/** Large-screen view of the Interference tab: status banner, L1/L2/L5 band cards and the live power plot. */
+function setWallMode(enabled, { fullscreen = false } = {}) {
+  state.wall = Boolean(enabled);
+  document.documentElement.classList.toggle('wall', state.wall);
+  const button = $('wall-toggle');
+  button.textContent = state.wall ? 'Exit wall display' : '\u26F6 Wall display';
+  button.setAttribute('aria-pressed', String(state.wall));
+  const url = new URL(location.href);
+  if (state.wall) url.searchParams.set('wall', '1');
+  else url.searchParams.delete('wall');
+  history.replaceState(null, '', url);
+  if (state.wall) {
+    document.querySelector('button.tab[data-tab="interference"]')?.click();
+    if (state.selectMode) setSelectMode(false);
+    state.timelineView = null;
+    if (fullscreen && !document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {});
+    requestWallWakeLock();
+    wallCursorActivity();
+  } else {
+    if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+    wallWakeLock?.release().catch(() => {});
+    wallWakeLock = null;
+    clearTimeout(wallCursorTimer);
+    document.documentElement.classList.remove('wall-idle');
+  }
+  timelineDirty = true;
+  flushUpdates(true);
+}
+
+/** Keeps the screen on while the wall display is shown, where the browser allows it. */
+async function requestWallWakeLock() {
+  if (!state.wall || wallWakeLock || document.hidden || !navigator.wakeLock) return;
+  try {
+    wallWakeLock = await navigator.wakeLock.request('screen');
+    wallWakeLock.addEventListener('release', () => { wallWakeLock = null; });
+  } catch {
+    wallWakeLock = null;
+  }
+}
+
+/** Hides the mouse pointer after a few seconds without movement. */
+function wallCursorActivity() {
+  document.documentElement.classList.remove('wall-idle');
+  clearTimeout(wallCursorTimer);
+  if (state.wall) wallCursorTimer = setTimeout(() => document.documentElement.classList.add('wall-idle'), 4000);
+}
+
+$('wall-toggle').addEventListener('click', () => setWallMode(!state.wall, { fullscreen: !state.wall }));
+document.addEventListener('pointermove', () => { if (state.wall) wallCursorActivity(); });
+document.addEventListener('visibilitychange', () => { if (!document.hidden) requestWallWakeLock(); });
+if (typeof ResizeObserver === 'function') {
+  new ResizeObserver(() => {
+    if (!state.wall) return;
+    timelineDirty = true;
+    requestAnimationFrame(() => flushUpdates());
+  }).observe($('timeline'));
+}
+// Deferred until the rest of the script has initialised the state that rendering relies on.
+if (new URLSearchParams(location.search).has('wall')) queueMicrotask(() => setWallMode(true));
 
 // --- historic archive -------------------------------------------------------
 
@@ -1909,6 +2114,26 @@ function renderArchiveStatus() {
       + `${auto.lastError ? ` Last refresh problem: ${auto.lastError}.` : ''}`);
   }
   $('archive-status').textContent = parts.join(' ');
+  $('archive-summary').textContent = archiveSummary(status, known, busy);
+}
+
+/** One-line archive state for the collapsed panel header. */
+function archiveSummary(status, known, busy) {
+  if (!known) return '';
+  if (status.state === 'idle') return 'Expand to choose days and load history';
+  const clock = (time) => dateFormatter({
+    timeZone: state.timeZone, hourCycle: 'h23', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+  }).format(new Date(time));
+  const bits = [];
+  if (busy && status.state === 'listing') bits.push('Searching for log files…');
+  else if (busy && status.state === 'scanning') {
+    const percent = status.bytesTotal > 0 ? Math.floor(100 * status.bytesDone / status.bytesTotal) : 0;
+    bits.push(`File ${Math.min(status.filesDone + 1, status.filesTotal)} of ${status.filesTotal} · ${percent}%`);
+  }
+  if (Number.isFinite(status.from)) bits.push(`${clock(status.from)} – ${clock(status.to)}`);
+  if (status.auto?.enabled) bits.push(`auto-refresh every ${formatSpan(status.auto.refreshMs || 900000)}`);
+  if (status.state === 'error' || status.auto?.lastError || status.errors?.length) bits.push('problem – expand for details');
+  return bits.join(' · ');
 }
 
 /** Fetches archive data for the visible range (debounced), at roughly one bucket per pixel. */
@@ -1995,7 +2220,7 @@ async function archiveRequest(url, body) {
 function showWholeArchive() {
   const status = state.archive.status;
   if (!status || !Number.isFinite(status.from)) return;
-  state.timelineView = { end: Date.now(), windowMs: Date.now() - status.from, follow: true };
+  state.timelineView = { end: Date.now(), windowMs: Date.now() - status.from, follow: true, preset: 'archive' };
   timelineDirty = true;
 }
 
@@ -2079,6 +2304,11 @@ $('archive-auto').addEventListener('change', (event) => {
 
 renderArchiveStatus();
 loadArchiveSettings();
+{
+  const panel = $('archive-panel');
+  panel.open = readPreference('archivePanelOpen', 'false') === 'true';
+  panel.addEventListener('toggle', () => writePreference('archivePanelOpen', String(panel.open)));
+}
 setInterval(() => {
   if (ARCHIVE_BUSY.has(state.archive.status?.state)) renderArchiveStatus();
 }, 1000);
