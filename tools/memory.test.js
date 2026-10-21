@@ -820,19 +820,21 @@ test('clicking a timeline report zooms in with that report centered', () => {
 });
 
 test('wall display does not treat stale or disconnected interference data as live', () => {
-  const context = vm.createContext({ state: { receiverConnected: true, streamConnected: true } });
+  const context = vm.createContext({
+    connection: { status: { connected: true }, offline: false }, INTERFERENCE_STALE_MS: 5000,
+  });
   loadFunctions(browserCode, 'function interferenceIsLive(', 'function renderVerdict(', context);
   const now = Date.now();
-  const record = { receivedAt: new Date(now).toISOString() };
+  const record = { receivedAt: new Date(now).toISOString(), data: { detections: [] } };
   assert.equal(context.interferenceIsLive(record, now), true);
-  assert.equal(context.interferenceIsLive(record, now + 3000), true);
-  assert.equal(context.interferenceIsLive(record, now + 3001), false);
+  assert.equal(context.interferenceIsLive(record, now + 5000), true);
+  assert.equal(context.interferenceIsLive(record, now + 5001), false);
   assert.equal(context.interferenceIsLive(null, now), false);
   assert.equal(context.interferenceIsLive({ receivedAt: 'invalid' }, now), false);
-  context.state.receiverConnected = false;
+  context.connection.status.connected = false;
   assert.equal(context.interferenceIsLive(record, now), false);
-  context.state.receiverConnected = true;
-  context.state.streamConnected = false;
+  context.connection.status.connected = true;
+  context.connection.offline = true;
   assert.equal(context.interferenceIsLive(record, now), false);
 });
 
@@ -849,6 +851,7 @@ test('every band remains visible without data, when clear and during detections'
     latestByName: {},
     $: () => ({ replaceChildren: () => { cards.length = 0; }, append: (card) => cards.push(card) }),
     bandStats: () => ({}),
+    interferenceIsLive: (record) => Boolean(record),
     renderVerdict() {},
     buildBandCard: (band, group, detections, status) => ({ dataset: {}, band: band.id, title: band.title, status }),
   });
@@ -951,6 +954,8 @@ test('unchanged clear reports refresh live history, time and counters without re
   let timelineRenders = 0;
   Object.assign(context, {
     source: null, MAX_IT_ROWS: 50, MAX_RAW_ROWS: 300,
+    MAX_EVENT_CHARS: 8 * 1024 * 1024, INTERFERENCE_STALE_MS: 5000,
+    connection: { status: { connected: true }, offline: false },
     latestByName: {}, dirtyRecords: new Set(),
     countsDirty: false, ephemerisDirty: false, pendingRaw: [], pendingInterference: [],
     document: {
@@ -964,8 +969,7 @@ test('unchanged clear reports refresh live history, time and counters without re
     registerFilterOption() {}, renderBands() {},
     renderTimeline() { timelineRenders++; },
   });
-  context.state.receiverConnected = true;
-  context.state.streamConnected = true;
+  loadFunctions(browserCode, 'function handleStreamEvent(', 'function connectStream()', context);
   loadFunctions(browserCode, 'function connectStream()', 'function renderStatus(', context);
   loadFunctions(browserCode, 'function applyRecord(', '// --- renderers', context);
   loadFunctions(browserCode, 'function renderItDetect(', '// --- interference bands', context);

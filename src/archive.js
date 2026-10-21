@@ -46,6 +46,8 @@ const PROGRESS_FIELDS = ['state', 'filesTotal', 'filesDone', 'filesCached', 'fil
   'currentFile', 'message', 'errors', 'startedAt'];
 const DATA_FIELDS = ['coverage', 'samples', 'solution', 'solutionResolutionMs', 'bestsats', 'bestsatsResolutionMs',
   'sorted', 'resolutionMs'];
+const NETWORK_ERRORS = new Set(['EIO', 'ENETDOWN', 'ENETUNREACH', 'EHOSTDOWN', 'EHOSTUNREACH',
+  'ENOTCONN', 'ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'UNKNOWN']);
 
 function fatalError(message) {
   const error = new Error(message);
@@ -425,9 +427,11 @@ class InterferenceArchive extends EventEmitter {
     this.dataGeneration = 0;
     this.view = null;
     this.hung = 0;
+    this.pendingFs = 0;
     this.autoTimer = null;
     this.autoState = { lastRunAt: null, nextRunAt: null, lastError: null };
     this.stream = null;
+    this.cancelScan = null;
     this.lastProgressAt = 0;
     this.settings = this.readSettings();
     this.reset({ state: 'idle' });
@@ -561,6 +565,7 @@ class InterferenceArchive extends EventEmitter {
 
   /** Starts loading `days` of history from `root`, replacing any loaded or in-progress archive. */
   load(request = {}) {
+    this.assertAvailable();
     const root = validateRoot(request.root === undefined ? this.settings.root : request.root);
     const days = this.validateDays(request.days === undefined ? this.settings.days : request.days);
     this.settings = { ...this.settings, root, days };
@@ -573,6 +578,7 @@ class InterferenceArchive extends EventEmitter {
    * it is swapped in only on success, and restored on failure or cancellation.
    */
   start(root, days, background) {
+    this.assertAvailable();
     this.stopStream();
     const generation = ++this.generation;
     if (background && !this.view && !this.busy() && this.state.state !== 'idle' && this.hasData()) {
@@ -594,9 +600,10 @@ class InterferenceArchive extends EventEmitter {
     this.run(generation).catch((error) => {
       if (generation !== this.generation) return;
       this.stopStream();
+      this.autoState.lastError = error.message;
+      console.warn(`[archive] load failed: ${error.message}; live receiver data is unaffected`);
       if (this.view) {
         this.restoreView();
-        this.autoState.lastError = error.message;
         this.update({ message: `Refresh failed (${error.message}); showing the previously loaded data` }, true);
       } else {
         this.update({ state: 'error', message: error.message, currentFile: null, finishedAt: Date.now() }, true);
@@ -680,7 +687,7 @@ class InterferenceArchive extends EventEmitter {
       this.scheduleAuto(this.options.busyRetryMs);
       return;
     }
-    if (this.hung > 0) {
+    if (this.hung > 0 || this.pendingFs > 0) {
       this.autoState.lastError = 'The network folder has not answered an earlier request yet; will retry';
       this.scheduleAuto(this.options.refreshMs);
       this.update({}, true);
@@ -691,8 +698,17 @@ class InterferenceArchive extends EventEmitter {
     this.start(this.settings.root, this.settings.days, true);
   }
 
+  assertAvailable() {
+    if (this.hung > 0 || this.pendingFs > 0 || (this.stream && !this.stream.closed)) {
+      throw new Error('Archive network folder still has an outstanding request; wait before retrying. Live data is unaffected.');
+    }
+  }
+
   /** Bounds a NAS call; a call that times out is still counted until it finally settles. */
   async withTimeout(promise, label) {
+    this.pendingFs++;
+    const settled = () => { this.pendingFs--; };
+    Promise.resolve(promise).then(settled, settled);
     let timer;
     let timedOut = false;
     const timeout = new Promise((resolve, reject) => {
@@ -716,13 +732,20 @@ class InterferenceArchive extends EventEmitter {
   }
 
   stopStream() {
-    if (this.stream) this.stream.destroy();
+    const stream = this.stream;
     this.stream = null;
+    const cancel = this.cancelScan;
+    this.cancelScan = null;
+    if (cancel) cancel();
+    if (stream) {
+      if (!stream.closed) this.trackHung(new Promise((resolve) => stream.once('close', resolve)));
+      stream.destroy();
+    }
   }
 
   async run(generation) {
     const { root, from, to } = this.state;
-    const files = await this.listFiles(root, from, to);
+    const files = await this.listFiles(root, from, to, generation);
     if (generation !== this.generation) return;
     const bytesTotal = files.reduce((sum, file) => sum + file.size, 0);
     this.update({
@@ -735,16 +758,19 @@ class InterferenceArchive extends EventEmitter {
       if (generation !== this.generation) return;
       this.update({ currentFile: file.path, bytesDone: bytesBefore });
       let summary = await this.readCache(file);
+      if (generation !== this.generation) return;
       const cached = Boolean(summary);
       try {
         if (!summary) {
           summary = await this.scanFile(file, generation, bytesBefore);
-          if (!summary) return;
+          if (!summary || generation !== this.generation) return;
           await this.writeCache(file, summary);
         }
       } catch (error) {
         if (generation !== this.generation) return;
-        if (error.fatal) throw new Error(`${path.basename(file.path)}: ${error.message}`);
+        if (error.fatal || NETWORK_ERRORS.has(error.code)) {
+          throw new Error(`${path.basename(file.path)}: ${error.message}`);
+        }
         this.addError(`${path.basename(file.path)}: ${error.message}`);
         summary = null;
       }
@@ -773,13 +799,14 @@ class InterferenceArchive extends EventEmitter {
   }
 
   /** Lists `root\YYYY\DDD\*.LOG` files that can contain reports between `from` and `to`. */
-  async listFiles(root, from, to) {
+  async listFiles(root, from, to, generation = this.generation) {
     try {
       await this.withTimeout(fs.promises.access(root), `Archive folder ${root}`);
     } catch (error) {
       if (error.fatal) throw new Error(`Archive folder ${root} is not reachable (${error.message})`);
       throw new Error(`Archive folder ${root} is not reachable (${error.code || error.message})`);
     }
+    if (generation !== this.generation) return [];
     const folders = [];
     const firstYear = new Date(from - DAY_MS).getUTCFullYear();
     const lastYear = new Date(to + DAY_MS).getUTCFullYear();
@@ -789,10 +816,12 @@ class InterferenceArchive extends EventEmitter {
         entries = await this.withTimeout(
           fs.promises.readdir(path.join(root, String(year)), { withFileTypes: true }), `Folder ${year}`);
       } catch (error) {
-        if (error.fatal) throw error;
+        if (generation !== this.generation) return [];
+        if (error.fatal || NETWORK_ERRORS.has(error.code)) throw error;
         if (error.code !== 'ENOENT') this.addError(`${year}: ${error.message}`);
         continue;
       }
+      if (generation !== this.generation) return [];
       for (const entry of entries) {
         if (!entry.isDirectory() || !/^\d{1,3}$/.test(entry.name)) continue;
         const dayStart = Date.UTC(year, 0, 1) + (Number(entry.name) - 1) * DAY_MS;
@@ -809,21 +838,25 @@ class InterferenceArchive extends EventEmitter {
         names = (await this.withTimeout(fs.promises.readdir(folder.dir), `Folder ${folder.dir}`))
           .filter((name) => /\.log$/i.test(name)).sort();
       } catch (error) {
-        if (error.fatal) throw error;
+        if (generation !== this.generation) return [];
+        if (error.fatal || NETWORK_ERRORS.has(error.code)) throw error;
         this.addError(`${folder.dir}: ${error.message}`);
         continue;
       }
+      if (generation !== this.generation) return [];
       for (const name of names) {
         const filePath = path.join(folder.dir, name);
         try {
           const stat = await this.withTimeout(fs.promises.stat(filePath), name);
+          if (generation !== this.generation) return [];
           if (!stat.isFile()) continue;
           files.push({
             path: filePath, size: stat.size, mtimeMs: Math.round(stat.mtimeMs),
             start: fileNameTime(name) ?? folder.dayStart, folderStart: folder.dayStart,
           });
         } catch (error) {
-          if (error.fatal) throw error;
+          if (generation !== this.generation) return [];
+          if (error.fatal || NETWORK_ERRORS.has(error.code)) throw error;
           this.addError(`${name}: ${error.message}`);
         }
       }
@@ -851,13 +884,18 @@ class InterferenceArchive extends EventEmitter {
     this.stream = stream;
     let bytes = 0;
     let lastDataAt = Date.now();
+    let abandon;
+    const abandoned = new Promise((resolve, reject) => {
+      abandon = (error) => error ? reject(error) : resolve(null);
+    });
+    this.cancelScan = () => abandon();
     const watchdog = setInterval(() => {
       if (Date.now() - lastDataAt <= this.options.stallTimeoutMs || stream.destroyed) return;
-      // The destroyed stream closes only once the stuck read returns, so it counts as hung until then.
-      if (!stream.closed) this.trackHung(new Promise((resolve) => stream.once('close', resolve)));
-      stream.destroy(fatalError(`no data received for ${Math.round(this.options.stallTimeoutMs / 1000)} s`));
+      // Windows may not close a network handle until its pending read returns.
+      abandon(fatalError(`no data received for ${Math.round(this.options.stallTimeoutMs / 1000)} s`));
+      this.stopStream();
     }, Math.max(10, Math.min(5000, this.options.stallTimeoutMs / 4)));
-    try {
+    const read = async () => {
       for await (const chunk of stream) {
         if (generation !== this.generation) return null;
         lastDataAt = Date.now();
@@ -865,16 +903,19 @@ class InterferenceArchive extends EventEmitter {
         bytes += chunk.length;
         this.update({ bytesDone: bytesBefore + bytes });
       }
+      if (generation !== this.generation) return null;
+      scanner.end();
+      return summary.toJSON();
+    };
+    try {
+      return await Promise.race([read(), abandoned]);
     } catch (error) {
       if (generation !== this.generation) return null;
       throw error;
     } finally {
       clearInterval(watchdog);
-      if (this.stream === stream) this.stream = null;
-      stream.destroy();
+      if (this.stream === stream) this.stopStream();
     }
-    if (generation === this.generation) scanner.end();
-    return generation === this.generation ? summary.toJSON() : null;
   }
 
   cachePath(file) {

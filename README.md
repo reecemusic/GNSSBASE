@@ -198,6 +198,11 @@ plot rows. Other bands (L6, SBAS, …) appear only while they have detections.
   the page fits one screen with no scrolling. Use the TV at 100 % browser zoom.
 - The plot opens on the live view (the same as **View → Live**), following current time
   over the history window, including any loaded archive.
+- The banner shows seconds since the last status update and the status-message counter,
+  even when every report is clear. It checks freshness every second: after more than
+  5 seconds without a fresh valid ITDETECTSTATUS report, the green verdict is replaced
+  by a device error and the band cards stop claiming to be clear. A known receiver or
+  live-server disconnection also shows an error. Fresh reports restore the live verdict.
 - To keep the plot as large as possible, wall mode hides the satellites-used and fix-type
   rows, the frequency plots, connection settings, archive panel, navigation controls and
   the recent changes list.
@@ -243,9 +248,13 @@ day: archive data underneath, live data on top.
   load completes, then switch over. Only new or changed files are read; the rest come from cache.
 - Refreshes never overlap and never interrupt a load you started; they wait for it.
 - NAS calls that do not answer within `ARCHIVE_TIMEOUT_SEC` (and file reads that stall for
-  six times that) are abandoned. A failed refresh keeps the previous data, shows the reason
-  in the panel and retries at the next interval; no new NAS work starts while an abandoned
-  call is still outstanding.
+  six times that, with a minimum of 60 seconds) are abandoned, without waiting for Windows
+  to close a stuck network handle. A failed refresh keeps the previous data, shows the reason
+  in the panel and retries at the next interval. Network failures during listing or reading
+  fail the refresh rather than replacing the previous archive with an incomplete result.
+  Neither automatic nor manual retries start new NAS work while an abandoned call or
+  closing read is outstanding; cancelling a directory search also stops subsequent work.
+  Archive failures are logged separately and do not stop live receiver data or the web server.
 - **Unload** also turns automatic loading off. The choice is remembered across restarts.
 
 Safeguards keep the NAS, server and browser responsive:
@@ -320,7 +329,8 @@ or `PROFILE ACTIVATE GNSSBASE`.
 
 ## Testing without hardware
 
-Run `npm test` for the memory-bound and update-batching regression checks.
+Run `npm test` for the memory-bound, update-batching, archive-outage and live-status
+freshness regression checks.
 
 ```bash
 npm run sim                                                   # terminal 1

@@ -481,6 +481,7 @@ test('NAS calls that hang time out, and automatic refresh waits for them to sett
   assert.match(status.message, /not reachable.*did not respond/);
   assert(Date.now() - started < 2000);
   assert.equal(archive.hung, 1);
+  assert.throws(() => archive.load({ root, days: 1 }), /outstanding request/);
 
   archive.settings.auto = true;
   const generation = archive.generation;
@@ -492,6 +493,82 @@ test('NAS calls that hang time out, and automatic refresh waits for them to sett
   release();
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(archive.hung, 0);
+});
+
+test('a cancelled directory request cannot start more NAS work or be retried until it settles', async (t) => {
+  const { root, options } = makeArchive(t);
+  let release;
+  let listings = 0;
+  t.mock.method(fs.promises, 'access', () => new Promise((resolve) => { release = resolve; }));
+  t.mock.method(fs.promises, 'readdir', async () => { listings++; return []; });
+  const archive = new InterferenceArchive(options);
+  archive.load({ root, days: 1 });
+  assert.equal(archive.cancel().state, 'cancelled');
+  assert.throws(() => archive.load({ root, days: 1 }), /outstanding request/);
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(archive.pendingFs, 0);
+  assert.equal(listings, 0);
+  assert.equal(archive.status().state, 'cancelled');
+});
+
+test('a stalled NAS read times out even when destroy is waiting for Windows, and late errors are handled', async (t) => {
+  const { root, write, options } = makeArchive(t, { stallTimeoutMs: 40, cacheDir: null });
+  write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
+  const { Readable } = require('node:stream');
+  let finishDestroy;
+  const stream = new Readable({
+    read() {},
+    destroy(error, callback) { finishDestroy = callback; },
+  });
+  t.mock.method(fs, 'createReadStream', () => stream);
+  t.after(() => { if (finishDestroy && !stream.closed) finishDestroy(); });
+  const archive = new InterferenceArchive(options);
+  archive.load({ root, days: 1 });
+  const status = await waitFor(archive, ['ready', 'error']);
+  assert.equal(status.state, 'error');
+  assert.match(status.message, /no data received/);
+  assert.equal(stream.closed, false, 'the operating system still has not closed the handle');
+  assert.equal(archive.hung, 1);
+  assert.throws(() => archive.load({ root, days: 1 }), /outstanding request/);
+  archive.settings.auto = true;
+  const generation = archive.generation;
+  archive.autoTick();
+  archive.stopAuto();
+  assert.equal(archive.generation, generation);
+  const closed = once(stream, 'close');
+  finishDestroy(Object.assign(new Error('NAS disconnected after timeout'), { code: 'EIO' }));
+  await assert.rejects(closed, /NAS disconnected/);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(archive.hung, 0);
+});
+
+test('network errors while listing or reading fail a refresh without discarding the previous archive', async (t) => {
+  const { root, write, options } = makeArchive(t, { cacheDir: null });
+  write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
+  const archive = new InterferenceArchive(options);
+  archive.load({ root, days: 1 });
+  const first = await waitFor(archive, ['ready', 'error']);
+  assert.equal(first.state, 'ready');
+  const query = { from: NOW - 86400000, to: NOW, buckets: 100 };
+  const before = archive.query(query);
+  const { Readable } = require('node:stream');
+  for (const stage of ['listing', 'reading']) {
+    const networkError = Object.assign(new Error('NAS connection lost'), { code: 'EIO' });
+    const mock = stage === 'listing'
+      ? t.mock.method(fs.promises, 'readdir', async () => { throw networkError; })
+      : t.mock.method(fs, 'createReadStream', () => new Readable({
+        read() { this.destroy(networkError); },
+      }));
+    archive.start(root, 1, true);
+    const status = await waitFor(archive, ['ready', 'error']);
+    assert.equal(status.state, 'ready');
+    assert.equal(status.generation, first.generation);
+    assert.match(status.auto.lastError, /NAS connection lost/);
+    assert.deepEqual(archive.query(query), before);
+    mock.mock.restore();
+    await new Promise((resolve) => setImmediate(resolve));
+  }
 });
 
 test('a read that stops delivering data is abandoned instead of hanging the load', async (t) => {

@@ -9,6 +9,8 @@ const HISTORY_REQUEST_LIMIT = 15000;
 const MAX_TRACK_SAMPLES = 1081;
 const MAX_TRACKS = 512;
 const MAX_EVENT_CHARS = 8 * 1024 * 1024;
+const INTERFERENCE_STALE_MS = 5000;
+const liveStatusStartedAt = Date.now();
 const dirtyRecords = new Set();
 const pendingRaw = [];
 const pendingInterference = [];
@@ -2776,23 +2778,16 @@ function renderBands() {
 
   const container = $('bands');
   container.replaceChildren();
-  let jammedBands = [];
-  let totalDetections = 0;
-
   for (const band of BANDS) {
     const group = groups[band.id];
     const bandDetections = group ? group.detections : [];
-    const status = !record ? 'unmonitored' : bandDetections.length ? 'jammed' : 'clear';
-    if (status === 'jammed') {
-      jammedBands.push(band.id);
-      totalDetections += bandDetections.length;
-    }
+    const status = !interferenceIsLive(record, now) ? 'unmonitored' : bandDetections.length ? 'jammed' : 'clear';
     const card = buildBandCard(band, group, bandDetections, status, stats[band.id]);
     card.dataset.band = band.id;
     container.append(card);
   }
 
-  renderVerdict(jammedBands, totalDetections, Boolean(record));
+  renderVerdict();
 }
 
 /** Detection rate, peak power and time since the last hit over the selected window. */
@@ -2947,17 +2942,45 @@ function buildPowerMeter(powerDbm) {
   return wrap;
 }
 
-function renderVerdict(jammedBands, totalDetections, hasData) {
+function interferenceIsLive(record, now = Date.now()) {
+  const receivedAt = Date.parse(record?.receivedAt);
+  return !connection.offline && connection.status?.connected === true
+    && record?.crcValid !== false && Boolean(record?.data)
+    && Number.isFinite(receivedAt) && now - receivedAt <= INTERFERENCE_STALE_MS;
+}
+
+function renderVerdict() {
+  const now = Date.now();
+  const record = latestByName.ITDETECTSTATUS;
+  const receivedAt = Date.parse(record?.receivedAt);
+  const age = Number.isFinite(receivedAt) ? Math.max(0, now - receivedAt) : null;
+  const detections = record?.data?.detections || [];
+  const jammedBands = BANDS.map((band) => band.id)
+    .filter((band) => detections.some((detection) => classifyBand(detection.signalType, [detection]) === band));
+  const totalDetections = detections.length;
   const banner = $('it-banner');
   const verdict = $('it-verdict');
   const detail = $('it-detail');
 
+  $('it-freshness').textContent = `Last status update: ${age === null ? 'never' : `${Math.floor(age / 1000)} s ago`}`
+    + ` \u00b7 Status messages: ${state.counts.ITDETECTSTATUS || 0}`;
   $('it-bands-hit').textContent = jammedBands.length ? jammedBands.join(', ') : 'None';
   $('it-bands-hit').classList.toggle('alert', jammedBands.length > 0);
   $('it-count').textContent = totalDetections;
   $('it-count').classList.toggle('alert', totalDetections > 0);
 
-  if (!hasData) {
+  if (!interferenceIsLive(record, now)
+    && (record || connection.offline || connection.status?.connected === false
+      || now - liveStatusStartedAt > INTERFERENCE_STALE_MS)) {
+    banner.className = 'banner device-error';
+    verdict.textContent = connection.offline ? 'Live server connection lost'
+      : connection.status?.connected === false ? 'Device disconnected' : 'Device status unavailable';
+    detail.textContent = connection.offline ? 'Cannot receive live data from the server. Reconnecting...'
+      : connection.status?.connected === false ? 'Receiver connection lost. Interference status is unknown.'
+        : 'No fresh valid ITDETECTSTATUS report from the receiver. Interference status is unknown.';
+    return;
+  }
+  if (!record) {
     banner.className = 'banner idle';
     verdict.textContent = 'Waiting for ITDETECTSTATUS';
     detail.textContent = 'No interference data received yet.';
@@ -3561,6 +3584,14 @@ function initTimeZone() {
 }
 
 setInterval(() => flushUpdates(), 250);
+setInterval(() => {
+  if (!document.hidden && document.querySelector('.tab.active')?.dataset.tab === 'interference') {
+    renderSafely('Updating live device status', () => {
+      renderVerdict();
+      if (!interferenceIsLive(latestByName.ITDETECTSTATUS)) renderBands();
+    });
+  }
+}, 1000);
 setInterval(() => {
   pruneClientHistory();
   timelineDirty = true;

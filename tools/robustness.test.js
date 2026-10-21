@@ -19,6 +19,66 @@ function load(context, start, end) {
   vm.runInContext(code.slice(first, last), context);
 }
 
+test('interference banner ages clear reports, errors after five seconds, and recovers on fresh data', () => {
+  const elements = new Map();
+  let now = 100000;
+  const context = vm.createContext({
+    Date: class extends Date { static now() { return now; } },
+    INTERFERENCE_STALE_MS: 5000, liveStatusStartedAt: now,
+    connection: { status: { connected: true }, offline: false },
+    latestByName: {}, state: { counts: {} },
+    BANDS: [{ id: 'L1' }, { id: 'L2' }],
+    classifyBand: (signal) => signal,
+    $: (id) => {
+      if (!elements.has(id)) elements.set(id, { classList: { toggle() {} } });
+      return elements.get(id);
+    },
+  });
+  load(context, 'function interferenceIsLive(', 'function renderCounts(');
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner idle');
+  now += 5001;
+  context.renderVerdict();
+  assert.equal(elements.get('it-verdict').textContent, 'Device status unavailable');
+  context.latestByName.ITDETECTSTATUS = { receivedAt: new Date(now).toISOString(), data: { detections: [] } };
+  context.state.counts.ITDETECTSTATUS = 42;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner clear');
+  assert.match(elements.get('it-freshness').textContent, /0 s ago.*Status messages: 42/);
+  now += 5000;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner clear', 'exactly 5 seconds is not stale');
+  assert.match(elements.get('it-freshness').textContent, /5 s ago/);
+  now++;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner device-error');
+  assert.match(elements.get('it-detail').textContent, /Interference status is unknown/);
+
+  context.latestByName.ITDETECTSTATUS.receivedAt = new Date(now).toISOString();
+  context.state.counts.ITDETECTSTATUS++;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner clear');
+  assert.match(elements.get('it-freshness').textContent, /0 s ago.*Status messages: 43/);
+  context.connection.status.connected = false;
+  context.renderVerdict();
+  assert.equal(elements.get('it-verdict').textContent, 'Device disconnected');
+  context.connection.offline = true;
+  context.renderVerdict();
+  assert.equal(elements.get('it-verdict').textContent, 'Live server connection lost');
+  context.connection.offline = false;
+  context.connection.status.connected = true;
+  context.latestByName.ITDETECTSTATUS.data.detections = [{ signalType: 'L2' }];
+  context.renderVerdict();
+  assert.equal(elements.get('it-verdict').textContent, 'Jamming detected on L2');
+  now += 5001;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner device-error', 'stale detections are not live either');
+  context.latestByName.ITDETECTSTATUS.receivedAt = new Date(now).toISOString();
+  context.latestByName.ITDETECTSTATUS.crcValid = false;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner device-error', 'a CRC failure cannot restore live status');
+});
+
 test('corrupt and unavailable preferences display errors without preventing startup', () => {
   const notice = {};
   const errors = [];

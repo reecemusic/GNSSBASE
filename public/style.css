@@ -527,6 +527,9 @@ select {
 .banner.alarm { border-color: var(--bad); background: rgba(255, 95, 86, .1); }
 .banner.alarm .banner-icon { background: var(--bad); box-shadow: 0 0 10px var(--bad); animation: pulse 1.4s ease-in-out infinite; }
 .banner.alarm .banner-title { color: var(--bad); }
+.banner.device-error { border-color: var(--bad); background: rgba(255, 95, 86, .1); }
+.banner.device-error .banner-icon { background: var(--bad); }
+.banner.device-error .banner-title { color: var(--bad); }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
