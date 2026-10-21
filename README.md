@@ -23,7 +23,7 @@ changes only take effect when that button is pressed.
 | --- | --- |
 | Overview | Per-log counters, format, last-seen time, CRC result |
 | Position | BESTPOS, BESTGNSSPOS (solution status, lat/lon/height, σ, SVs, ages, station ID) plus a live map |
-| Satellites | Skyplot merging SATVIS2 (geometry), BESTSATS (solution usage) and RANGE (tracking, C/No), with per-constellation toggles and a satellite status table; plus the raw RANGE table |
+| Satellites | Skyplot merging SATVIS2 (geometry), BESTSATS (solution usage), RANGE (tracking, C/No) and TRACKSTAT (assigned channels), with per-constellation toggles and a satellite status table; plus the raw RANGE table |
 | Ephemeris and Iono | Per-constellation sub-tabs with one row per PRN and ephemeris/iono parameter columns across the table |
 | Interference | ITDETECTSTATUS (signal, detection count, center freq, bandwidth, power, history); linked power and GNSS frequency plots with signal visibility controls |
 | Receiver health | RXSTATUS error/status words with decoded flags, VERSION component table |
@@ -31,6 +31,35 @@ changes only take effect when that button is pressed.
 
 Both ASCII (`#...*crc`) and binary (`0xAA 0x44 0x12`) framings are decoded, and the two
 may be interleaved on the same port. CRC is verified on every log.
+
+Satellite **tracked** counts on both tabs are unique constellation/PRN pairs in
+the latest RANGE report, including satellites used in the solution. Multiple
+signals do not count as multiple satellites. **In view** counts come only from
+valid SATVIS2 positions above the horizon, not the combined RANGE/BESTSATS list.
+BESTSATS supplies solution/exclusion status independently of tracking; an excluded
+satellite may still be tracked. GLONASS slot IDs (including signed frequency-channel
+suffixes) are matched across logs. Invalid IDs and CRC-failed reports are excluded.
+Tracked totals therefore overlap with the used, missing and unhealthy status counts;
+those cards are not additive. Used-signal counts deduplicate each satellite per band.
+Skyplot constellation filters affect the plot and detail table, not the summary
+counts. Counts show the latest reports, not a guarantee of current reception when
+the receiver is disconnected.
+Every connection explicitly requests `LOG BESTSATSA ONTIME 1`, even with
+profile-managed logging: the profile may configure ICOM1 while the monitor uses
+USB serial. Without a decoded, CRC-valid BESTSATS report, per-satellite usage,
+and used signals are shown as unavailable rather than zero or
+"not used". BESTPOS still supplies the overall used total when available.
+`LOG TRACKSTATA ONTIME 5` supplies assigned tracking channels. Assigned satellites
+with valid visible positions at or above the reported tracking cutoff, but without
+RANGE observations, are classified as missing, including satellites that
+BESTSATS does not list. Idle channels, below-cutoff search candidates and candidates
+without valid sky geometry are excluded; multiple channels for one
+satellite are deduplicated. Missing counts are unavailable without TRACKSTAT.
+This is an explicit assigned-channel definition; the manufacturer's internal
+missing-satellite selection/retention policy is not documented and may differ.
+The constellation legend separates used, not used and missing counts for comparison
+with the manufacturer's Satellite View. Its "in view" value is a separate almanac
+prediction and is not equivalent to the manufacturer's tracked-plus-missing total.
 
 The Position map uses Leaflet and OpenStreetMap tiles loaded from a CDN (pinned with
 subresource integrity). It is the only part of the UI that needs internet access; without

@@ -214,11 +214,13 @@ class ReceiverClient extends EventEmitter {
 
   sendConfiguredCommands(transport) {
     const profileCommands = this.options.sendLogCommands
-      ? (this.options.logCommands || []).filter((command) => !/^LOG ITDETECTSTATUS[A-Z]? /i.test(command))
+      ? (this.options.logCommands || []).filter((command) => !/^LOG (?:ITDETECTSTATUS|BESTSATS|TRACKSTAT)[A-Z]? /i.test(command))
       : [];
     const commands = [
       ...(this.options.ephemerisLogCommands || []),
       ...profileCommands,
+      'LOG BESTSATSA ONTIME 1',
+      'LOG TRACKSTATA ONTIME 5',
       'LOG ITDETECTSTATUSA ONTIME 1',
     ];
     for (const command of commands) {

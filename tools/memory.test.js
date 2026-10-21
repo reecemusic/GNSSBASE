@@ -10,7 +10,7 @@ const { History } = require('../src/history');
 const browserCode = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
 const serverCode = fs.readFileSync(path.join(__dirname, '../src/server.js'), 'utf8');
 
-test('profile-managed TCP connections request interference reports every second on each connection', () => {
+test('profile-managed TCP connections request usage and interference reports every second on each connection', () => {
   const { EventEmitter } = require('node:events');
   const writes = [];
   const socket = new EventEmitter();
@@ -34,8 +34,8 @@ test('profile-managed TCP connections request interference reports every second 
     socket.emit('connect');
   }
   assert.deepEqual(writes, [
-    'LOG GPSEPHEMA ONALL\r\n', 'LOG ITDETECTSTATUSA ONTIME 1\r\n',
-    'LOG GPSEPHEMA ONALL\r\n', 'LOG ITDETECTSTATUSA ONTIME 1\r\n',
+    'LOG GPSEPHEMA ONALL\r\n', 'LOG BESTSATSA ONTIME 1\r\n', 'LOG TRACKSTATA ONTIME 5\r\n', 'LOG ITDETECTSTATUSA ONTIME 1\r\n',
+    'LOG GPSEPHEMA ONALL\r\n', 'LOG BESTSATSA ONTIME 1\r\n', 'LOG TRACKSTATA ONTIME 5\r\n', 'LOG ITDETECTSTATUSA ONTIME 1\r\n',
   ]);
   assert(!writes.some((command) => command.includes('UNLOGALL')));
 });
@@ -827,8 +827,8 @@ test('wall display does not treat stale or disconnected interference data as liv
   const now = Date.now();
   const record = { receivedAt: new Date(now).toISOString(), data: { detections: [] } };
   assert.equal(context.interferenceIsLive(record, now), true);
-  assert.equal(context.interferenceIsLive(record, now + 5000), true);
-  assert.equal(context.interferenceIsLive(record, now + 5001), false);
+  assert.equal(context.interferenceIsLive(record, now + 4999), true);
+  assert.equal(context.interferenceIsLive(record, now + 5000), false);
   assert.equal(context.interferenceIsLive(null, now), false);
   assert.equal(context.interferenceIsLive({ receivedAt: 'invalid' }, now), false);
   context.connection.status.connected = false;
@@ -957,19 +957,24 @@ test('unchanged clear reports refresh live history, time and counters without re
     MAX_EVENT_CHARS: 8 * 1024 * 1024, INTERFERENCE_STALE_MS: 5000,
     connection: { status: { connected: true }, offline: false },
     latestByName: {}, dirtyRecords: new Set(),
-    countsDirty: false, ephemerisDirty: false, pendingRaw: [], pendingInterference: [],
+    countsDirty: false, ephemerisDirty: false,
+    pendingRaw: [], pendingInterference: [],
     document: {
       hidden: false,
       querySelector: () => ({ dataset: { tab: 'interference' } }),
       createElement: () => ({ dataset: {}, append() {} }),
     },
     EventSource: class { addEventListener(name, handler) { handlers[name] = handler; } },
+    reportClientError() {},
     $: (id) => elements[id],
     formatTime: (record) => record.receivedAt,
-    registerFilterOption() {}, renderBands() {},
+    registerFilterOption() {}, rememberLastDetection() {}, renderBands() {},
     renderTimeline() { timelineRenders++; },
   });
+  vm.runInContext('let timelineDirty = false;', context);
   loadFunctions(browserCode, 'function handleStreamEvent(', 'function connectStream()', context);
+  loadFunctions(browserCode, 'function applyPayload(', 'function queueRecord(', context);
+  loadFunctions(browserCode, 'function renderSafely(', 'function renderStatus(', context);
   loadFunctions(browserCode, 'function connectStream()', 'function renderStatus(', context);
   loadFunctions(browserCode, 'function applyRecord(', '// --- renderers', context);
   loadFunctions(browserCode, 'function renderItDetect(', '// --- interference bands', context);
@@ -983,6 +988,7 @@ test('unchanged clear reports refresh live history, time and counters without re
       data: { detectionCount: 0, detections: [] },
     };
     handlers.message({ data: JSON.stringify({ record, counts: { ITDETECTSTATUS: count } }) });
+    assert.equal(vm.runInContext('timelineDirty', context), true);
     context.flushUpdates();
     assert.equal(elements['it-total'].textContent, count);
     assert.equal(elements['it-time'].textContent, record.receivedAt);

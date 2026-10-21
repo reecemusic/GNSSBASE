@@ -164,10 +164,11 @@
   <section id="tab-satellites" class="panel">
     <div class="summary">
       <div class="card"><span class="label">Used in solution</span><span id="sv-used" class="value">&mdash;</span></div>
-      <div class="card"><span class="label">Tracked, not used</span><span id="sv-tracked" class="value">&mdash;</span></div>
-      <div class="card"><span class="label">Missing</span><span id="sv-missing" class="value">&mdash;</span></div>
+      <div class="card"><span class="label" title="Unique satellites in RANGE, including those used in solution; unaffected by skyplot filters">Tracked (including used)</span><span id="sv-tracked" class="value">&mdash;</span></div>
+      <div class="card"><span class="label" title="Visible assigned TRACKSTAT channels above the reported cutoff without a RANGE observation">Missing (assigned channels)</span><span id="sv-missing" class="value">&mdash;</span></div>
       <div class="card"><span class="label">Unhealthy</span><span id="sv-unhealthy" class="value">&mdash;</span></div>
     </div>
+    <p id="sv-status-note" class="muted">Waiting for satellite status reports.</p>
 
     <h2>
       Skyplot <span id="sky-count" class="muted"></span>
@@ -186,13 +187,15 @@
         <ul class="legend key">
           <li><span class="key-marker used"></span>Used in solution</li>
           <li><span class="key-marker tracked"></span>Tracked, not used</li>
+          <li><span class="key-marker tracked"></span>Tracked, usage unknown (no BESTSATS status)</li>
           <li><span class="key-marker missing"></span>Missing observation</li>
           <li><span class="key-marker unhealthy"></span>Unhealthy / excluded</li>
         </ul>
       </div>
     </div>
     <div id="sky-fallback" class="map-fallback">
-      Waiting for SATVIS2 — add <code>LOG SATVIS2A ONTIME 10</code> if the receiver is not sending it.
+      No tracked satellite positions to plot (or all constellations are hidden). Counts above include all constellations.
+      For sky positions, add <code>LOG SATVIS2A ONTIME 10</code> if the receiver is not sending it.
     </div>
 
     <h2>Satellite status</h2>
@@ -273,11 +276,39 @@
 
     <div id="it-banner" class="banner idle">
       <span class="banner-icon"></span>
-      <div>
+      <div class="banner-copy">
         <div id="it-verdict" class="banner-title">Waiting for ITDETECTSTATUS</div>
         <div id="it-detail" class="banner-detail">No interference data received yet.</div>
-        <div id="it-freshness" class="banner-detail">Last status update: never &middot; Status messages: 0</div>
+        <div id="it-freshness" class="banner-detail">Waiting for data &middot; Status messages: 0</div>
       </div>
+      <div class="banner-block banner-last-detection">
+        <span class="banner-block-label">Last interference detected</span>
+        <span id="it-last-detection" class="banner-block-value">None yet</span>
+        <span id="it-last-detection-detail" class="banner-block-detail"></span>
+      </div>
+      <div class="banner-block banner-clock" aria-live="off">
+        <span id="it-clock" class="banner-clock-time">--:--:--</span>
+        <span id="it-clock-date" class="banner-block-detail"></span>
+      </div>
+    </div>
+
+    <div id="satellite-view-panel" aria-label="Live satellites tracked and in view over time">
+      <div class="satellite-view-plot">
+        <h2>Satellites tracked <span id="satellite-view-total" class="muted"></span></h2>
+        <svg id="satellite-view-chart" viewBox="0 0 900 180" role="img"
+          aria-label="Satellites tracked by constellation, total tracked and total in view over time"></svg>
+      </div>
+      <table class="satellite-signal-table" aria-label="Satellites and tracked signals by constellation">
+        <thead><tr><th>System</th><th title="Satellites tracked / in view">Trk / view</th><th>Tracked signals (satellites)</th></tr></thead>
+        <tbody id="satellite-signal-rows"></tbody>
+        <tfoot>
+          <tr>
+            <th><i class="satellite-key total"></i>Total</th>
+            <td id="satellite-total-counts">&mdash;</td>
+            <td><i class="satellite-key in-view"></i>dashed line: total in view</td>
+          </tr>
+        </tfoot>
+      </table>
     </div>
 
     <div class="summary interference-summary">
@@ -289,6 +320,7 @@
 
     <h2 id="timeline-heading">
       Power over time <span id="timeline-range" class="muted"></span>
+      <button id="timeline-live" type="button" title="Reset to the live window">&#10227; Live</button>
       <span class="scale">
         <span class="scale-item"><i class="swatch strong"></i>&gt; &minus;95 dBm</span>
         <span class="scale-item"><i class="swatch moderate"></i>&minus;95 to &minus;110</span>
@@ -317,7 +349,6 @@
         <button id="timeline-zoom-out" type="button" class="icon-button" title="Zoom out" aria-label="Zoom out">&minus;</button>
         <button id="timeline-zoom-in" type="button" class="icon-button" title="Zoom in" aria-label="Zoom in">+</button>
       </span>
-      <button id="timeline-live" type="button" title="Reset to the live window">&#10227; Live</button>
       <button id="timeline-select" type="button" aria-pressed="false" title="Click data points to inspect them (Esc to exit)">&#8598; Select point</button>
       <span id="timeline-mode" class="timeline-mode" role="status">Live</span>
     </div>

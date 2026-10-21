@@ -10,6 +10,7 @@ const { test } = require('node:test');
 const { ReceiverClient } = require('../src/receiver');
 const { History } = require('../src/history');
 const { parseAsciiLog, readBinaryLog } = require('../src/novatel');
+const { decode } = require('../src/messages');
 const code = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
 
 function load(context, start, end) {
@@ -26,17 +27,51 @@ test('interference banner ages clear reports, errors after five seconds, and rec
     Date: class extends Date { static now() { return now; } },
     INTERFERENCE_STALE_MS: 5000, liveStatusStartedAt: now,
     connection: { status: { connected: true }, offline: false },
-    latestByName: {}, state: { counts: {} },
+    latestByName: {}, state: { counts: {}, lastDetection: null, testSatellites: [], satelliteViewHistory: [] },
     BANDS: [{ id: 'L1' }, { id: 'L2' }],
+    SIGNAL_BANDS: ['L1', 'L2', 'L5'],
     classifyBand: (signal) => signal,
+    buildSatelliteList: () => context.state.testSatellites,
+    signalBand: (_system, status) => status,
+    normalisePrn: (_system, prn) => prn,
+    formatFrequency: (hz) => `${hz / 1e6} MHz`,
+    timeAgo: () => '0s ago',
+    formatTimestamp: () => '12:00:00 GMT+4',
+    detectionTypeLabel: (type) => `label:${type}`,
+    dateFormatter: (options) => ({ format: () => (options.second ? 'CLOCK' : 'DATE') }),
+    constellationColor: () => '#fff',
+    cell: (row, text, className) => row.insertCell(text, className),
+    document: {
+      createElement: () => ({ style: {} }),
+      createTextNode: (text) => ({ text }),
+    },
     $: (id) => {
-      if (!elements.has(id)) elements.set(id, { classList: { toggle() {} } });
+      if (!elements.has(id)) {
+        elements.set(id, {
+          classList: { toggle() {} },
+          rows: [],
+          replaceChildren() { this.rows = []; },
+          insertRow() {
+            const row = { cells: [], insertCell(text, className) {
+              const td = { text, className, append() {} };
+              this.cells.push(td);
+              return td;
+            } };
+            this.rows.push(row);
+            return row;
+          },
+        });
+      }
       return elements.get(id);
     },
   });
   load(context, 'function interferenceIsLive(', 'function renderCounts(');
+  context.renderSatelliteViewPlot = () => {};
   context.renderVerdict();
   assert.equal(elements.get('it-banner').className, 'banner idle');
+  assert.equal(elements.get('it-clock').textContent, 'CLOCK');
+  assert.equal(elements.get('it-clock-date').textContent, 'DATE');
+  assert.equal(elements.get('it-last-detection').textContent, 'None yet');
   now += 5001;
   context.renderVerdict();
   assert.equal(elements.get('it-verdict').textContent, 'Device status unavailable');
@@ -44,39 +79,444 @@ test('interference banner ages clear reports, errors after five seconds, and rec
   context.state.counts.ITDETECTSTATUS = 42;
   context.renderVerdict();
   assert.equal(elements.get('it-banner').className, 'banner clear');
-  assert.match(elements.get('it-freshness').textContent, /0 s ago.*Status messages: 42/);
+  assert.match(elements.get('it-freshness').textContent, /^Receiving Data.*42 status messages$/);
   now += 5000;
   context.renderVerdict();
-  assert.equal(elements.get('it-banner').className, 'banner clear', 'exactly 5 seconds is not stale');
-  assert.match(elements.get('it-freshness').textContent, /5 s ago/);
-  now++;
-  context.renderVerdict();
-  assert.equal(elements.get('it-banner').className, 'banner device-error');
+  assert.equal(elements.get('it-banner').className, 'banner device-error', '5 seconds without a report is stale');
+  assert.match(elements.get('it-freshness').textContent, /Device connection lost.*Last message 5 s ago/);
   assert.match(elements.get('it-detail').textContent, /Interference status is unknown/);
 
   context.latestByName.ITDETECTSTATUS.receivedAt = new Date(now).toISOString();
   context.state.counts.ITDETECTSTATUS++;
   context.renderVerdict();
   assert.equal(elements.get('it-banner').className, 'banner clear');
-  assert.match(elements.get('it-freshness').textContent, /0 s ago.*Status messages: 43/);
+  assert.match(elements.get('it-freshness').textContent, /^Receiving Data.*43 status messages$/);
   context.connection.status.connected = false;
   context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner clear', 'device disconnect gets a 5-second grace period');
+  assert.match(elements.get('it-freshness').textContent, /^Receiving Data/);
+  now += 4999;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner clear');
+  now += 1;
+  context.renderVerdict();
   assert.equal(elements.get('it-verdict').textContent, 'Device disconnected');
+  context.connection.status.connected = true;
+  context.latestByName.ITDETECTSTATUS.receivedAt = new Date(now).toISOString();
+  context.renderVerdict();
   context.connection.offline = true;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner clear', 'server disconnect gets a 5-second grace period');
+  now += 4999;
+  context.renderVerdict();
+  assert.equal(elements.get('it-banner').className, 'banner clear');
+  now += 1;
   context.renderVerdict();
   assert.equal(elements.get('it-verdict').textContent, 'Live server connection lost');
   context.connection.offline = false;
-  context.connection.status.connected = true;
+  context.latestByName.ITDETECTSTATUS.receivedAt = new Date(now).toISOString();
   context.latestByName.ITDETECTSTATUS.data.detections = [{ signalType: 'L2' }];
   context.renderVerdict();
   assert.equal(elements.get('it-verdict').textContent, 'Jamming detected on L2');
-  now += 5001;
+  context.rememberLastDetection({
+    name: 'ITDETECTSTATUS', receivedAt: new Date(now).toISOString(),
+    data: { detections: [{
+      signalType: 'GPSL2', powerDbm: -83.5, bandwidthHz: 2000000, centerFrequencyHz: 1575420000,
+    }] },
+  });
+  context.renderVerdict();
+  assert.match(elements.get('it-last-detection').textContent, /GPSL2.*-83\.5 dBm.*2 MHz BW.*Centre frequency 1575\.42 MHz/);
+  context.state.testSatellites = [
+    { system: 'GPS', prn: '1', inView: true }, { system: 'GPS', prn: '2', inView: true },
+    { system: 'GALILEO', prn: '5', inView: true },
+  ];
+  assert.equal(elements.get('it-last-detection-detail').textContent, '12:00:00 GMT+4 · 0s ago');
+  context.state.lastDetection = { at: now, detection: { signalType: 'L2', type: 'STATISTICANALYSIS' } };
+  assert.equal(context.lastDetectionSummary(context.state.lastDetection),
+    'L2 (label:STATISTICANALYSIS) · power and frequency not reported by this detector');
+  const status = (code) => (code << 21).toString(16);
+  context.latestByName.RANGE = { data: { observations: [
+    { system: 'GPS', prn: 1, trackingStatus: status(0) },
+    { system: 'GPS', prn: 1, trackingStatus: status(17) },
+    { system: 'GPS', prn: 2, trackingStatus: status(14) },
+    { system: 'GPS', prn: 2, trackingStatus: status(0) },
+    { system: 'GALILEO', prn: 5, trackingStatus: status(12) },
+    { system: 'RESERVED', prn: 3, trackingStatus: status(0) },
+  ] } };
+  context.renderDeviceSummary();
+  const rows = elements.get('satellite-signal-rows').rows.map((row) => row.cells.slice(1).map((td) => td.text));
+  assert.deepEqual(JSON.parse(JSON.stringify(rows)), [
+    ['2 / 2', 'L1C/A 2 · L2C 1 · L5 1'],
+    ['0 / 0', 'Not reported by receiver'],
+    ['1 / 1', 'E5a 1'],
+    ['0 / 0', 'Not reported by receiver'],
+    ['0 / 0', 'Not reported by receiver'],
+    ['1 / 0', 'L5 1'],
+  ], 'GLONASS is always listed and RESERVED tracking is NavIC');
+  assert.equal(elements.get('satellite-total-counts').textContent, '4 / 3');
+  assert.equal(elements.get('satellite-view-total').textContent, '4 tracked · 3 in view · 6 signals');
+  now += 5000;
   context.renderVerdict();
   assert.equal(elements.get('it-banner').className, 'banner device-error', 'stale detections are not live either');
-  context.latestByName.ITDETECTSTATUS.receivedAt = new Date(now).toISOString();
   context.latestByName.ITDETECTSTATUS.crcValid = false;
+  context.latestByName.ITDETECTSTATUS.receivedAt = new Date(now - 5000).toISOString();
   context.renderVerdict();
   assert.equal(elements.get('it-banner').className, 'banner device-error', 'a CRC failure cannot restore live status');
+});
+
+function satelliteContext() {
+  const elements = new Map();
+  const context = vm.createContext({
+    latestByName: {},
+    state: { satvis: {}, hiddenSystems: new Set(), showTraces: false },
+    $: (id) => {
+      if (!elements.has(id)) elements.set(id, {
+        textContent: '', hidden: false, children: [],
+        classList: { toggle() {} },
+        replaceChildren() { this.children = []; },
+        append(child) { this.children.push(child); },
+      });
+      return elements.get(id);
+    },
+    SKY: { cx: 210, cy: 210, r: 180 },
+    skyPosition: () => ({ x: 0, y: 0 }),
+    svg: () => ({}),
+    buildSatMarker: (sat) => sat,
+    renderSkyLegend: (counts) => { context.legendCounts = counts; },
+    renderSignalLegend() {},
+    signalBreakdown: () => ({}),
+    renderSatelliteTable: (sats) => { context.tableSatellites = sats; },
+  });
+  load(context, 'function isValidSkyPosition(', 'function svg(');
+  load(context, 'function buildSatelliteList(', 'function renderSkyLegend(');
+  load(context, 'const SATELLITE_SYSTEMS =', 'function sumCounts(');
+  load(context, 'function renderSkyplot(', '/** Past positions');
+  context.elements = elements;
+  return context;
+}
+
+test('QZSS tracked totals include used satellites, deduplicate signals and ignore skyplot filters', () => {
+  const context = satelliteContext();
+  context.state.satvis.QZSS = { data: { visibilityValid: true, satellites: [
+    ...[193, 194, 195, 196].map((prn) => ({ prn, elevation: 20, azimuth: 30 })),
+    { prn: 193, elevation: 20, azimuth: 30 },
+    { prn: 197, elevation: -5, azimuth: 30 },
+    { prn: 198, elevation: null, azimuth: 30 },
+  ] } };
+  context.latestByName.RANGE = { data: { observations: [
+    { system: 'QZSS', prn: 193, trackingStatus: '0' },
+    { system: 'QZSS', prn: 193, trackingStatus: (17 << 21).toString(16) },
+    { system: 'QZSS', prn: 194, trackingStatus: '0' },
+  ] } };
+  context.latestByName.BESTSATS = { data: { satellites: [
+    { system: 'QZSS', prn: 193, status: 'GOOD' },
+    { system: 'QZSS', prn: 194, status: 'GOOD' },
+  ] } };
+  context.renderSkyplot();
+  assert.equal(context.trackedSatelliteSummary().get('QZSS').prns.size, 2);
+  assert.equal(context.satellitesInViewBySystem().QZSS, 4);
+  assert.equal(context.elements.get('sv-tracked').textContent, 2);
+  assert.equal(context.elements.get('sv-used').textContent, 2);
+  assert.equal(context.legendCounts.QZSS.tracked, 2);
+  assert.equal(context.legendCounts.QZSS.visible, 4);
+  context.state.hiddenSystems.add('QZSS');
+  context.renderSkyplot();
+  assert.equal(context.elements.get('sv-tracked').textContent, 2);
+  assert.equal(context.elements.get('sv-used').textContent, 2);
+  assert.equal(context.elements.get('sky-count').textContent, '(0 plotted)');
+  assert.equal(context.satellitesInViewBySystem().QZSS, 4);
+});
+
+test('tracking remains independent of BESTSATS exclusions and missing sky geometry', () => {
+  const context = satelliteContext();
+  context.latestByName.RANGE = { data: { observations: [
+    { system: 'GLONASS', prn: 55, trackingStatus: '0' },
+    { system: 'RESERVED', prn: 3, trackingStatus: '0' },
+    { system: 'GPS', prn: 2, trackingStatus: '0' },
+  ] } };
+  context.latestByName.BESTSATS = { data: { satellites: [
+    { system: 'GLONASS', prn: '18-3', status: 'GOOD' },
+    { system: 'NAVIC', prn: 3, status: 'BADHEALTH' },
+    { system: 'GPS', prn: 2, status: 'NOEPHEMERIS' },
+    { system: 'GPS', prn: 4, status: 'NOTUSED' },
+  ] } };
+  context.latestByName.TRACKSTAT = { data: { observations: [] } };
+  context.renderSkyplot();
+  const sats = context.buildSatelliteList();
+  assert.equal(sats.length, 4, 'GLONASS frequency suffix and RANGE slot offset match one satellite');
+  assert.equal(sats.find((sat) => sat.system === 'GLONASS').prn, '18');
+  assert.equal(sats.find((sat) => sat.system === 'NAVIC').tracked, true);
+  assert.equal(sats.find((sat) => sat.prn === '4').tracked, false, 'BESTSATS alone is not tracking evidence');
+  assert.equal(context.elements.get('sv-tracked').textContent, 3);
+  assert.equal(context.elements.get('sv-used').textContent, 1);
+  assert.equal(context.elements.get('sv-missing').textContent, 0, 'a RANGE observation is not missing despite solution exclusion');
+  assert.equal(context.elements.get('sv-unhealthy').textContent, 1);
+  assert.equal(context.elements.get('sky-fallback').hidden, false);
+  assert.deepEqual(Object.keys(context.satellitesInViewBySystem()), [], 'RANGE and BESTSATS do not invent visibility');
+  for (const [system, entry] of context.trackedSatelliteSummary()) {
+    assert.equal(sats.filter((sat) => sat.system === system && sat.tracked).length, entry.prns.size);
+  }
+  context.latestByName = {};
+  context.renderSkyplot();
+  assert.equal(context.elements.get('sv-tracked').textContent, 0);
+  for (const id of ['sv-used', 'sv-missing', 'sv-unhealthy']) {
+    assert.equal(context.elements.get(id).textContent, '\u2014', 'missing reports are unknown, not zero');
+  }
+  assert.equal(context.tableSatellites.length, 0, 'empty data clears the status table');
+});
+
+test('satellite counts reject invalid IDs, invalid visibility and CRC failures', () => {
+  const context = satelliteContext();
+  const invalid = [null, undefined, '', ' ', 0, -1, NaN, Infinity, 'abc', '2x', 1.5];
+  const observations = invalid.map((prn) => ({ system: 'GPS', prn, trackingStatus: '0' }));
+  observations.push({ system: 'GPS', prn: 1, trackingStatus: '0' },
+    { system: 'GPS', prn: '01', trackingStatus: '0' },
+    { system: 'OTHER', prn: 3, trackingStatus: '0' });
+  context.latestByName.RANGE = { data: { observations } };
+  context.state.satvis.GPS = { data: { visibilityValid: false,
+    satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } };
+  context.state.satvis.QZSS = { crcValid: false, data: {
+    satellites: [{ prn: 193, elevation: 20, azimuth: 30 }] } };
+  context.latestByName.BESTSATS = { crcValid: false, data: {
+    satellites: [{ system: 'GPS', prn: 2, status: 'GOOD' }] } };
+  assert.equal(context.buildSatelliteList().length, 1);
+  assert.equal(context.trackedSatelliteSummary().get('GPS').prns.size, 1);
+  assert.deepEqual(Object.keys(context.satellitesInViewBySystem()), []);
+  context.latestByName.RANGE.crcValid = false;
+  assert.equal(context.buildSatelliteList().length, 0);
+  assert.equal(context.trackedSatelliteSummary().size, 0);
+  context.latestByName.RANGE = { data: { observations: [] } };
+  assert.equal(context.trackedSatelliteSummary().size, 0);
+});
+
+test('used-signal counts match RANGE signal bands and normalize legacy NavIC IDs', () => {
+  const context = satelliteContext();
+  context.SIGNAL_BANDS = ['L1', 'L2', 'L5', 'Other'];
+  load(context, 'function signalBreakdown(', 'function renderSignalLegend(');
+  load(context, 'function signalBand(', 'function renderSatelliteTable(');
+  const observations = [
+    ['GPS', 1, 17], ['QZSS', 193, 17], ['QZSS', 193, 0], ['QZSS', 193, 0],
+    ['QZSS', 194, 24], ['SBAS', 131, 6], ['BEIDOU', 3, 7], ['BEIDOU', 4, 9],
+    ['RESERVED', 5, 0], ['GLONASS', 55, 1],
+  ].map(([system, prn, signal]) => ({ system, prn, trackingStatus: (signal << 21).toString(16) }));
+  context.latestByName.RANGE = { data: { observations } };
+  const used = observations.map((obs) => ({
+    system: context.observationSystem(obs), prn: context.normalisePrn(obs.system, obs.prn), state: 'used',
+  }));
+  assert.deepEqual(JSON.parse(JSON.stringify(context.signalBreakdown(used))),
+    { L1: 3, L2: 3, L5: 3, Other: 0 });
+  context.latestByName.RANGE.crcValid = false;
+  assert.deepEqual(JSON.parse(JSON.stringify(context.signalBreakdown(used))),
+    { L1: 0, L2: 0, L5: 0, Other: 0 });
+});
+
+test('missing BESTSATS displays BESTPOS total without inventing per-satellite solution status', () => {
+  const context = satelliteContext();
+  context.latestByName.BESTPOS = { data: { satellitesUsed: 21, satellitesTracked: 29 } };
+  context.latestByName.RANGE = { data: { observations: [
+    { system: 'GPS', prn: 26, trackingStatus: '0' },
+  ] } };
+  context.renderSkyplot();
+  assert.equal(context.elements.get('sv-used').textContent, 21);
+  assert.equal(context.elements.get('sv-tracked').textContent, 1, 'tracking is derived from RANGE, not BESTPOS');
+  assert.equal(context.elements.get('sv-missing').textContent, '\u2014');
+  assert.equal(context.elements.get('sv-unhealthy').textContent, '\u2014');
+  assert.match(context.elements.get('sv-status-note').textContent, /unavailable.*BESTSATS/);
+  assert.equal(context.buildSatelliteList()[0].state, 'unknown', 'unknown usage is not labelled not used');
+  context.latestByName.BESTSATS = { format: 'binary', data: null };
+  assert.equal(context.satelliteUsageAvailable(), false);
+  context.latestByName.BESTSATS = { crcValid: false, data: { satellites: [] } };
+  assert.equal(context.satelliteUsageAvailable(), false);
+  context.latestByName.BESTPOS.crcValid = false;
+  context.renderSkyplot();
+  assert.equal(context.elements.get('sv-used').textContent, '\u2014', 'CRC-failed BESTPOS cannot supply a used count');
+  context.latestByName.BESTSATS = { data: { satellites: [] } };
+  context.latestByName.TRACKSTAT = { data: { observations: [] } };
+  context.renderSkyplot();
+  assert.equal(context.elements.get('sv-used').textContent, 0, 'a valid empty report is genuinely zero');
+  assert.equal(context.elements.get('sv-missing').textContent, 0);
+});
+
+test('manufacturer reference counts match per-constellation used, not-used and missing states', () => {
+  const context = satelliteContext();
+  const reference = {
+    GPS: { used: 10, notUsed: 0, missing: 0 },
+    GALILEO: { used: 6, notUsed: 2, missing: 0 },
+    BEIDOU: { used: 4, notUsed: 5, missing: 1 },
+    QZSS: { used: 1, notUsed: 1, missing: 1 },
+    NAVIC: { used: 0, notUsed: 0, missing: 2 },
+    SBAS: { used: 0, notUsed: 0, missing: 0 },
+  };
+  const satellites = [];
+  const observations = [];
+  for (const [system, counts] of Object.entries(reference)) {
+    const geometry = [];
+    let prn = system === 'QZSS' ? 194 : 1;
+    for (const [kind, count] of Object.entries(counts)) {
+      for (let index = 0; index < count; index++, prn++) {
+        satellites.push({ system, prn, status: kind === 'used' ? 'GOOD' : kind === 'missing' ? 'NA' : 'NOTUSED' });
+        geometry.push({ prn, elevation: 20, azimuth: 30 });
+        if (kind !== 'missing') observations.push({ system, prn, trackingStatus: '0' });
+      }
+    }
+    context.state.satvis[system] = { data: { visibilityValid: true, satellites: geometry } };
+  }
+  context.latestByName.RANGE = { data: { observations } };
+  context.latestByName.BESTSATS = { data: { satellites } };
+  context.latestByName.TRACKSTAT = { data: { cutoff: 5, observations: satellites.map((sat) => ({
+    system: sat.system, prn: sat.prn, trackingStatus: '1',
+  })) } };
+  context.renderSkyplot();
+  assert.equal(context.elements.get('sv-used').textContent, 21);
+  assert.equal(context.elements.get('sv-tracked').textContent, 29);
+  assert.equal(context.elements.get('sv-missing').textContent, 4);
+  assert.equal(context.elements.get('sky-count').textContent, '(33 plotted)');
+  for (const [system, counts] of Object.entries(reference)) {
+    const actual = context.legendCounts[system];
+    if (!actual) {
+      assert.equal(counts.used + counts.notUsed + counts.missing, 0);
+      continue;
+    }
+    assert.equal(actual.used, counts.used, `${system} used`);
+    assert.equal(actual.notUsed, counts.notUsed, `${system} not used`);
+    assert.equal(actual.missing, counts.missing, `${system} missing`);
+    assert.equal(actual.tracked, counts.used + counts.notUsed, `${system} tracked`);
+  }
+});
+
+test('serial and configured logging both explicitly request BESTSATS once per connection', () => {
+  for (const sendLogCommands of [false, true]) {
+    const writes = [];
+    const receiver = new ReceiverClient({
+      transport: 'serial', sendLogCommands,
+      logCommands: ['LOG BESTSATSA ONTIME 1', 'LOG TRACKSTATA ONTIME 1', 'LOG ITDETECTSTATUSA ONCHANGED', 'LOG RANGEA ONTIME 5'],
+    });
+    receiver.sendConfiguredCommands({ write: (command) => writes.push(command) });
+    assert.equal(writes.filter((command) => command === 'LOG BESTSATSA ONTIME 1\r\n').length, 1);
+    assert.equal(writes.filter((command) => command.startsWith('LOG TRACKSTAT')).length, 1);
+    assert.equal(writes.filter((command) => command === 'LOG ITDETECTSTATUSA ONTIME 1\r\n').length, 1);
+    assert.equal(writes.includes('LOG RANGEA ONTIME 5\r\n'), sendLogCommands);
+    assert(!writes.some((command) => command.includes('UNLOGALL')));
+  }
+});
+
+test('TRACKSTAT decodes assigned channels and counts unobserved satellites without counting idle channels', () => {
+  const fields = ['SOL_COMPUTED', 'SINGLE', '5', '5'];
+  const channel = (prn, system, state) => [
+    String(prn), '0', ((system << 16) | state).toString(16), '0', '0', '0', '0', '0', 'NA', '0',
+  ];
+  fields.push(...channel(9, 6, 1), ...channel(9, 6, 1), ...channel(0, 0, 0),
+    ...channel(10, 1, 0), ...channel(44, 4, 1));
+  const record = decode({ format: 'ascii', header: { messageName: 'TRACKSTAT' }, fields, crcValid: true });
+  assert.equal(record.data.observationCount, 5);
+  assert.equal(record.data.observations[0].system, 'NAVIC');
+  const context = satelliteContext();
+  context.latestByName.TRACKSTAT = record;
+  context.state.satvis.NAVIC = { data: { visibilityValid: true,
+    satellites: [{ prn: 9, elevation: 20, azimuth: 30 }] } };
+  context.state.satvis.BEIDOU = { data: { visibilityValid: true,
+    satellites: [{ prn: 44, elevation: 20, azimuth: 30 }] } };
+  const sats = context.buildSatelliteList();
+  assert.equal(sats.length, 2, 'duplicates, idle PRN zero and idle GLONASS channels are excluded');
+  assert(sats.every((sat) => sat.state === 'missing' && !sat.tracked));
+  context.renderSkyplot();
+  assert.equal(context.elements.get('sv-missing').textContent, 2);
+  context.latestByName.TRACKSTAT.data.cutoff = 25;
+  assert.equal(context.buildSatelliteList().filter((sat) => sat.state === 'missing').length, 0,
+    'assigned acquisition channels below the tracking cutoff are not missing');
+  context.latestByName.TRACKSTAT.crcValid = false;
+  assert(context.buildSatelliteList().every((sat) => sat.state === 'visible'));
+  assert.throws(() => decode({
+    format: 'ascii', header: { messageName: 'TRACKSTAT' }, fields: fields.slice(0, -1),
+  }), /incomplete channel data/);
+});
+
+test('last interference detected is seeded from restored history when newer', () => {
+  const context = vm.createContext({ state: { lastDetection: { at: 500, detection: {} } } });
+  load(context, 'function rememberHistoryDetection(', 'function lastDetectionSummary(');
+  context.rememberHistoryDetection([
+    { t: 1000, signal: 'GPSL2', count: 2, maxPower: -70, freq: 1227e6, detections: [
+      { freq: 1227e6, bandwidth: 1e6, power: -90, type: 'CW' },
+      { freq: 1228e6, bandwidth: 2e6, power: -70, type: 'WB' },
+    ] },
+    { t: 2000, signal: 'ALL', count: 0, detections: [] },
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.state.lastDetection)), {
+    at: 1000,
+    detection: { signalType: 'GPSL2', type: 'WB', powerDbm: -70, bandwidthHz: 2e6, centerFrequencyHz: 1228e6 },
+  });
+  context.state.lastDetection = { at: 5000, detection: {} };
+  context.rememberHistoryDetection([{ t: 1000, signal: 'GPSL2', count: 1, detections: [] }]);
+  assert.equal(context.state.lastDetection.at, 5000, 'a newer live detection is kept');
+});
+
+test('satellite view history stores tracked and in-view counts and renders a horizontal time plot', () => {
+  const context = vm.createContext({
+    MAX_INTERFERENCE_SAMPLES: 10, SOLUTION_HEARTBEAT_MS: 10000,
+    state: { satelliteViewHistory: [{ t: 1000, tracked: { GPS: 1 }, inView: { GPS: 2 } }] },
+    trackedSatelliteSummary: () => new Map([['GPS', { prns: new Set(['1', '2']) }]]),
+    satellitesInViewBySystem: () => ({ GPS: 2, GALILEO: 1 }),
+  });
+  load(context, 'function recordSatelliteView(', 'const SATELLITE_VIEW =');
+  context.recordSatelliteView({ name: 'RANGE', receivedAt: new Date(2000).toISOString() });
+  assert.deepEqual(JSON.parse(JSON.stringify(context.state.satelliteViewHistory[1])), {
+    t: 2000, tracked: { GPS: 2 }, inView: { GPS: 2, GALILEO: 1 },
+  });
+  context.recordSatelliteView({ name: 'RANGE', receivedAt: new Date(3000).toISOString() });
+  assert.equal(context.state.satelliteViewHistory.length, 2, 'unchanged counts are thinned');
+
+  const chart = { children: [], replaceChildren() { this.children = []; }, append(child) { this.children.push(child); } };
+  const plotContext = vm.createContext({
+    Date,
+    state: { satelliteViewHistory: [
+      { t: 1000, tracked: { GPS: 2, GALILEO: 1 }, inView: { GPS: 4, GALILEO: 3 } },
+      { t: 2000, tracked: { GPS: 3, GALILEO: 2 }, inView: { GPS: 4, GALILEO: 3 } },
+    ] },
+    $: () => chart,
+    timelineViewport: () => ({ start: 0, windowMs: 10000 }),
+    timelineAxis: (start, _window, width) => ({
+      start, dataEnd: 10000, plotWidth: width, x: (time) => time / 10000 * width,
+    }),
+    appendTimeAxis() {},
+    constellationColor: (system) => system === 'GPS' ? '#00f' : '#0f0',
+    svg: (tag, attributes, text) => ({ tag, attributes, text, children: [], append(child) { this.children.push(child); } }),
+  });
+  load(plotContext, 'const SATELLITE_VIEW =', 'function renderCounts(');
+  plotContext.sumCounts = (counts) => Object.values(counts || {}).reduce((sum, count) => sum + count, 0);
+  plotContext.renderSatelliteViewPlot();
+  const lines = chart.children.filter((element) => element.tag === 'polyline');
+  assert.equal(lines.length, 4, 'in-view total, two constellations and tracked total');
+  assert.match(lines[0].attributes.class, /satellite-view-in-view/);
+  assert.match(lines[3].attributes.class, /satellite-view-total-line/);
+  assert(!chart.children.some((element) => element.tag === 'text' && /GPS|GAL/.test(element.text)), 'legend is outside the SVG');
+  assert(lines.every((line) => line.attributes.points.includes(',')));
+  assert.equal(chart.children.filter((element) => element.tag === 'text' && element.text === '0').length, 1);
+});
+
+test('wall keeps an always-visible live reset beside the timeline heading', () => {
+  const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  const headingStart = html.indexOf('<h2 id="timeline-heading">');
+  const headingEnd = html.indexOf('</h2>', headingStart);
+  const reset = html.indexOf('id="timeline-live"', headingStart);
+  assert(headingStart >= 0 && reset > headingStart && reset < headingEnd);
+  assert(!html.slice(headingEnd, html.indexOf('</div>', headingEnd)).includes('id="timeline-live"'));
+});
+
+test('wall live reset clears a custom timeline pan and redraws the live view', () => {
+  const handlers = new Map();
+  let renders = 0;
+  const context = vm.createContext({
+    state: { timelineView: { end: 1000, windowMs: 60000 } },
+    zoomTimeline() {},
+    initTimePlotNavigation() {},
+    renderTimeline() { renders++; },
+    $: (id) => ({ addEventListener: (event, handler) => handlers.set(id, handler) }),
+  });
+  load(context, 'function initTimelineControls()', 'function initTimePlotNavigation(');
+  context.initTimelineControls();
+  handlers.get('timeline-live')();
+  assert.equal(context.state.timelineView, null);
+  assert.equal(renders, 1);
 });
 
 test('corrupt and unavailable preferences display errors without preventing startup', () => {

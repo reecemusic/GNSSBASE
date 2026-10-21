@@ -117,7 +117,7 @@ function describeReceiverStatus(word) {
 }
 
 // Channel tracking status bits 16-18 identify the constellation.
-const TRACKING_SYSTEMS = ['GPS', 'GLONASS', 'SBAS', 'GALILEO', 'BEIDOU', 'QZSS', 'RESERVED', 'OTHER'];
+const TRACKING_SYSTEMS = ['GPS', 'GLONASS', 'SBAS', 'GALILEO', 'BEIDOU', 'QZSS', 'NAVIC', 'OTHER'];
 
 function systemFromTrackingStatus(status) {
   const value = typeof status === 'number' ? status : parseInt(status, 16);
@@ -161,6 +161,30 @@ function decodeBestSatsAscii(fields) {
     });
   }
   return { satelliteCount: count, satellites };
+}
+
+function decodeTrackStatAscii(fields) {
+  const count = num(fields[3]);
+  if (!Number.isInteger(count) || count < 0 || fields.length !== 4 + count * 10) {
+    throw new Error('TRACKSTAT has an invalid channel count or incomplete channel data');
+  }
+  const observations = [];
+  for (let i = 0; i < count; i++) {
+    const offset = 4 + i * 10;
+    const trackingStatus = fields[offset + 2];
+    observations.push({
+      prn: num(fields[offset]),
+      gloFrequency: num(fields[offset + 1]),
+      trackingStatus,
+      system: systemFromTrackingStatus(trackingStatus),
+      carrierToNoise: num(fields[offset + 5]),
+      status: fields[offset + 8],
+    });
+  }
+  return {
+    solutionStatus: fields[0], positionType: fields[1], cutoff: num(fields[2]),
+    observationCount: count, observations,
+  };
 }
 
 const GPS_EPHEMERIS_FIELDS = [
@@ -305,6 +329,7 @@ const ASCII_DECODERS = {
   RANGE: decodeRangeAscii,
   SATVIS2: decodeSatVis2Ascii,
   BESTSATS: decodeBestSatsAscii,
+  TRACKSTAT: decodeTrackStatAscii,
   ITDETECTSTATUS: (fields, message) => interpretItDetectStatus(message),
 };
 

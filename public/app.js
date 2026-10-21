@@ -79,6 +79,8 @@ const state = {
   ephemeris: {},
   itBySignal: {},
   satvis: {},
+  satelliteViewHistory: [],
+  lastDetection: null,
   hiddenSystems: readHiddenPreference('hiddenSystems'),
   hiddenSignals: readHiddenPreference('hiddenSignals'),
   timeZone: readPreference('timeZone', 'Asia/Dubai', (zone) => {
@@ -396,8 +398,20 @@ function applySnapshot(snap) {
   pendingRaw.length = 0;
   pendingInterference.length = 0;
   Object.values(snap.latest || {}).forEach(applyRecord);
+  const latestSatelliteReport = Object.values(snap.latest || {})
+    .filter((record) => ['RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT'].includes(record.name)
+      && Number.isFinite(Date.parse(record.receivedAt)))
+    .sort((a, b) => Date.parse(b.receivedAt) - Date.parse(a.receivedAt))[0];
+  if (latestSatelliteReport) recordSatelliteView(latestSatelliteReport);
   $('it-log').replaceChildren();
   lastItReportHadDetections = false;
+  (snap.itdetectHistory || []).forEach((record) => {
+    rememberLastDetection(record);
+    if (record.receivedAt && (!latestByName.ITDETECTSTATUS
+      || Date.parse(record.receivedAt) > Date.parse(latestByName.ITDETECTSTATUS.receivedAt))) {
+      latestByName.ITDETECTSTATUS = record;
+    }
+  });
   (snap.itdetectHistory || []).slice(-MAX_IT_ROWS).forEach((record) => queueRecord(pendingInterference, record, MAX_IT_ROWS));
   $('raw-log').replaceChildren();
   (snap.rawLog || []).slice(-MAX_RAW_ROWS).forEach((record) => queueRecord(pendingRaw, record, MAX_RAW_ROWS));
@@ -410,7 +424,9 @@ function applyPayload(payload) {
   if (payload.ephemeris) state.ephemeris = payload.ephemeris;
   recordLiveHistory(payload.record);
   applyRecord(payload.record);
+  if (['RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT'].includes(payload.record.name)) recordSatelliteView(payload.record);
   if (payload.record.name === 'ITDETECTSTATUS') {
+    rememberLastDetection(payload.record);
     state.itSeen = state.counts.ITDETECTSTATUS || 0;
     queueRecord(pendingInterference, payload.record, MAX_IT_ROWS);
     timelineDirty = true;
@@ -472,7 +488,7 @@ function flushUpdates(force = false) {
   const relevant = {
     overview: countsDirty,
     position: dirtyRecords.has('BESTPOS') || dirtyRecords.has('BESTGNSSPOS'),
-    satellites: ['RANGE', 'SATVIS2', 'BESTSATS'].some((name) => dirtyRecords.has(name)),
+    satellites: ['RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT', 'BESTPOS'].some((name) => dirtyRecords.has(name)),
     ephemeris: ephemerisDirty,
     interference: timelineDirty || dirtyRecords.has('ITDETECTSTATUS') || pendingInterference.length,
     health: dirtyRecords.has('RXSTATUS') || dirtyRecords.has('VERSION'),
@@ -498,6 +514,7 @@ function applyRecord(record) {
   latestByName[record.name] = record;
   dirtyRecords.add(record.name);
   if (record.name === 'SATVIS2' && record.data) state.satvis[record.data.system] = record;
+  if (record.name === 'ITDETECTSTATUS') rememberLastDetection(record);
   if (record.name === 'VERSION') renderVersionSummary(record);
   registerFilterOption(record.name);
 }
@@ -766,6 +783,7 @@ async function loadHistory() {
     state.interferenceHistory = [...savedInterference, ...arrivedDuringRequest.filter((sample) =>
       !keys.has(`${sample.t}:${sample.signal}:${sample.count}:${sample.maxPower}`))];
     state.interferenceHistory.sort((a, b) => a.t - b.t);
+    rememberHistoryDetection(state.interferenceHistory);
     if (Array.isArray(data.solution)) {
       const savedSolution = data.solution.slice(-MAX_INTERFERENCE_SAMPLES)
         .map((sample) => solutionSample(sample, sample?.t)).filter(Boolean).sort((a, b) => a.t - b.t);
@@ -2317,16 +2335,10 @@ setInterval(() => {
 
 function renderSkyplot() {
   const satellites = buildSatelliteList();
+  const usageAvailable = satelliteUsageAvailable();
   const plot = $('skyplot');
   const fallback = $('sky-fallback');
 
-  if (!satellites.length) {
-    plot.classList.remove('ready');
-    fallback.hidden = false;
-    return;
-  }
-  fallback.hidden = true;
-  plot.classList.add('ready');
   plot.replaceChildren();
 
   for (const elevation of [0, 30, 60]) {
@@ -2347,7 +2359,7 @@ function renderSkyplot() {
     plot.append(svg('text', { x: position.x, y: position.y + 4, class: 'sky-compass' }, label));
   }
 
-  const counts = { used: 0, tracked: 0, visible: 0, missing: 0, unhealthy: 0 };
+  const counts = { used: 0, tracked: 0, unknown: 0, visible: 0, missing: 0, unhealthy: 0 };
   const perSystem = {};
   let plotted = 0;
 
@@ -2359,12 +2371,16 @@ function renderSkyplot() {
   }
 
   for (const sat of satellites) {
-    perSystem[sat.system] = perSystem[sat.system] || { visible: 0, used: 0 };
-    if (state.hiddenSystems.has(sat.system)) continue;
-
+    perSystem[sat.system] = perSystem[sat.system]
+      || { visible: 0, tracked: 0, used: 0, notUsed: 0, missing: 0, unhealthy: 0 };
     counts[sat.state]++;
-    perSystem[sat.system].visible++;
+    if (sat.inView) perSystem[sat.system].visible++;
+    if (sat.tracked) perSystem[sat.system].tracked++;
     if (sat.state === 'used') perSystem[sat.system].used++;
+    if (sat.state === 'tracked') perSystem[sat.system].notUsed++;
+    if (sat.state === 'missing') perSystem[sat.system].missing++;
+    if (sat.state === 'unhealthy') perSystem[sat.system].unhealthy++;
+    if (state.hiddenSystems.has(sat.system)) continue;
 
     if (sat.state === 'visible'
       || !Number.isFinite(sat.elevation) || !Number.isFinite(sat.azimuth) || sat.elevation < 0) continue;
@@ -2372,13 +2388,22 @@ function renderSkyplot() {
     plot.append(buildSatMarker(sat));
   }
 
-  $('sv-used').textContent = counts.used;
-  $('sv-tracked').textContent = counts.tracked;
-  $('sv-missing').textContent = counts.missing;
-  $('sv-unhealthy').textContent = counts.unhealthy;
+  const bestpos = latestByName.BESTPOS;
+  const solutionUsed = bestpos?.crcValid !== false ? bestpos?.data?.satellitesUsed : null;
+  $('sv-used').textContent = usageAvailable ? counts.used
+    : Number.isInteger(solutionUsed) && solutionUsed >= 0 ? solutionUsed : '\u2014';
+  $('sv-tracked').textContent = satellites.filter((sat) => sat.tracked).length;
+  $('sv-missing').textContent = satelliteTrackingAvailable() ? counts.missing : '\u2014';
+  $('sv-unhealthy').textContent = usageAvailable ? counts.unhealthy : '\u2014';
+  $('sv-status-note').textContent = usageAvailable
+    ? 'Usage: BESTSATS. Missing: visible assigned TRACKSTAT channels above the tracking cutoff without RANGE observations. In view: SATVIS2 above-horizon prediction, not a tracking count.'
+    : 'Per-satellite usage unavailable: waiting for BESTSATS. The used total, when available, comes from BESTPOS; tracked comes from RANGE.'
+      + (satelliteTrackingAvailable() ? ' Missing is derived from TRACKSTAT and SATVIS2.' : ' Missing status is unavailable without TRACKSTAT.');
   $('sv-missing').classList.toggle('alert', counts.missing > 0);
   $('sv-unhealthy').classList.toggle('alert', counts.unhealthy > 0);
   $('sky-count').textContent = `(${plotted} plotted)`;
+  fallback.hidden = plotted > 0;
+  plot.classList.toggle('ready', plotted > 0);
 
   renderSkyLegend(perSystem);
   renderSignalLegend(signalBreakdown(satellites));
@@ -2388,7 +2413,8 @@ function renderSkyplot() {
 const STATE_TEXT = {
   used: 'Used in solution',
   tracked: 'Tracked, not used',
-  visible: 'Above horizon, not tracked',
+  unknown: 'Tracked, usage unknown (no BESTSATS status)',
+  visible: 'Not tracked',
   missing: 'Missing observation',
   unhealthy: 'Unhealthy / excluded',
 };
@@ -2433,6 +2459,7 @@ function buildSatMarker(sat) {
   const style = {
     used: { fill: colour, stroke: 'none', label: '#12151a' },
     tracked: { fill: 'rgba(27,32,41,.9)', stroke: colour, label: colour },
+    unknown: { fill: 'rgba(27,32,41,.9)', stroke: colour, label: colour },
     visible: { fill: 'none', stroke: 'rgba(140,148,164,.7)', label: '#8c94a4' },
     missing: { fill: 'none', stroke: '#ffb02e', label: '#ffb02e' },
     unhealthy: { fill: 'none', stroke: '#ff5f56', label: '#ff5f56' },
@@ -2453,14 +2480,15 @@ function buildSatMarker(sat) {
   return group;
 }
 
-/** Merges SATVIS2 (sky geometry), RANGE (tracking) and BESTSATS (solution usage). */
+/** Merges geometry, measured satellites, assigned channels and solution usage. */
 function buildSatelliteList() {
   const byKey = new Map();
   const key = (system, prn) => `${system}:${normalisePrn(system, prn)}`;
 
   for (const [system, record] of Object.entries(state.satvis)) {
+    if (record.crcValid === false || record.data?.visibilityValid === false) continue;
     for (const sat of (record.data && record.data.satellites) || []) {
-      if (!isValidSkyPosition(sat.elevation, sat.azimuth)) continue;
+      if (normalisePrn(system, sat.prn) === null || !isValidSkyPosition(sat.elevation, sat.azimuth)) continue;
       byKey.set(key(system, sat.prn), {
         system,
         prn: String(normalisePrn(system, sat.prn)),
@@ -2468,6 +2496,8 @@ function buildSatelliteList() {
         azimuth: sat.azimuth,
         health: sat.health,
         carrierToNoise: null,
+        tracked: false,
+        inView: true,
         state: 'visible',
         detail: '',
       });
@@ -2475,26 +2505,50 @@ function buildSatelliteList() {
   }
 
   const range = latestByName.RANGE;
-  for (const obs of (range && range.data && range.data.observations) || []) {
-    if (!obs.system || obs.system === 'RESERVED') continue;
-    const id = key(obs.system, obs.prn);
+  for (const obs of (range?.crcValid !== false && range?.data?.observations) || []) {
+    const system = observationSystem(obs);
+    if (!system || system === 'OTHER' || normalisePrn(system, obs.prn) === null) continue;
+    const id = key(system, obs.prn);
     const entry = byKey.get(id) || {
-      system: obs.system, prn: String(normalisePrn(obs.system, obs.prn)),
+      system, prn: String(normalisePrn(system, obs.prn)),
       elevation: null, azimuth: null, health: '0', detail: '',
+      inView: false,
     };
     entry.carrierToNoise = Math.max(entry.carrierToNoise || 0, obs.carrierToNoise || 0) || null;
-    entry.state = 'tracked';
+    entry.state = 'unknown';
+    entry.tracked = true;
+    byKey.set(id, entry);
+  }
+
+  const trackstat = latestByName.TRACKSTAT;
+  for (const obs of (trackstat?.crcValid !== false && trackstat?.data?.observations) || []) {
+    const system = observationSystem(obs);
+    if (!system || system === 'OTHER' || normalisePrn(system, obs.prn) === null) continue;
+    const status = typeof obs.trackingStatus === 'number'
+      ? obs.trackingStatus : parseInt(obs.trackingStatus, 16);
+    if (!Number.isFinite(status) || (system === 'GLONASS' && (status & 0x1f) === 0)) continue;
+    const id = key(system, obs.prn);
+    const entry = byKey.get(id);
+    if (!entry) continue;
+    if (!entry.tracked) {
+      const cutoff = trackstat.data.cutoff;
+      if (!entry.inView || !Number.isFinite(cutoff) || entry.elevation < cutoff) continue;
+      entry.state = 'missing';
+      entry.detail = 'Assigned TRACKSTAT channel without a RANGE observation';
+    }
     byKey.set(id, entry);
   }
 
   const best = latestByName.BESTSATS;
-  for (const sat of (best && best.data && best.data.satellites) || []) {
+  for (const sat of (best?.crcValid !== false && best?.data?.satellites) || []) {
+    if (!sat.system || sat.system === 'OTHER' || normalisePrn(sat.system, sat.prn) === null) continue;
     const id = key(sat.system, sat.prn);
     const entry = byKey.get(id) || {
       system: sat.system, prn: String(normalisePrn(sat.system, sat.prn)),
       elevation: null, azimuth: null, health: '0', carrierToNoise: null,
+      tracked: false, inView: false,
     };
-    entry.state = bestSatState(sat.status);
+    entry.state = bestSatState(sat.status, entry.tracked);
     entry.detail = sat.status;
     byKey.set(id, entry);
   }
@@ -2502,17 +2556,30 @@ function buildSatelliteList() {
   return [...byKey.values()].sort((a, b) => a.system.localeCompare(b.system) || Number(a.prn) - Number(b.prn));
 }
 
-function bestSatState(status) {
+function bestSatState(status, tracked) {
   if (status === 'GOOD') return 'used';
   if (status === 'BADHEALTH') return 'unhealthy';
-  if (['NA', 'NOEPHEMERIS', 'LOSSOFLOCK'].includes(status)) return 'missing';
-  return 'tracked';
+  if (['NA', 'NOEPHEMERIS', 'LOSSOFLOCK'].includes(status) && !tracked) return 'missing';
+  return tracked ? 'tracked' : 'visible';
+}
+
+function satelliteUsageAvailable() {
+  const best = latestByName.BESTSATS;
+  return best?.crcValid !== false && Array.isArray(best?.data?.satellites);
+}
+
+function satelliteTrackingAvailable() {
+  const trackstat = latestByName.TRACKSTAT;
+  return trackstat?.crcValid !== false && Array.isArray(trackstat?.data?.observations);
 }
 
 /** RANGE reports GLONASS as slot + 37; SATVIS2 and BESTSATS use the slot number. */
 function normalisePrn(system, prn) {
-  const value = Number(prn);
-  if (!Number.isFinite(value)) return prn;
+  const text = String(prn ?? '').trim();
+  const match = text.match(system === 'GLONASS' ? /^(\d+)(?:[+-]\d+)?$/ : /^(\d+)$/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isSafeInteger(value) || value <= 0) return null;
   if (system === 'GLONASS' && value > 37) return value - 37;
   return value;
 }
@@ -2536,7 +2603,12 @@ function renderSkyLegend(perSystem) {
     const label = document.createElement('span');
     label.textContent = hidden
       ? `${system} — hidden`
-      : `${system} — ${perSystem[system].used} used / ${perSystem[system].visible}`;
+      : `${system} — ${perSystem[system].tracked} tracked / ${perSystem[system].visible} in view`
+        + (satelliteUsageAvailable()
+          ? ` · ${perSystem[system].used} used / ${perSystem[system].notUsed} not used`
+            + (perSystem[system].unhealthy ? ` / ${perSystem[system].unhealthy} unhealthy` : '')
+          : ' · usage unavailable')
+        + (satelliteTrackingAvailable() ? ` / ${perSystem[system].missing} missing` : ' / missing unavailable');
 
     button.append(dot, label);
     button.addEventListener('click', () => toggleSystem(system));
@@ -2568,10 +2640,12 @@ function signalBreakdown(satellites) {
   const range = latestByName.RANGE;
 
   for (const obs of (range && range.data && range.data.observations) || []) {
-    if (!obs.system || obs.system === 'RESERVED') continue;
-    const key = `${obs.system}:${normalisePrn(obs.system, obs.prn)}`;
+    if (range.crcValid === false) continue;
+    const system = observationSystem(obs);
+    if (!system || normalisePrn(system, obs.prn) === null) continue;
+    const key = `${system}:${normalisePrn(system, obs.prn)}`;
     if (!used.has(key)) continue;
-    const band = signalBand(obs.system, obs.trackingStatus);
+    const band = signalBand(system, obs.trackingStatus);
     counts[band].add(key);
   }
 
@@ -2584,7 +2658,7 @@ function renderSignalLegend(counts) {
   if (!Object.values(counts).some(Boolean)) {
     const li = document.createElement('li');
     li.className = 'muted';
-    li.textContent = 'No used RANGE signals yet.';
+    li.textContent = satelliteUsageAvailable() ? 'No used RANGE signals yet.' : 'Used signals unavailable without BESTSATS.';
     list.append(li);
     return;
   }
@@ -2606,12 +2680,12 @@ function signalBand(system, trackingStatus) {
   if (!Number.isFinite(value)) return 'Other';
   const code = (value >>> 21) & 0x1f;
   const bandsBySystem = {
-    GPS: { 0: 'L1', 1: 'L1', 5: 'L2', 9: 'L2', 14: 'L5', 16: 'L1', 17: 'L1' },
+    GPS: { 0: 'L1', 1: 'L1', 5: 'L2', 9: 'L2', 14: 'L5', 16: 'L1', 17: 'L2' },
     GLONASS: { 0: 'L1', 1: 'L2', 5: 'L2' },
-    SBAS: { 0: 'L1', 14: 'L5' },
+    SBAS: { 0: 'L1', 6: 'L5', 14: 'L5' },
     GALILEO: { 2: 'L1', 12: 'L5', 17: 'L5', 20: 'L5' },
-    BEIDOU: { 0: 'L1', 1: 'L5', 4: 'L1', 5: 'L5', 7: 'L5' },
-    QZSS: { 0: 'L1', 1: 'L1', 5: 'L2', 9: 'L2', 14: 'L5', 16: 'L1', 17: 'L1' },
+    BEIDOU: { 0: 'L1', 1: 'L5', 4: 'L1', 5: 'L5', 7: 'L1', 9: 'L5', 11: 'L5' },
+    QZSS: { 0: 'L1', 1: 'L1', 5: 'L2', 9: 'L2', 14: 'L5', 16: 'L1', 17: 'L2', 24: 'L1' },
     NAVIC: { 0: 'L5' },
   };
   return (bandsBySystem[system] && bandsBySystem[system][code]) || 'Other';
@@ -2626,7 +2700,7 @@ function renderSatelliteTable(satellites) {
     return;
   }
 
-  const order = { used: 0, tracked: 1, missing: 2, unhealthy: 3, visible: 4 };
+  const order = { used: 0, tracked: 1, unknown: 2, missing: 3, unhealthy: 4, visible: 5 };
   shown.sort((a, b) => order[a.state] - order[b.state] || (b.elevation || 0) - (a.elevation || 0));
 
   for (const sat of shown) {
@@ -2943,10 +3017,14 @@ function buildPowerMeter(powerDbm) {
 }
 
 function interferenceIsLive(record, now = Date.now()) {
-  const receivedAt = Date.parse(record?.receivedAt);
   return !connection.offline && connection.status?.connected === true
-    && record?.crcValid !== false && Boolean(record?.data)
-    && Number.isFinite(receivedAt) && now - receivedAt <= INTERFERENCE_STALE_MS;
+    && hasFreshInterferenceReport(record, now);
+}
+
+function hasFreshInterferenceReport(record, now = Date.now()) {
+  const receivedAt = Date.parse(record?.receivedAt);
+  return record?.crcValid !== false && Boolean(record?.data)
+    && Number.isFinite(receivedAt) && now - receivedAt < INTERFERENCE_STALE_MS;
 }
 
 function renderVerdict() {
@@ -2962,16 +3040,23 @@ function renderVerdict() {
   const verdict = $('it-verdict');
   const detail = $('it-detail');
 
-  $('it-freshness').textContent = `Last status update: ${age === null ? 'never' : `${Math.floor(age / 1000)} s ago`}`
-    + ` \u00b7 Status messages: ${state.counts.ITDETECTSTATUS || 0}`;
+  const messageCount = state.counts.ITDETECTSTATUS || 0;
+  const reportIsFresh = hasFreshInterferenceReport(record, now);
+  $('it-freshness').textContent = reportIsFresh
+    ? `Receiving Data \u00b7 ${messageCount} status messages`
+    : `${connection.offline ? 'Live server connection lost' : 'Device connection lost'}`
+      + ` \u00b7 Last message ${age === null ? 'never' : `${Math.floor(age / 1000)} s ago`}`
+      + ` \u00b7 ${messageCount} status messages`;
+  renderClock(now);
+  renderLastDetection();
+  renderDeviceSummary();
   $('it-bands-hit').textContent = jammedBands.length ? jammedBands.join(', ') : 'None';
   $('it-bands-hit').classList.toggle('alert', jammedBands.length > 0);
   $('it-count').textContent = totalDetections;
   $('it-count').classList.toggle('alert', totalDetections > 0);
 
-  if (!interferenceIsLive(record, now)
-    && (record || connection.offline || connection.status?.connected === false
-      || now - liveStatusStartedAt > INTERFERENCE_STALE_MS)) {
+  const lastReportAt = Number.isFinite(receivedAt) ? receivedAt : liveStatusStartedAt;
+  if (!reportIsFresh && now - lastReportAt >= INTERFERENCE_STALE_MS) {
     banner.className = 'banner device-error';
     verdict.textContent = connection.offline ? 'Live server connection lost'
       : connection.status?.connected === false ? 'Device disconnected' : 'Device status unavailable';
@@ -2980,6 +3065,7 @@ function renderVerdict() {
         : 'No fresh valid ITDETECTSTATUS report from the receiver. Interference status is unknown.';
     return;
   }
+
   if (!record) {
     banner.className = 'banner idle';
     verdict.textContent = 'Waiting for ITDETECTSTATUS';
@@ -2995,6 +3081,273 @@ function renderVerdict() {
   banner.className = 'banner clear';
   verdict.textContent = 'No interference detected';
   detail.textContent = 'Latest receiver status reports no active detections.';
+}
+
+function rememberLastDetection(record) {
+  if (record?.name !== 'ITDETECTSTATUS' || record.crcValid === false) return;
+  const detections = record.data?.detections;
+  if (!Array.isArray(detections) || detections.length === 0) return;
+  const at = Date.parse(record.receivedAt);
+  if (!Number.isFinite(at) || (state.lastDetection && at < state.lastDetection.at)) return;
+  const detection = detections.reduce((strongest, item) => {
+    if (!strongest) return item;
+    const power = Number.isFinite(item.powerDbm) ? item.powerDbm : -Infinity;
+    const strongestPower = Number.isFinite(strongest.powerDbm) ? strongest.powerDbm : -Infinity;
+    return power > strongestPower ? item : strongest;
+  }, null);
+  state.lastDetection = { at, detection };
+}
+
+/** Seeds the last detection from restored history samples when it is newer than the live one. */
+function rememberHistoryDetection(samples) {
+  let latest = null;
+  for (const sample of samples) {
+    if (sample?.count > 0 && Number.isFinite(sample.t) && (!latest || sample.t >= latest.t)) latest = sample;
+  }
+  if (!latest || (state.lastDetection && latest.t <= state.lastDetection.at)) return;
+  const power = (item) => (Number.isFinite(item?.power) ? item.power : -Infinity);
+  const strongest = (latest.detections || []).reduce((best, item) => (
+    !best || power(item) > power(best) ? item : best), null);
+  state.lastDetection = {
+    at: latest.t,
+    detection: {
+      signalType: latest.signal,
+      type: strongest?.type || '',
+      powerDbm: Number.isFinite(strongest?.power) ? strongest.power : latest.maxPower,
+      bandwidthHz: strongest?.bandwidth ?? null,
+      centerFrequencyHz: strongest?.freq ?? latest.freq ?? null,
+    },
+  };
+}
+
+function lastDetectionSummary(last) {
+  if (!last) return 'None yet';
+  const detection = last.detection;
+  const signal = detection.signalType || 'Unknown signal';
+  const metrics = [
+    Number.isFinite(detection.powerDbm) ? `${detection.powerDbm.toFixed(1)} dBm` : null,
+    Number.isFinite(detection.bandwidthHz) ? `${formatFrequency(detection.bandwidthHz)} BW` : null,
+    Number.isFinite(detection.centerFrequencyHz)
+      ? `Centre frequency ${formatFrequency(detection.centerFrequencyHz)}` : null,
+  ];
+  const details = [
+    detection.type ? `${signal} (${detectionTypeLabel(detection.type)})` : signal,
+    ...(metrics.some(Boolean)
+      ? metrics.map((text, index) => text || ['power unavailable', 'bandwidth unavailable', 'centre frequency unavailable'][index])
+      : ['power and frequency not reported by this detector']),
+  ];
+  return details.join(' \u00b7 ');
+}
+
+function renderLastDetection() {
+  const last = state.lastDetection;
+  $('it-last-detection').textContent = lastDetectionSummary(last);
+  $('it-last-detection-detail').textContent = last
+    ? `${formatTimestamp(last.at)} \u00b7 ${timeAgo(last.at)}` : 'No interference reported since startup';
+}
+
+function renderClock(now = Date.now()) {
+  const date = new Date(now);
+  $('it-clock').textContent = dateFormatter({
+    timeZone: state.timeZone, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).format(date);
+  $('it-clock-date').textContent = dateFormatter({
+    timeZone: state.timeZone, weekday: 'short', day: '2-digit', month: 'short', year: 'numeric',
+    timeZoneName: 'shortOffset',
+  }).format(date);
+}
+
+const SATELLITE_SYSTEMS = ['GPS', 'GLONASS', 'GALILEO', 'BEIDOU', 'QZSS', 'NAVIC'];
+
+// RANGE channel tracking status bits 21-25, listed in display order (NovAtel OEM7).
+const SIGNAL_NAMES = {
+  GPS: [[0, 'L1C/A'], [16, 'L1C'], [5, 'L2P'], [9, 'L2P(Y)'], [17, 'L2C'], [14, 'L5']],
+  GLONASS: [[0, 'L1C/A'], [1, 'L2C/A'], [5, 'L2P'], [6, 'L3']],
+  SBAS: [[0, 'L1C/A'], [6, 'L5']],
+  GALILEO: [[2, 'E1'], [12, 'E5a'], [17, 'E5b'], [20, 'E5 AltBOC'], [6, 'E6B'], [7, 'E6C']],
+  BEIDOU: [[0, 'B1I'], [4, 'B1I'], [7, 'B1C'], [1, 'B2I'], [5, 'B2I'], [9, 'B2a'], [11, 'B2b'], [2, 'B3I'], [6, 'B3I']],
+  QZSS: [[0, 'L1C/A'], [16, 'L1C'], [24, 'L1C/B'], [17, 'L2C'], [14, 'L5'], [27, 'L6P'], [28, 'L6D']],
+  NAVIC: [[0, 'L5']],
+};
+
+/** Older servers label NavIC (tracking system 6) as RESERVED. */
+function observationSystem(observation) {
+  return observation?.system === 'RESERVED' ? 'NAVIC' : observation?.system;
+}
+
+function signalCode(trackingStatus) {
+  const value = typeof trackingStatus === 'number' ? trackingStatus : parseInt(trackingStatus, 16);
+  return Number.isFinite(value) ? (value >>> 21) & 0x1f : null;
+}
+
+function signalName(system, trackingStatus) {
+  const code = signalCode(trackingStatus);
+  if (code === null) return 'Unknown';
+  const entry = (SIGNAL_NAMES[system] || []).find(([value]) => value === code);
+  return entry ? entry[1] : `Signal ${code}`;
+}
+
+function signalOrder(system, name) {
+  const index = (SIGNAL_NAMES[system] || []).findIndex(([, value]) => value === name);
+  return index < 0 ? Infinity : index;
+}
+
+/** Unique tracked satellites and per-signal satellite counts for each constellation from RANGE. */
+function trackedSatelliteSummary(range = latestByName.RANGE) {
+  const systems = new Map();
+  for (const observation of (range?.crcValid !== false && range?.data?.observations) || []) {
+    const system = observationSystem(observation);
+    if (!system || system === 'OTHER') continue;
+    if (normalisePrn(system, observation.prn) === null) continue;
+    const prn = String(normalisePrn(system, observation.prn));
+    if (!systems.has(system)) systems.set(system, { prns: new Set(), signals: new Map() });
+    const entry = systems.get(system);
+    entry.prns.add(prn);
+    const name = signalName(system, observation.trackingStatus);
+    if (!entry.signals.has(name)) entry.signals.set(name, new Set());
+    entry.signals.get(name).add(prn);
+  }
+  return systems;
+}
+
+function satellitesInViewBySystem() {
+  const counts = {};
+  for (const satellite of buildSatelliteList()) {
+    if (!satellite.inView) continue;
+    counts[satellite.system] = (counts[satellite.system] || 0) + 1;
+  }
+  return counts;
+}
+
+function sumCounts(counts) {
+  return Object.values(counts || {}).reduce((sum, count) => sum + count, 0);
+}
+
+function renderDeviceSummary() {
+  const tracked = trackedSatelliteSummary();
+  const inView = satellitesInViewBySystem();
+  const systems = [...new Set([...SATELLITE_SYSTEMS, ...tracked.keys(), ...Object.keys(inView)])]
+    .filter((system) => SATELLITE_SYSTEMS.includes(system) || tracked.has(system) || inView[system]);
+  const body = $('satellite-signal-rows');
+  body.replaceChildren();
+  let trackedTotal = 0;
+  let signalTotal = 0;
+  for (const system of systems) {
+    const entry = tracked.get(system);
+    const trackedCount = entry ? entry.prns.size : 0;
+    const inViewCount = inView[system] || 0;
+    trackedTotal += trackedCount;
+    const row = body.insertRow();
+    row.className = trackedCount ? '' : 'inactive';
+    const name = row.insertCell();
+    const key = document.createElement('i');
+    key.className = 'satellite-key';
+    key.style.background = constellationColor(system);
+    name.append(key, document.createTextNode(constellationLabel(system)));
+    cell(row, `${trackedCount} / ${inViewCount}`, 'satellite-counts');
+    const signals = entry ? [...entry.signals]
+      .sort(([a], [b]) => signalOrder(system, a) - signalOrder(system, b) || a.localeCompare(b)) : [];
+    signals.forEach(([, prns]) => { signalTotal += prns.size; });
+    cell(row, signals.length
+      ? signals.map(([signal, prns]) => `${signal} ${prns.size}`).join(' \u00b7 ')
+      : inViewCount ? 'Not tracked' : 'Not reported by receiver', 'satellite-signals');
+  }
+  const inViewTotal = sumCounts(inView);
+  $('satellite-total-counts').textContent = `${trackedTotal} / ${inViewTotal}`;
+  $('satellite-view-total').textContent = trackedTotal || inViewTotal
+    ? `${trackedTotal} tracked \u00b7 ${inViewTotal} in view \u00b7 ${signalTotal} signals`
+    : 'No satellite data';
+  renderSatelliteViewPlot();
+}
+
+function recordSatelliteView(record) {
+  if (!['RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT'].includes(record?.name)) return;
+  const t = Date.parse(record.receivedAt);
+  if (!Number.isFinite(t)) return;
+  const tracked = {};
+  for (const [system, entry] of trackedSatelliteSummary()) tracked[system] = entry.prns.size;
+  const inView = satellitesInViewBySystem();
+  const history = state.satelliteViewHistory;
+  const last = history[history.length - 1];
+  const unchanged = last && JSON.stringify([last.tracked, last.inView]) === JSON.stringify([tracked, inView]);
+  if (last && (t <= last.t || (unchanged && t - last.t < SOLUTION_HEARTBEAT_MS))) return;
+  history.push({ t, tracked, inView });
+  if (history.length > MAX_INTERFERENCE_SAMPLES) {
+    history.splice(0, history.length - MAX_INTERFERENCE_SAMPLES);
+  }
+}
+
+const SATELLITE_VIEW = { width: 900, height: 180, left: 44, right: 16, top: 22, bottom: 34 };
+
+function renderSatelliteViewPlot() {
+  const chart = $('satellite-view-chart');
+  chart.replaceChildren();
+  const { start, windowMs } = timelineViewport();
+  const plotWidth = SATELLITE_VIEW.width - SATELLITE_VIEW.left - SATELLITE_VIEW.right;
+  const axis = timelineAxis(start, windowMs, plotWidth);
+  const bottom = SATELLITE_VIEW.height - SATELLITE_VIEW.bottom;
+  const samples = state.satelliteViewHistory
+    .filter((sample) => sample.t >= axis.start && sample.t <= axis.dataEnd)
+    .sort((a, b) => a.t - b.t);
+  const systems = [...new Set(samples.flatMap((sample) => Object.keys(sample.tracked || {})))]
+    .sort((a, b) => a.localeCompare(b));
+  const peak = Math.max(0, ...samples.map((sample) => Math.max(sumCounts(sample.tracked), sumCounts(sample.inView))));
+  const maxCount = Math.max(8, Math.ceil(peak / 10) * 10);
+  const y = (count) => bottom - count / maxCount * (bottom - SATELLITE_VIEW.top);
+
+  for (const count of [0, maxCount / 2, maxCount]) {
+    const gridY = y(count);
+    chart.append(svg('line', {
+      x1: SATELLITE_VIEW.left, x2: SATELLITE_VIEW.width - SATELLITE_VIEW.right,
+      y1: gridY, y2: gridY, class: 'tl-grid',
+    }));
+    chart.append(svg('text', { x: SATELLITE_VIEW.left - 8, y: gridY + 4, class: 'tl-axis', style: 'text-anchor:end' }, String(count)));
+  }
+
+  const drawSeries = (value, attributes) => {
+    let segment = [];
+    let previousTime = null;
+    const flush = () => {
+      if (segment.length > 1) {
+        chart.append(svg('polyline', { points: segment.join(' '), fill: 'none', ...attributes }));
+      }
+      segment = [];
+    };
+    for (const sample of samples) {
+      if (previousTime !== null && sample.t - previousTime > 30000) flush();
+      segment.push(`${(SATELLITE_VIEW.left + axis.x(sample.t)).toFixed(1)},${y(value(sample)).toFixed(1)}`);
+      previousTime = sample.t;
+    }
+    flush();
+  };
+
+  if (!samples.length) {
+    chart.append(svg('text', {
+      x: SATELLITE_VIEW.left + plotWidth / 2, y: (SATELLITE_VIEW.top + bottom) / 2,
+      class: 'tl-axis', style: 'text-anchor:middle',
+    }, 'Waiting for satellite reports'));
+  } else {
+    drawSeries((sample) => sumCounts(sample.inView), { class: 'satellite-view-line satellite-view-in-view' });
+    for (const system of systems) {
+      drawSeries((sample) => sample.tracked?.[system] || 0,
+        { stroke: constellationColor(system), class: 'satellite-view-line' });
+    }
+    drawSeries((sample) => sumCounts(sample.tracked), { class: 'satellite-view-line satellite-view-total-line' });
+  }
+  appendTimeAxis(chart, axis, {
+    left: SATELLITE_VIEW.left,
+    top: SATELLITE_VIEW.top,
+    bottom,
+    labelY: SATELLITE_VIEW.height - 16,
+    nowLabelY: SATELLITE_VIEW.top - 8,
+    gridClass: 'tl-grid',
+    labelClass: 'tl-axis',
+  });
+}
+
+function constellationLabel(system) {
+  return ({ GALILEO: 'Galileo', BEIDOU: 'BeiDou', GLONASS: 'GLONASS', NAVIC: 'NavIC', QZSS: 'QZSS', SBAS: 'SBAS' })[system]
+    || system;
 }
 
 function renderCounts() {
