@@ -10,6 +10,19 @@ const { History } = require('../src/history');
 const browserCode = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
 const serverCode = fs.readFileSync(path.join(__dirname, '../src/server.js'), 'utf8');
 
+test('live and archive frequency interference overlays share an opaque red fill and contrasting outline', () => {
+  const css = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+  const detection = css.match(/\.spectrum-detection\s*\{([^}]+)\}/)?.[1];
+  const archive = css.match(/\.spectrum-detection\.archive\s*\{([^}]+)\}/)?.[1];
+  const swatch = css.match(/\.spectrum-key-item \.detection-swatch\s*\{([^}]+)\}/)?.[1];
+  assert.match(detection, /fill:\s*#ff2020;/);
+  assert.match(detection, /stroke:\s*#fff;/);
+  assert.match(detection, /vector-effect:\s*non-scaling-stroke;/);
+  assert.match(archive, /stroke-dasharray:\s*2 1;/);
+  assert.doesNotMatch(archive, /(?:fill|stroke|opacity)\s*:/, 'archive must retain the same high-contrast colours');
+  assert.match(swatch, /background:\s*#ff2020;/);
+});
+
 test('profile-managed TCP connections request usage and interference reports every second on each connection', () => {
   const { EventEmitter } = require('node:events');
   const writes = [];
@@ -656,6 +669,41 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
   assert(!l5Chart.children.some((child) => child.attributes.class === 'spectrum-centre-line'));
   context.renderSpectrumPlots(1040000, now, 20000);
   assert(!l5Chart.children.some((child) => child.attributes.class === 'spectrum-detection'));
+
+  const hits = Array.from({ length: 501 }, (_, index) => ({
+    t: 1000000 + index * 120, signal: 'L5', count: 1,
+    detections: [{ freq: 1176.45e6, bandwidth: 20.46e6, power: -85 }],
+  }));
+  context.state.interferenceHistory = hits;
+  context.state.archive = { shown: true, data: { samples: hits } };
+  context.renderSpectrumPlots(1000000, now, 60000);
+  for (const className of ['spectrum-detection', 'spectrum-detection archive']) {
+    const markers = l5Chart.children.filter((child) => child.attributes.class === className);
+    assert.equal(markers.length, 501, 'Render the whole window, not just the latest 400 hits');
+    assert.match(markers[0].children[0].textContent, /t1000000/);
+    assert.match(markers.at(-1).children[0].textContent, /t1060000/);
+  }
+  assert.doesNotMatch(sections[2].children[0].children[0].textContent, /latest|showing/);
+});
+
+test('frequency markers group only matching pixel-level detections and preserve coverage and peak power', () => {
+  const context = vm.createContext({});
+  loadFunctions(browserCode, 'function spectrumMarkers(', 'function renderSpectrumPlots(', context);
+  const hit = (t, power, freq = 1176.45e6, bandwidth = 20.46e6, signal = 'L5') => ({
+    sample: { t, signal }, detection: { freq, bandwidth, power },
+  });
+  const hits = [hit(100, -100), hit(101, -80), hit(99, null),
+    hit(100, -90, 1207.14e6), hit(100, -90, 1176.45e6, 1e6),
+    hit(100, -90, 1176.45e6, 20.46e6, 'E5a'), hit(1000, -70)];
+  const markers = context.spectrumMarkers(hits, (t) => t / 100);
+  assert.equal(markers.length, 5);
+  assert.equal(markers[0].count, 3);
+  assert.equal(markers[0].start, 99);
+  assert.equal(markers[0].end, 101);
+  assert.equal(markers[0].detection.power, -80);
+  assert.equal(markers[0].sample.t, 101);
+  assert.equal(context.spectrumMarkers(hits, (t) => t).length, 7, 'Zoom separates distinct times');
+  assert.equal(context.spectrumMarkers([], (t) => t).length, 0);
 });
 
 test('linked plot navigation clamps history and zoom and handles drag cancellation', () => {

@@ -174,9 +174,13 @@ visible signal allocation's centre frequency; coincident centres alternate
 signal colours along the line. Hover a guide for its signal name and frequency.
 For frequency-range allocations (GLONASS and BeiDou B3), the guide marks the
 midpoint of the displayed range, not individual GLONASS FDMA channels.
-Narrow red vertical markers show each
+Opaque bright-red vertical markers with white outlines show each
 interference detection's center frequency and bandwidth at its report time
-(hover for details). The grouped plots are titled **L1 / E1 / B1 / G1**,
+(hover for details). All detections in the visible time window are represented,
+without a latest-only cutoff. Matching signal, frequency and bandwidth detections
+within the same horizontal pixel share a marker; its tooltip includes the count,
+time range and strongest detection. Zooming in separates these markers.
+The grouped plots are titled **L1 / E1 / B1 / G1**,
 **L2 / G2 / B3**, and **L5 / E5 / B2**.
 
 The **View** dropdown jumps straight to a time range that follows live time: the
@@ -323,7 +327,7 @@ Safeguards keep the NAS, server and browser responsive:
   the panel. **Cancel** stops reading and keeps what was already loaded; **Unload** frees it.
 
 Archive data appears as faint green status bars where reports were received (clear unless
-marked), hollow power markers joined by dashed lines, and dashed amber frequency markers.
+marked), hollow power markers joined by dashed lines, and bright-red frequency markers with dashed white outlines.
 Live data is drawn on top in the usual style. After loading, the plots show the whole
 range while following live time (**View: Whole archive**); zoom and pan work as usual, and **⟳ Live** returns
 to the live window. Untick **Show on plots** to hide it without unloading.

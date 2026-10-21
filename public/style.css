@@ -446,7 +446,7 @@ select {
 .spectrum-key-item[aria-pressed="false"] { opacity: .5; text-decoration: line-through; border-style: dashed; }
 .spectrum-key-item:focus-visible { outline: 2px solid var(--signal-color); outline-offset: 2px; }
 .spectrum-key-item i { width: .8rem; height: .8rem; border-radius: 2px; background: var(--signal-color); }
-.spectrum-key-item .detection-swatch { background: rgba(255, 95, 86, .35); border: 1px solid var(--bad); }
+.spectrum-key-item .detection-swatch { background: #ff2020; border: 1px solid #fff; }
 .spectrum-chart { min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: .55rem 0 .25rem; }
 .spectrum-chart h3, .spectrum-key { margin-left: .65rem; margin-right: .65rem; }
 .spectrum-chart h3 { display: flex; align-items: baseline; justify-content: space-between; gap: .75rem; margin: 0; color: var(--text); font-size: .95rem; font-weight: 600; }
@@ -459,7 +459,7 @@ select {
 .spectrum-signal { opacity: .7; }
 .spectrum-allocation-outline { stroke-width: 1; stroke-dasharray: 4 4; pointer-events: none; }
 .spectrum-centre-line { stroke-width: 2; vector-effect: non-scaling-stroke; }
-.spectrum-detection { fill: #ff5f56; stroke: #14171d; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.spectrum-detection { fill: #ff2020; stroke: #fff; stroke-width: 1; vector-effect: non-scaling-stroke; }
 
 .scale { display: flex; gap: .9rem; margin-left: auto; font-size: .85rem; text-transform: none; letter-spacing: 0; color: var(--muted); flex-wrap: wrap; }
 .scale-item { display: flex; align-items: center; gap: .3rem; }
@@ -508,7 +508,7 @@ select {
 .tl-archive-status { opacity: .75; }
 .tl-archive-line { stroke-width: 1.25; stroke-dasharray: 4 3; opacity: .8; }
 .tl-archive-point { fill: var(--bg); stroke-width: 1.5; }
-.spectrum-detection.archive { fill: rgba(255, 176, 46, .25); stroke: #ffb02e; stroke-dasharray: 2 1; }
+.spectrum-detection.archive { stroke-dasharray: 2 1; }
 
 .band-stats { margin-top: .55rem; font-size: .72rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .45rem; }
 .band-stats.has-hits { color: var(--warn); }

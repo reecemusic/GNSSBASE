@@ -1660,6 +1660,27 @@ function spectrumAllocation([label, system, centerOrStart, widthOrEnd]) {
   };
 }
 
+function spectrumMarkers(hits, xFor) {
+  const markers = new Map();
+  for (const { sample, detection } of hits) {
+    const key = JSON.stringify([Math.round(xFor(sample.t)), sample.signal, detection.freq, detection.bandwidth]);
+    const existing = markers.get(key);
+    if (!existing) {
+      markers.set(key, { sample, detection, count: 1, start: sample.t, end: sample.t });
+      continue;
+    }
+    existing.count++;
+    existing.start = Math.min(existing.start, sample.t);
+    existing.end = Math.max(existing.end, sample.t);
+    if (Number.isFinite(detection.power)
+      && (!Number.isFinite(existing.detection.power) || detection.power > existing.detection.power)) {
+      existing.sample = sample;
+      existing.detection = detection;
+    }
+  }
+  return [...markers.values()];
+}
+
 function renderSpectrumPlots(start, end, windowMs) {
   const container = $('spectrum-plots');
   const availableWidth = Math.min(1920, Math.max(360, Math.round(container.getBoundingClientRect().width) || 900));
@@ -1789,20 +1810,18 @@ function renderSpectrumPlots(start, end, windowMs) {
     };
     const plotHits = hitsIn(historyHits);
     const archivePlotHits = hitsIn(archiveHits);
-    const visibleHits = plotHits.slice(-400);
-    const visibleArchiveHits = archivePlotHits.slice(-400);
+    const visibleHits = spectrumMarkers(plotHits, xFor);
+    const visibleArchiveHits = spectrumMarkers(archivePlotHits, xFor);
     hitSummary.textContent = plotHits.length ? `${plotHits.length} hit${plotHits.length === 1 ? '' : 's'}` : 'No frequency hits';
-    if (plotHits.length > visibleHits.length) hitSummary.textContent += ` · showing latest ${visibleHits.length}`;
     if (archivePlotHits.length) {
-      hitSummary.textContent += ` · ${archivePlotHits.length} archive`
-        + (archivePlotHits.length > visibleArchiveHits.length ? ` (latest ${visibleArchiveHits.length} shown)` : '');
+      hitSummary.textContent += ` · ${archivePlotHits.length} archive`;
     }
 
     const hitMarkers = [
       ...visibleArchiveHits.map((hit) => ({ ...hit, archive: true })),
       ...visibleHits.map((hit) => ({ ...hit, archive: false })),
     ];
-    for (const { sample, detection, archive } of hitMarkers) {
+    for (const { sample, detection, archive, count, start: firstTime, end: lastTime } of hitMarkers) {
       const centerMHz = detection.freq / 1e6;
       const halfBandwidthMHz = Number.isFinite(detection.bandwidth) && detection.bandwidth > 0
         ? detection.bandwidth / 2e6
@@ -1820,7 +1839,9 @@ function renderSpectrumPlots(start, end, windowMs) {
       const title = svg('title', {}, `${archive ? 'Archive ' : ''}${sample.signal}: ${centerMHz.toFixed(3)} MHz`
         + (Number.isFinite(detection.bandwidth) ? `, ${(detection.bandwidth / 1e6).toFixed(3)} MHz bandwidth` : '')
         + (Number.isFinite(detection.power) ? `, ${detection.power.toFixed(1)} dBm` : '')
-        + `, ${formatTimestamp(sample.t, true)}`);
+        + `, ${formatTimestamp(sample.t, true)}`
+        + (count > 1 ? `; ${count} detections, ${formatTimestamp(firstTime, true)}`
+          + ` - ${formatTimestamp(lastTime, true)} (strongest shown)` : ''));
       marker.append(title);
       svgChart.append(marker);
     }
