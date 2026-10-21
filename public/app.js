@@ -829,8 +829,9 @@ function pruneClientHistory() {
 }
 
 function recordLiveHistory(record) {
+  if (record.crcValid === false) return;
   const now = Date.now();
-  if (record.name === 'SATVIS2' && record.data) {
+  if (record.name === 'SATVIS2' && record.data && record.data.visibilityValid !== false) {
     for (const sat of record.data.satellites || []) {
       if (!isValidSkyPosition(sat.elevation, sat.azimuth)) continue;
       const key = `${record.data.system}:${sat.prn}`;

@@ -41,7 +41,10 @@ test('profile-managed TCP connections request usage and interference reports eve
 });
 
 function loadFunctions(code, start, end, context) {
-  vm.runInContext(code.slice(code.indexOf(start), code.indexOf(end)), context);
+  const first = code.indexOf(start);
+  const last = code.indexOf(end, first + start.length);
+  assert(first >= 0 && last > first, `Missing source boundary: ${start}`);
+  vm.runInContext(code.slice(first, last), context);
 }
 
 test('receiver phases track connecting, connected, retrying and manual disconnect', async () => {
@@ -302,45 +305,39 @@ test('timeline displacement is linear in dBm, bounded, and excludes unknown powe
   assert(Math.abs(context.timelinePowerY(-100, 1, 120) - medium - 120) < 1e-9);
 });
 
-test('timeline status bar separates clear, weak, moderate and strong reports', () => {
+test('timeline power colours distinguish weak, moderate, strong and unknown measurements', () => {
   const context = vm.createContext({});
-  loadFunctions(browserCode, 'function timelineStatus(', 'function timelineMarkers(', context);
-  assert.equal(context.timelineStatus({ count: 0, maxPower: null }).className, 'tl-status-clear');
-  assert.equal(context.timelineStatus({ count: 1, maxPower: -115 }).className, 'tl-status-weak');
-  assert.equal(context.timelineStatus({ count: 1, maxPower: -100 }).className, 'tl-status-moderate');
-  assert.equal(context.timelineStatus({ count: 1, maxPower: -90 }).className, 'tl-status-strong');
-  assert.equal(context.timelineStatus({ count: 1, maxPower: null }).className, 'tl-status-unknown');
-  assert.equal(context.timelineStatus({ count: 1, maxPower: -95 }).className, 'tl-status-moderate');
-  assert.equal(context.timelineStatus({ count: 1, maxPower: -110 }).className, 'tl-status-weak');
-  assert.equal(context.timelineStatus({ count: 0, maxPower: -80 }).label, 'Clear report');
-  assert.equal(context.timelineStatus({ count: 1, maxPower: null }).label, 'Power unknown');
+  loadFunctions(browserCode, 'function powerColour(', 'function formatWindow(', context);
+  for (const [power, colour] of [
+    [-115, '#ffd98a'], [-110, '#ffd98a'], [-100, '#ffb02e'], [-95, '#ffb02e'],
+    [-90, '#ff5f56'], [null, '#ffb02e'], [NaN, '#ffb02e'],
+  ]) assert.equal(context.powerColour(power), colour);
 });
 
-test('power lines join detections but break at clear, unknown and missing reports', () => {
+test('dense power chart bounds rendered points while preserving the strongest measurement per pixel', () => {
+  const now = 100000;
+  const chart = {
+    children: [], append(child) { this.children.push(child); },
+    replaceChildren() { this.children = []; }, setAttribute() {},
+    getBoundingClientRect: () => ({ width: 900 }),
+  };
   const context = vm.createContext({
-    TIMELINE: { top: 12, left: 120, minPower: -130, maxPower: -70 },
-    classifyBand: () => 'L1',
+    Date: class extends Date { static now() { return now; } },
+    state: { windowMinutes: 1, timelineView: { end: now, windowMs: 10000 },
+      interferenceHistory: Array.from({ length: 10000 }, (_, index) => ({
+        t: now - 10000 + index, signal: 'L1', count: 1, maxPower: index % 2 ? -80 : -110,
+      })),
+    },
+    $: () => chart, classifyBand: (signal) => signal, renderSpectrumPlots() {},
+    utcLabel: String, formatTimestamp: String,
+    svg: (tag, attributes, text) => ({ tag, attributes, text, append() {} }),
   });
-  loadFunctions(browserCode, 'function timelinePowerY(', 'function renderTimeline(', context);
-  const sample = (t, count = 1, maxPower = -100) => ({ t, count, maxPower, signal: 'L1' });
-  const reports = [sample(0), sample(1000, 1, -90), sample(2000, 0), sample(3000),
-    sample(4000, 1, null), sample(5000), sample(25000)];
-  const markers = context.timelineMarkers(reports, ['L1'], 0, 30000, 300);
-  const paths = context.timelineLinePaths(markers, 120);
-  assert.equal(paths.length, 2);
-  const moderatePath = paths.find((path) => path.className === 'tl-status-moderate');
-  const strongPath = paths.find((path) => path.className === 'tl-status-strong');
-  assert.equal((moderatePath.d.match(/M/g) || []).length, 4);
-  assert.equal((moderatePath.d.match(/L/g) || []).length, 0);
-  assert.equal((strongPath.d.match(/M/g) || []).length, 1);
-  assert.equal((strongPath.d.match(/L/g) || []).length, 1);
-  const dense = Array.from({ length: 10000 }, (_, index) => sample(index, 1, index % 2 ? -80 : -110));
-  const bounded = context.timelineMarkers(dense, ['L1'], 0, 10000, 100);
-  assert.equal(bounded.size, 100);
-  assert([...bounded.values()].every((marker) => marker.sample.maxPower === -80));
-  const subpixelGap = [sample(0), sample(10, 0), sample(20), sample(1000)];
-  const gapPaths = context.timelineLinePaths(context.timelineMarkers(subpixelGap, ['L1'], 0, 10000, 100), 120);
-  assert.equal((gapPaths.find((path) => path.className === 'tl-status-moderate').d.match(/M/g) || []).length, 2);
+  loadFunctions(browserCode, 'const TIMELINE =', 'const SPECTRUM_PLOTS =', context);
+  loadFunctions(browserCode, 'function powerColour(', 'function formatWindow(', context);
+  context.renderTimeline();
+  const points = chart.children.filter((child) => child.tag === 'circle');
+  assert(points.length > 100 && points.length <= 661, 'bounded by the 660-unit plot width');
+  assert(points.every((point) => point.attributes.fill === '#ff5f56'));
 });
 
 test('timeline places band names and frequency coverage in the left axis gutter', () => {
@@ -384,25 +381,28 @@ test('timeline places band names and frequency coverage in the left axis gutter'
 });
 
 test('timeline zoom and pan stay within retained history and can follow live time', () => {
-  const context = vm.createContext({ state: { windowMinutes: 60 }, renderTimeline() {} });
+  const now = 10000000;
+  const context = vm.createContext({
+    Date: class extends Date { static now() { return now; } },
+    state: { windowMinutes: 60 }, renderTimeline() {},
+  });
   loadFunctions(browserCode, 'function timelineViewport(', 'function initTimelineControls(', context);
-  const now = Date.now();
   assert.equal(context.timelineViewport(now).windowMs, 3600000);
-  context.setTimelineViewport(60000, now - 120000, now);
+  context.setTimelineView(now - 120000, 60000);
   assert.equal(context.timelineViewport(now).end, now - 120000);
-  context.setTimelineViewport(1, now + 10000, now);
+  context.setTimelineView(now + 10000, 1);
   assert.equal(context.timelineViewport(now).windowMs, 10000);
   assert.equal(context.timelineViewport(now).end, now);
-  context.setTimelineViewport(60000, now - 7200000, now);
+  context.setTimelineView(now - 7200000, 60000);
   assert.equal(context.timelineViewport(now).start, now - 3600000);
-  context.setTimelineViewport(60000, null, now);
+  context.state.timelineView = { windowMs: 60000, follow: true };
   assert.equal(context.timelineViewport(now + 1000).end, now + 1000);
   context.state.timelineView = null;
   context.zoomTimeline(0.5);
   assert.equal(context.state.timelineView.windowMs, 1800000);
 });
 
-test('timeline controls support wheel zoom, dragging, cursor inspection and live reset', () => {
+test('timeline controls support wheel zoom, dragging, selection mode and live reset', () => {
   const elements = new Map();
   const element = () => ({
     handlers: {}, children: [], style: {}, attributes: {}, textContent: '',
@@ -414,6 +414,7 @@ test('timeline controls support wheel zoom, dragging, cursor inspection and live
     getBoundingClientRect: () => ({ left: 0, top: 0, width: 900, height: 488 }),
     viewBox: { baseVal: { width: 900, height: 488 } },
     setPointerCapture() {},
+    hasPointerCapture() { return false; },
   });
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, element());
@@ -428,6 +429,7 @@ test('timeline controls support wheel zoom, dragging, cursor inspection and live
     svg: (tag, attrs, text) => Object.assign(element(), { tag, attributes: attrs, textContent: text }),
     powerColour: () => '#ff5f56',
     formatWindow: (minutes) => `${minutes} min`,
+    selectTimePlotPoint: (_chart, x, y) => { context.selectedPoint = { x, y }; },
   });
   loadFunctions(browserCode, 'const TIMELINE =', 'function timelineViewport(', context);
   loadFunctions(browserCode, 'function timelineViewport(', 'const SPECTRUM_PLOTS =', context);
@@ -447,18 +449,16 @@ test('timeline controls support wheel zoom, dragging, cursor inspection and live
     assert(labels.includes(range));
   }
   assert.equal(chart.children.filter((child) => child.attributes.class === 'tl-band-name'
-    && child.attributes.x === 8).length, 3);
+    && child.attributes.x === 8).length, 5, 'three interference and two solution rows');
   assert.equal(labels.filter((label) => label === 'Power (dBm)').length, 3);
-  assert.equal(labels.filter((label) => label === 'Status').length, 3);
+  assert.equal(labels.filter((label) => label === 'Status').length, 6, 'status labels appear on both sides of each interference row');
   assert.equal(labels.filter((label) => label.includes('Interference status')).length, 0);
   for (const label of ['-130', '-110', '-90', '-70']) {
     assert(labels.includes(label));
   }
-  assert.equal(chart.children.filter((child) => child.attributes.class === 'tl-status-lane').length, 3);
-  const powerPoint = chart.children.find((child) => child.attributes.class === 'tl-status-strong tl-power-point');
-  const statusPoint = chart.children.find((child) => child.attributes.class === 'tl-status-strong tl-status-marker');
-  const powerTrace = chart.children.find((child) => child.tag === 'path');
-  assert.equal(powerTrace.attributes.class, 'tl-status-strong tl-power-line');
+  const powerPoint = chart.children.find((child) => child.tag === 'circle');
+  const statusPoint = chart.children.find((child) => child.tag === 'rect' && child.attributes.height === 18);
+  assert.equal(powerPoint.attributes.fill, '#ff5f56');
   assert(powerPoint.attributes.cy < statusPoint.attributes.y);
   get('timeline-zoom-in').handlers.click();
   assert.equal(context.state.timelineView.windowMs, 1800000);
@@ -469,45 +469,15 @@ test('timeline controls support wheel zoom, dragging, cursor inspection and live
   const beforeDrag = context.state.timelineView.end;
   chart.handlers.pointerdown({ button: 0, pointerId: 1, clientX: 200, clientY: 50 });
   chart.handlers.pointermove({ pointerId: 1, clientX: 300, clientY: 50 });
-  chart.handlers.pointerup({});
+  chart.handlers.pointerup({ pointerId: 1 });
   assert(context.state.timelineView.end < beforeDrag);
   get('timeline-live').handlers.click();
   assert.equal(context.state.timelineView, null);
-  get('timeline-cursor').handlers.click();
-  assert.equal(get('timeline-cursor').attributes['aria-pressed'], 'true');
-  const sample = context.state.interferenceHistory[0];
-  const view = context.timelineViewport();
-  const x = 168 + (sample.t - view.start) / view.windowMs * 716;
-  chart.handlers.click({ clientX: x, clientY: 60 });
-  assert.equal(context.state.timelineSelection.sample.maxPower, -88.25);
-  assert.match(get('timeline-inspection').textContent, /-88.25 dBm/);
-  assert.match(get('timeline-inspection').textContent, /GMT\+4/);
-  assert(chart.children.some((child) => child.attributes.class === 'tl-cursor-line'));
-  chart.handlers.click({ clientX: x, clientY: 202 });
-  assert.equal(context.state.timelineSelection.sample.maxPower, -88.25);
-  assert.equal(context.timelineStatusY(1, 180) - context.timelineStatusY(0, 180), 180);
-  assert(context.timelineStatusY(0, 180) > context.timelinePowerY(-130, 0, 180));
-  assert(context.timelineStatusY(0, 180) < 32 + 180 - 12);
-  for (const [count, maxPower, expected] of [
-    [1, null, /Power unknown/], [0, null, /Clear report \(no measured power\)/],
-  ]) {
-    context.state.interferenceHistory[0] = { ...sample, count, maxPower };
-    context.renderTimeline();
-    chart.handlers.click({ clientX: x, clientY: 60 });
-    assert.match(get('timeline-inspection').textContent, expected);
-    assert(!get('timeline-inspection').textContent.includes('null dBm'));
-  }
-  context.state.interferenceHistory[0] = sample;
-  context.renderTimeline();
-  chart.handlers.click({ clientX: x, clientY: 60 });
-  chart.handlers.click({ clientX: 100, clientY: 60 });
-  assert.match(get('timeline-inspection').textContent, /No report near this position/);
-  context.state.timeZone = 'UTC';
-  context.renderTimeline();
-  assert.match(get('timeline-inspection').textContent, /GMT/);
-  assert(!get('timeline-inspection').textContent.includes('GMT+4'));
+  context.state.selectMode = true;
+  chart.handlers.pointerdown({ button: 0, pointerId: 2, clientX: 489, clientY: 60 });
+  assert.deepEqual(context.selectedPoint, { x: 489, y: 60 });
+  assert.equal(context.state.timelineView, null, 'selection does not initiate a pan');
   get('timeline-live').handlers.click();
-  assert.equal(context.state.timelineSelection, null);
   assert.equal(get('timeline-mode').textContent, 'Live');
 });
 
@@ -809,14 +779,19 @@ test('power chart plots measured power only, preserves gaps and shares its exact
   assert(titles.some((title) => title.includes('Power unknown')));
 });
 
-test('clicking a timeline report zooms in with that report centered', () => {
-  const context = vm.createContext({ state: { windowMinutes: 60 }, renderTimeline() {} });
+test('zoom keeps the selected time anchored on the shared axis', () => {
+  const now = 10000000;
+  const context = vm.createContext({
+    Date: class extends Date { static now() { return now; } },
+    state: { windowMinutes: 60 }, renderTimeline() {},
+  });
   loadFunctions(browserCode, 'function timelineViewport(', 'function initTimelineControls(', context);
-  const now = Date.now();
-  context.zoomTimelineToReport(now - 1800000);
+  const original = context.timelineViewport();
+  const anchor = original.start + context.timelineAxisMs(original.windowMs) / 2;
+  context.zoomTimeline(0.5);
   const view = context.timelineViewport(now);
   assert.equal(view.windowMs, 1800000);
-  assert.equal(view.start + view.windowMs / 2, now - 1800000);
+  assert.equal(view.start + context.timelineAxisMs(view.windowMs) / 2, anchor);
 });
 
 test('wall display does not treat stale or disconnected interference data as live', () => {

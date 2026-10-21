@@ -106,6 +106,24 @@ test('BESTSATS ASCII and binary recover GOOD count without inventing fix type or
   for (const size of [1, 3, 17, 29, 100, 4096]) assert.deepEqual(scan(log, size), expected, `chunk size ${size}`);
 });
 
+test('archive skips malformed decoded records and continues through the following valid reports', () => {
+  const start = NOW - 3600000;
+  const truncated = Buffer.alloc(4);
+  truncated.writeUInt32LE(1);
+  const log = Buffer.concat([
+    asciiLine(start, '1,GPS,1,GOOD,not-hex', 'BESTSATSA'),
+    bestsatsAscii(start + 1000, ['GOOD']),
+    binaryFrame(2065, start + 2000, truncated),
+    asciiLine(start + 3000, '1,L1'),
+    asciiLine(start + 4000, '0'),
+  ]);
+  const summary = scan(log, 17);
+  assert.equal(summary.crcErrors, 3, 'malformed payloads are counted even with valid checksums');
+  assert.equal(summary.bestsatsReports, 1);
+  assert.equal(summary.reportCount, 1, 'truncated detections cannot become false clear coverage');
+  assert.deepEqual(summary.coverage, [[start + 4000, start + 4000]]);
+});
+
 test('BESTPOS scanner parses ASCII and binary with receiver times, CRC checks and chunk boundaries', () => {
   const start = NOW - 3600000;
   const log = Buffer.concat([

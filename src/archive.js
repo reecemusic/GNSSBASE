@@ -229,7 +229,15 @@ function createItDetectScanner(summary) {
       }
       summary.addSolution(t, decode({ format: 'binary', header: { messageName: 'BESTPOS' }, body }).data);
     } else {
-      summary.addReport(t, decodeItDetectStatusBinary(body).detections);
+      let data;
+      try {
+        data = decodeItDetectStatusBinary(body);
+      } catch (error) {
+        summary.crcErrors++;
+        console.warn(`[archive] skipping invalid binary ITDETECTSTATUS report: ${error.message}`);
+        return;
+      }
+      summary.addReport(t, data.detections);
     }
   }
 
@@ -247,7 +255,14 @@ function createItDetectScanner(summary) {
         summary.crcErrors++;
         return;
       }
-      const data = decode(parsed).data;
+      let data;
+      try {
+        data = decode(parsed).data;
+      } catch (error) {
+        summary.crcErrors++;
+        console.warn(`[archive] skipping invalid BESTSATS report: ${error.message}`);
+        return;
+      }
       summary.addBestSats(t, data.satellites.filter((satellite) => satellite.status === 'GOOD').length);
     } else if (parsed.header.messageName === 'BESTPOS') {
       if (parsed.fields.length < 15) {
@@ -256,7 +271,15 @@ function createItDetectScanner(summary) {
       }
       summary.addSolution(t, decode(parsed).data);
     } else {
-      summary.addReport(t, interpretItDetectStatus(parsed).detections);
+      let data;
+      try {
+        data = interpretItDetectStatus(parsed);
+      } catch (error) {
+        summary.crcErrors++;
+        console.warn(`[archive] skipping invalid ASCII ITDETECTSTATUS report: ${error.message}`);
+        return;
+      }
+      summary.addReport(t, data.detections);
     }
   }
 

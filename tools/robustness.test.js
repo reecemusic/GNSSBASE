@@ -9,7 +9,7 @@ const { EventEmitter } = require('node:events');
 const { test } = require('node:test');
 const { ReceiverClient } = require('../src/receiver');
 const { History } = require('../src/history');
-const { parseAsciiLog, readBinaryLog } = require('../src/novatel');
+const { parseAsciiLog, readBinaryLog, novatelCrc32, decodeItDetectStatusBinary } = require('../src/novatel');
 const { decode } = require('../src/messages');
 const code = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
 
@@ -19,6 +19,77 @@ function load(context, start, end) {
   assert(first >= 0 && last > first, `Missing source boundary: ${start}`);
   vm.runInContext(code.slice(first, last), context);
 }
+
+test('malformed CRC text is a failure, not an unchecked report', () => {
+  const body = 'BESTSATSA,USB1,0,50,FINESTEERING,2441,100,00000000,0000;0';
+  const checksum = novatelCrc32(body).toString(16).padStart(8, '0');
+  assert.equal(parseAsciiLog(`#${body}*${checksum}`).crcValid, true);
+  assert.equal(parseAsciiLog(`#${body}`).crcValid, null);
+  for (const malformed of ['', 'garbage', checksum + 'garbage', '0' + checksum, checksum.slice(1)]) {
+    assert.equal(parseAsciiLog(`#${body}*${malformed}`).crcValid, false);
+  }
+});
+
+test('RANGE, SATVIS2 and interference decoders reject incomplete payloads instead of inventing counts', () => {
+  const ascii = (name, fields) => decode({ format: 'ascii', header: { messageName: name }, fields });
+  for (const fields of [[], [''], ['-1'], ['1.5'], ['2049'], ['1', ...Array(9).fill('0')]]) {
+    assert.throws(() => ascii('RANGE', fields), /RANGE/);
+  }
+  assert.equal(ascii('RANGE', ['0']).data.observations.length, 0);
+  for (const fields of [
+    ['GPS', 'TRUE', 'TRUE', '1', '1', '0', '20', '30'],
+    ['GPS', 'UNKNOWN', 'TRUE', '0'], ['GPS', 'TRUE', 'TRUE', ''],
+  ]) assert.throws(() => ascii('SATVIS2', fields), /SATVIS2/);
+  const sat = ascii('SATVIS2', ['GPS', 'TRUE', 'TRUE', '1', '1', '0', '', '30', '0', '0']);
+  assert.equal(sat.data.satellites[0].elevation, null, 'blank elevation is unknown, not the horizon');
+  assert.equal(ascii('BESTPOS', ['SOL_COMPUTED', 'SINGLE', '', '']).data.latitude, null);
+  for (const fields of [[], [''], ['-1'], ['1'], ['2', 'L1', 'SPECTRUMANALYSIS'], ['L1', '1']]) {
+    assert.throws(() => ascii('ITDETECTSTATUS', fields), /ITDETECTSTATUS/);
+  }
+  assert.equal(ascii('ITDETECTSTATUS', ['0']).data.detectionCount, 0);
+  assert.equal(ascii('ITDETECTSTATUS', ['L1', '0']).data.detectionCount, 0);
+  const truncated = Buffer.alloc(4);
+  truncated.writeUInt32LE(1);
+  assert.throws(() => decodeItDetectStatusBinary(Buffer.alloc(3)), /incomplete/);
+  assert.throws(() => decodeItDetectStatusBinary(truncated), /incomplete/);
+  assert.throws(() => decode({ format: 'binary', header: { messageName: 'RANGE' }, body: truncated }), /incomplete/);
+});
+
+test('CRC failures and invalid visibility never enter server or browser history', () => {
+  const records = [
+    { name: 'ITDETECTSTATUS', crcValid: false, data: { detections: [] } },
+    { name: 'BESTPOS', crcValid: false, data: { satellitesUsed: 0 } },
+    { name: 'SATVIS2', crcValid: false, data: { system: 'GPS', satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } },
+    { name: 'SATVIS2', crcValid: true, data: { system: 'GPS', visibilityValid: false,
+      satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } },
+  ];
+  const calls = [];
+  const browser = vm.createContext({
+    MAX_INTERFERENCE_SAMPLES: 40000,
+    state: { tracks: {}, interferenceHistory: [] },
+    recordSolution: () => calls.push('solution'),
+  });
+  load(browser, 'function recordLiveHistory(', '// Unchanged solutions');
+  records.forEach((record) => browser.recordLiveHistory(record));
+  assert.deepEqual(calls, []);
+  assert.equal(browser.state.interferenceHistory.length, 0);
+  assert.equal(Object.keys(browser.state.tracks).length, 0);
+  const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  const context = vm.createContext({
+    decode: (record) => record, store: { latest: {}, counts: {}, itdetectHistory: [], satvisBySystem: {}, rawLog: [] },
+    config: { historySize: 50, rawLogSize: 200 },
+    history: { addSolution: () => calls.push('solution'), addSatellites: () => calls.push('sky'),
+      addInterference: () => calls.push('interference') },
+    broadcast() {}, console: { warn() {} },
+  });
+  vm.runInContext(serverCode.slice(serverCode.indexOf('function processReceiverLog('),
+    serverCode.indexOf('function broadcast(')), context);
+  records.forEach((record) => context.processReceiverLog(record));
+  assert.deepEqual(calls, []);
+  assert.equal(context.store.rawLog.length, 4, 'bad reports remain available for diagnosis');
+  context.processReceiverLog({ name: 'ITDETECTSTATUS', crcValid: true, data: { detections: [] } });
+  assert.deepEqual(calls, ['interference'], 'the next valid clear report is retained');
+});
 
 test('interference banner ages clear reports, errors after five seconds, and recovers on fresh data', () => {
   const elements = new Map();

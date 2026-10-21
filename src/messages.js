@@ -57,6 +57,7 @@ const EPHEMERIS_MESSAGES = new Set([
 // --- ASCII decoders ---------------------------------------------------------
 
 function num(value) {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -126,9 +127,12 @@ function systemFromTrackingStatus(status) {
 }
 
 function decodeRangeAscii(fields) {
-  const count = num(fields[0]) || 0;
+  const count = num(fields[0]);
+  if (!Number.isInteger(count) || count < 0 || count > 2048 || fields.length !== 1 + count * 10) {
+    throw new Error('RANGE has an invalid observation count or incomplete observation data');
+  }
   const rest = fields.slice(1);
-  const blockSize = count > 0 ? Math.floor(rest.length / count) : 0;
+  const blockSize = 10;
   const observations = [];
   for (let i = 0; i < count && blockSize >= 10; i++) {
     const block = rest.slice(i * blockSize, (i + 1) * blockSize);
@@ -307,9 +311,14 @@ function decodeSatVisSatelliteId(value) {
 
 function decodeSatVis2Ascii(fields) {
   const system = fields[0] || '';
-  const count = num(fields[3]) || 0;
+  const count = num(fields[3]);
+  if (!TRACKING_SYSTEMS.includes(system) || system === 'OTHER'
+    || !['TRUE', 'FALSE'].includes(fields[1]) || !['TRUE', 'FALSE'].includes(fields[2])
+    || !Number.isInteger(count) || count < 0 || count > 2048 || fields.length !== 4 + count * 6) {
+    throw new Error('SATVIS2 has invalid visibility fields or incomplete satellite data');
+  }
   const rest = fields.slice(4);
-  const blockSize = count > 0 ? Math.floor(rest.length / count) : 0;
+  const blockSize = 6;
   const satellites = [];
   for (let i = 0; i < count && blockSize >= 4; i++) {
     const block = rest.slice(i * blockSize, (i + 1) * blockSize);
@@ -379,8 +388,11 @@ function decodeRxStatusBinary(body) {
 }
 
 function decodeRangeBinary(body) {
-  if (body.length < 4) return null;
+  if (body.length < 4) throw new Error('RANGE binary body is incomplete');
   const count = body.readUInt32LE(0);
+  if (count > 2048 || body.length !== 4 + count * 44) {
+    throw new Error('RANGE binary body has an invalid observation count or incomplete observation data');
+  }
   const observations = [];
   for (let i = 0; i < count; i++) {
     const offset = 4 + i * 44;

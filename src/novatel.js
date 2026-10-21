@@ -71,8 +71,8 @@ function parseAsciiLog(line) {
 
   let crcValid = null;
   if (hasCrc) {
-    const expected = parseInt(raw.slice(starIndex + 1).trim(), 16);
-    crcValid = Number.isNaN(expected) ? null : novatelCrc32(body) === expected >>> 0;
+    const checksum = raw.slice(starIndex + 1).trim();
+    crcValid = /^[0-9a-fA-F]{8}$/.test(checksum) && novatelCrc32(body) === (parseInt(checksum, 16) >>> 0);
   }
 
   const semicolon = body.indexOf(';');
@@ -142,8 +142,17 @@ function splitFields(text) {
  */
 function interpretItDetectStatus(message) {
   const fields = message.fields || [];
+  const signalFirst = /^[A-Z][A-Z0-9_]*$/i.test(fields[0] || '');
+  const countField = fields[signalFirst ? 1 : 0];
+  const declaredCount = Number(countField);
+  const dataLength = fields.length - (signalFirst ? 2 : 1);
+  if (!/^\d+$/.test(countField || '') || !Number.isInteger(declaredCount) || declaredCount > 256
+    || (declaredCount === 0 ? dataLength !== 0
+      : dataLength < declaredCount * (signalFirst ? 1 : 2) || dataLength % declaredCount !== 0)) {
+    throw new Error('ITDETECTSTATUS has an invalid detection count or incomplete detection data');
+  }
 
-  if (fields.length > 1 && Number.isFinite(Number(fields[1]))) {
+  if (signalFirst) {
     const signalType = fields[0];
     const count = Number(fields[1]);
     const rest = fields.slice(2);
@@ -220,8 +229,11 @@ const IT_MAX_ENTRIES = 256;
 
 /** Decodes an OEM7 binary ITDETECTSTATUS body (message ID 2065) into the ASCII decoder's shape. */
 function decodeItDetectStatusBinary(body) {
-  if (!body || body.length < 4) return { detectionCount: 0, detections: [], extraFields: [] };
+  if (!body || body.length < 4) throw new Error('ITDETECTSTATUS binary body is incomplete');
   const declared = body.readUInt32LE(0);
+  if (declared > IT_MAX_ENTRIES || body.length !== 4 + declared * IT_ENTRY_BYTES) {
+    throw new Error('ITDETECTSTATUS binary body has an invalid detection count or incomplete detection data');
+  }
   const count = Math.min(declared, IT_MAX_ENTRIES, Math.floor((body.length - 4) / IT_ENTRY_BYTES));
   const detections = [];
   for (let index = 0; index < count; index++) {

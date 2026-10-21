@@ -110,7 +110,9 @@ function processReceiverLog(message) {
       bySignal.set(detection.signalType, signalDetections);
     }
     const reportTime = Date.now();
-    if (bySignal.size) {
+    if (record.crcValid === false) {
+      console.warn('[receiver] excluding CRC-failed ITDETECTSTATUS from history');
+    } else if (bySignal.size) {
       for (const [signal, signalDetections] of bySignal) {
         history.addInterference(signal, signalDetections, reportTime);
       }
@@ -119,11 +121,13 @@ function processReceiverLog(message) {
     }
   }
 
-  if (name === 'BESTPOS' && record.data) history.addSolution(record.data);
+  if (name === 'BESTPOS' && record.data && record.crcValid !== false) history.addSolution(record.data);
 
   if (name === 'SATVIS2' && record.data && record.data.system) {
     store.satvisBySystem[record.data.system] = record;
-    history.addSatellites(record.data.system, record.data.satellites || []);
+    if (record.crcValid !== false && record.data.visibilityValid !== false) {
+      history.addSatellites(record.data.system, record.data.satellites || []);
+    }
   }
 
   store.rawLog.push({ name, receivedAt: record.receivedAt, format: record.format, crcValid: record.crcValid, raw: record.raw });
