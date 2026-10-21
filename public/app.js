@@ -2399,6 +2399,16 @@ function renderSkyplot() {
     ? 'Usage: BESTSATS. Missing: visible assigned TRACKSTAT channels above the tracking cutoff without RANGE observations. In view: SATVIS2 above-horizon prediction, not a tracking count.'
     : 'Per-satellite usage unavailable: waiting for BESTSATS. The used total, when available, comes from BESTPOS; tracked comes from RANGE.'
       + (satelliteTrackingAvailable() ? ' Missing is derived from TRACKSTAT and SATVIS2.' : ' Missing status is unavailable without TRACKSTAT.');
+  const best = latestByName.BESTSATS;
+  const bestAge = Date.now() - Date.parse(best?.receivedAt);
+  if (Number.isFinite(bestAge) && bestAge >= 5000) {
+    $('sv-status-note').textContent += ` WARNING: BESTSATS is ${Math.floor(bestAge / 1000)} s old; usage counts are last reported, not live.`;
+  }
+  const bestEpoch = best?.header?.utc;
+  if (usageAvailable && bestEpoch && bestEpoch === bestpos?.header?.utc
+    && Number.isInteger(solutionUsed) && counts.used !== solutionUsed) {
+    $('sv-status-note').textContent += ` WARNING: same-epoch BESTPOS reports ${solutionUsed} used, but BESTSATS identifies ${counts.used}; counts have not been adjusted.`;
+  }
   $('sv-missing').classList.toggle('alert', counts.missing > 0);
   $('sv-unhealthy').classList.toggle('alert', counts.unhealthy > 0);
   $('sky-count').textContent = `(${plotted} plotted)`;
@@ -2637,16 +2647,25 @@ function signalBreakdown(satellites) {
     .filter((sat) => sat.state === 'used' && !state.hiddenSystems.has(sat.system))
     .map((sat) => `${sat.system}:${normalisePrn(sat.system, sat.prn)}`));
   const counts = Object.fromEntries(SIGNAL_BANDS.map((band) => [band, new Set()]));
-  const range = latestByName.RANGE;
-
-  for (const obs of (range && range.data && range.data.observations) || []) {
-    if (range.crcValid === false) continue;
-    const system = observationSystem(obs);
-    if (!system || normalisePrn(system, obs.prn) === null) continue;
-    const key = `${system}:${normalisePrn(system, obs.prn)}`;
+  const best = latestByName.BESTSATS;
+  const maskBands = {
+    GPS: ['L1', 'L2', 'L5'],
+    GLONASS: ['L1', 'L2', 'Other'],
+    SBAS: ['L1', 'L5'],
+    GALILEO: ['L1', 'L5', 'L5', 'L5', 'Other'],
+    BEIDOU: ['L1', 'L5', 'Other', 'L1', 'L5', 'L5'],
+    QZSS: ['L1', 'L2', 'L5', 'Other'],
+    NAVIC: [null, null, 'L5'],
+  };
+  for (const sat of (best?.crcValid !== false && best?.data?.satellites) || []) {
+    const key = `${sat.system}:${normalisePrn(sat.system, sat.prn)}`;
     if (!used.has(key)) continue;
-    const band = signalBand(system, obs.trackingStatus);
-    counts[band].add(key);
+    if (!/^[0-9a-fA-F]{1,8}$/.test(sat.signalMask || '')) continue;
+    const mask = parseInt(sat.signalMask, 16);
+    const bands = maskBands[sat.system] || [];
+    for (let bit = 0; bit < 32; bit++) {
+      if ((mask >>> bit) & 1) counts[bands[bit] || 'Other'].add(key);
+    }
   }
 
   return Object.fromEntries(SIGNAL_BANDS.map((band) => [band, counts[band].size]));
@@ -2658,7 +2677,7 @@ function renderSignalLegend(counts) {
   if (!Object.values(counts).some(Boolean)) {
     const li = document.createElement('li');
     li.className = 'muted';
-    li.textContent = satelliteUsageAvailable() ? 'No used RANGE signals yet.' : 'Used signals unavailable without BESTSATS.';
+    li.textContent = satelliteUsageAvailable() ? 'No used signals in the BESTSATS masks.' : 'Used signals unavailable without BESTSATS.';
     list.append(li);
     return;
   }
@@ -3938,7 +3957,11 @@ function initTimeZone() {
 
 setInterval(() => flushUpdates(), 250);
 setInterval(() => {
-  if (!document.hidden && document.querySelector('.tab.active')?.dataset.tab === 'interference') {
+  const tab = document.querySelector('.tab.active')?.dataset.tab;
+  if (!document.hidden && tab === 'satellites') {
+    renderSafely('Updating satellite report freshness', renderSkyplot);
+  }
+  if (!document.hidden && tab === 'interference') {
     renderSafely('Updating live device status', () => {
       renderVerdict();
       if (!interferenceIsLive(latestByName.ITDETECTSTATUS)) renderBands();

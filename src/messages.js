@@ -147,20 +147,30 @@ function decodeRangeAscii(fields) {
 }
 
 function decodeBestSatsAscii(fields) {
-  const count = num(fields[0]) || 0;
-  const rest = fields.slice(1);
-  const blockSize = count > 0 ? Math.floor(rest.length / count) : 0;
-  const satellites = [];
-  for (let i = 0; i < count && blockSize >= 3; i++) {
-    const block = rest.slice(i * blockSize, (i + 1) * blockSize);
-    satellites.push({
-      system: block[0],
-      prn: block[1],
-      status: block[2],
-      signalMask: block[3] || '',
-    });
+  const count = Number(fields[0]);
+  if (!/^\d+$/.test(fields[0] || '') || !Number.isSafeInteger(count)
+    || count > 2048 || fields.length !== 1 + count * 4) {
+    throw new Error('BESTSATS has an invalid satellite count or incomplete satellite data');
   }
-  return { satelliteCount: count, satellites };
+  const byKey = new Map();
+  for (let i = 0; i < count; i++) {
+    const offset = 1 + i * 4;
+    const [system, satelliteId, status, signalMask] = fields.slice(offset, offset + 4);
+    const id = String(satelliteId).match(system === 'GLONASS' ? /^(\d+)(?:[+-]\d+)?$/ : /^(\d+)$/);
+    if (!TRACKING_SYSTEMS.includes(system) || system === 'OTHER'
+      || !id || !Number.isSafeInteger(Number(id[1])) || Number(id[1]) <= 0
+      || !/^[A-Z][A-Z0-9_]*$/.test(status) || !/^[0-9a-fA-F]{1,8}$/.test(signalMask)) {
+      throw new Error(`BESTSATS has invalid satellite data at entry ${i + 1}`);
+    }
+    const key = `${system}:${Number(id[1])}`;
+    const previous = byKey.get(key);
+    if (previous && (previous.status !== status || parseInt(previous.signalMask, 16) !== parseInt(signalMask, 16))) {
+      throw new Error(`BESTSATS has conflicting duplicate satellite ${key}`);
+    }
+    byKey.set(key, { system, prn: satelliteId, status, signalMask });
+  }
+  const satellites = [...byKey.values()];
+  return { satelliteCount: satellites.length, satellites };
 }
 
 function decodeTrackStatAscii(fields) {

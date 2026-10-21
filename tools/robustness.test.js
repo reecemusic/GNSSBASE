@@ -289,7 +289,7 @@ test('satellite counts reject invalid IDs, invalid visibility and CRC failures',
   assert.equal(context.trackedSatelliteSummary().size, 0);
 });
 
-test('used-signal counts match RANGE signal bands and normalize legacy NavIC IDs', () => {
+test('used-signal counts use BESTSATS masks rather than every tracked band', () => {
   const context = satelliteContext();
   context.SIGNAL_BANDS = ['L1', 'L2', 'L5', 'Other'];
   load(context, 'function signalBreakdown(', 'function renderSignalLegend(');
@@ -300,14 +300,108 @@ test('used-signal counts match RANGE signal bands and normalize legacy NavIC IDs
     ['RESERVED', 5, 0], ['GLONASS', 55, 1],
   ].map(([system, prn, signal]) => ({ system, prn, trackingStatus: (signal << 21).toString(16) }));
   context.latestByName.RANGE = { data: { observations } };
+  context.latestByName.BESTSATS = { data: { satellites: [
+    { system: 'GPS', prn: 1, signalMask: '03' },
+    { system: 'QZSS', prn: 193, signalMask: '02' },
+    { system: 'QZSS', prn: 194, signalMask: '01' },
+    { system: 'SBAS', prn: 131, signalMask: '02' },
+    { system: 'BEIDOU', prn: 3, signalMask: '08' },
+    { system: 'BEIDOU', prn: 4, signalMask: '10' },
+    { system: 'NAVIC', prn: 5, signalMask: '04' },
+    { system: 'GLONASS', prn: '18-3', signalMask: '02' },
+  ] } };
   const used = observations.map((obs) => ({
     system: context.observationSystem(obs), prn: context.normalisePrn(obs.system, obs.prn), state: 'used',
   }));
   assert.deepEqual(JSON.parse(JSON.stringify(context.signalBreakdown(used))),
     { L1: 3, L2: 3, L5: 3, Other: 0 });
-  context.latestByName.RANGE.crcValid = false;
+  context.latestByName.BESTSATS.crcValid = false;
   assert.deepEqual(JSON.parse(JSON.stringify(context.signalBreakdown(used))),
     { L1: 0, L2: 0, L5: 0, Other: 0 });
+});
+
+test('BESTSATSA validates exact block sizes, deduplicates IDs and rejects conflicting counts explicitly', () => {
+  const decodeFields = (fields) => decode({
+    format: 'ascii', header: { messageName: 'BESTSATS' }, fields, crcValid: true,
+  }).data;
+  assert.equal(decodeFields(['0']).satellites.length, 0);
+  for (const fields of [
+    [], [''], ['-1'], ['1.5'], ['2049'], ['0', 'GPS'],
+    ['1', 'GPS', '1', 'GOOD'], ['2', 'GPS', '1', 'GOOD', '03'],
+    ['1', 'GPS', '0', 'GOOD', '03'], ['1', 'GPS', '2x', 'GOOD', '03'],
+    ['1', 'GPS', '1', 'GOOD', 'invalid'], ['1', 'OTHER', '1', 'GOOD', '03'],
+    ['1', 'GPS', '1', '', '03'],
+  ]) assert.throws(() => decodeFields(fields), /BESTSATS/);
+  const duplicate = decodeFields(['2', 'GLONASS', '18-3', 'GOOD', '00000003',
+    'GLONASS', '018-3', 'GOOD', '03']);
+  assert.equal(duplicate.satellites.length, 1);
+  assert.equal(duplicate.satelliteCount, 1);
+  for (const [status, mask] of [['NOTUSED', '03'], ['GOOD', '01']]) {
+    assert.throws(() => decodeFields(['2', 'GPS', '1', 'GOOD', '03', 'GPS', '01', status, mask]),
+      /conflicting duplicate/);
+  }
+  assert.equal(decodeFields(['1', 'GPS', '1', 'FUTURE_STATUS', '03']).satellites[0].status, 'FUTURE_STATUS');
+});
+
+test('BESTSATS freshness and same-epoch disagreement are visible without altering receiver counts', () => {
+  const context = satelliteContext();
+  const now = 100000;
+  let clock = now;
+  context.Date = class extends Date { static now() { return clock; } };
+  const utc = new Date(now).toISOString();
+  context.latestByName.BESTSATS = {
+    receivedAt: new Date(now - 6000).toISOString(), header: { utc },
+    data: { satellites: [{ system: 'GPS', prn: 1, status: 'GOOD', signalMask: '01' }] },
+  };
+  context.latestByName.BESTPOS = { header: { utc }, data: { satellitesUsed: 2 } };
+  context.renderSkyplot();
+  assert.equal(context.elements.get('sv-used').textContent, 1, 'do not fabricate identities to match BESTPOS');
+  assert.match(context.elements.get('sv-status-note').textContent, /old.*not live/);
+  assert.match(context.elements.get('sv-status-note').textContent, /same-epoch BESTPOS reports 2/);
+  context.latestByName.BESTPOS.header.utc = new Date(now - 1000).toISOString();
+  context.latestByName.BESTSATS.receivedAt = utc;
+  context.renderSkyplot();
+  assert.doesNotMatch(context.elements.get('sv-status-note').textContent, /WARNING/);
+  clock = now + 4999;
+  context.renderSkyplot();
+  assert.doesNotMatch(context.elements.get('sv-status-note').textContent, /WARNING/);
+  clock = now + 5000;
+  context.renderSkyplot();
+  assert.match(context.elements.get('sv-status-note').textContent, /5 s old/);
+});
+
+test('fragmented and malformed BESTSATSA frames do not corrupt the next valid satellite report', () => {
+  const receiver = new ReceiverClient({});
+  const records = [];
+  receiver.on('log', (message) => records.push(decode(message)));
+  const invalid = '%BESTSATSA,2441,100;2,GPS,1,GOOD,01\n';
+  const valid = '%BESTSATSA,2441,101;1,QZSS,194,GOOD,03\n';
+  receiver.ingest(Buffer.from(invalid + valid.slice(0, 20)));
+  assert.equal(records.length, 0);
+  assert.match(receiver.state.lastError, /BESTSATS.*incomplete/);
+  receiver.ingest(Buffer.from(valid.slice(20)));
+  assert.equal(records.length, 1);
+  assert.equal(records[0].name, 'BESTSATS');
+  assert.equal(records[0].data.satellites[0].prn, '194');
+  assert.equal(receiver.buffer.length, 0);
+});
+
+test('BESTSATS mask counts include only selected solution bands and deduplicate multi-signal bands', () => {
+  const context = satelliteContext();
+  context.SIGNAL_BANDS = ['L1', 'L2', 'L5', 'Other'];
+  load(context, 'function signalBreakdown(', 'function renderSignalLegend(');
+  const satellites = [
+    { system: 'GPS', prn: '1', state: 'used', signalMask: '01' },
+    { system: 'GALILEO', prn: '2', state: 'used', signalMask: '0f' },
+    { system: 'BEIDOU', prn: '3', state: 'used', signalMask: '15' },
+    { system: 'QZSS', prn: '194', state: 'used', signalMask: '00' },
+    { system: 'NAVIC', prn: '5', state: 'tracked', signalMask: '04' },
+  ];
+  context.latestByName.BESTSATS = { data: { satellites } };
+  const counts = () => JSON.parse(JSON.stringify(context.signalBreakdown(satellites)));
+  assert.deepEqual(counts(), { L1: 3, L2: 0, L5: 2, Other: 1 });
+  context.state.hiddenSystems.add('GALILEO');
+  assert.deepEqual(counts(), { L1: 2, L2: 0, L5: 1, Other: 1 });
 });
 
 test('missing BESTSATS displays BESTPOS total without inventing per-satellite solution status', () => {

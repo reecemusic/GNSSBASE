@@ -41,6 +41,12 @@ satellite may still be tracked. GLONASS slot IDs (including signed frequency-cha
 suffixes) are matched across logs. Invalid IDs and CRC-failed reports are excluded.
 Tracked totals therefore overlap with the used, missing and unhealthy status counts;
 those cards are not additive. Used-signal counts deduplicate each satellite per band.
+Used bands come from BESTSATS signal masks, not every RANGE signal on a used
+satellite. Malformed BESTSATSA counts, incomplete entries and conflicting duplicate
+satellites are rejected with an explicit receiver-processing error; identical
+duplicates are counted once. A valid zero-entry report still means zero.
+The Satellites tab warns when BESTSATS is at least five seconds old and when
+same-epoch BESTPOS and BESTSATS used counts disagree; counts are not silently adjusted.
 Skyplot constellation filters affect the plot and detail table, not the summary
 counts. Counts show the latest reports, not a guarantee of current reception when
 the receiver is disconnected.
