@@ -132,7 +132,7 @@ test('browser records live BESTPOS with the same thinning and history merge as t
     state: { windowMinutes: 60, interferenceHistory: [], tracks: {}, solutionHistory: [] },
     isValidSkyPosition: () => true,
   });
-  loadFunctions(browserCode, 'function pruneClientHistory()', '// --- interference timeline', context);
+  loadFunctions(browserCode, 'function boundSeries(', '// --- interference timeline', context);
   const now = Date.now();
   context.recordSolution(bestpos(20), now);
   context.recordSolution(bestpos(20), now + 5000);

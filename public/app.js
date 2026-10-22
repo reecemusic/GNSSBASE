@@ -10,7 +10,11 @@
 const $ = (id) => document.getElementById(id);
 const MAX_RAW_ROWS = 300;
 const MAX_IT_ROWS = 50;
-// Room for a downsampled 24 h history response plus many hours of live reports arriving on top of it.
+// Hard cap for interference, solution, and satellite-view samples.
+// A burst shorter than two hours keeps the newest samples (a ring). A longer span
+// keeps the newest half as-is and merges older samples into time buckets, so a 24 h
+// chart keeps its shape instead of storing every 1 Hz point. The live edge matches
+// the server history response: same bucket rule, same "keep a detection" choice.
 const MAX_INTERFERENCE_SAMPLES = 40000;
 const HISTORY_REQUEST_LIMIT = 15000;
 const MAX_TRACK_SAMPLES = 1081;
@@ -672,6 +676,10 @@ function applyRecord(record) {
     registerFilterOption(record.name);
     return;
   }
+  // The raw log already keeps a 16 KiB display copy. The live record must not pin the rest.
+  if (typeof record.raw === 'string' && record.raw.length > 16384) {
+    record.raw = `${record.raw.slice(0, 16384)} [display truncated]`;
+  }
   latestByName[record.name] = record;
   dirtyRecords.add(record.name);
   if (record.name === 'SATVIS2' && record.data) state.satvis[record.data.system] = record;
@@ -872,9 +880,13 @@ function updateMap(d) {
     accuracyCircle.setLatLng(position).setRadius(radius || 1);
   }
 
-  marker.bindPopup(`<b>${escapeHtml(d.solutionStatus)} / ${escapeHtml(d.positionType)}</b><br>`
+  // Reuse the popup node. bindPopup on every fix allocated a new popup and left the old one detached.
+  const popupHtml = `<b>${escapeHtml(d.solutionStatus)} / ${escapeHtml(d.positionType)}</b><br>`
     + `${d.latitude.toFixed(9)}, ${d.longitude.toFixed(9)}<br>`
-    + `${escapeHtml(fmt(heightFor(d), 3, ' m'))} ${state.heightDatum === 'ellipsoidal' ? 'ellipsoidal' : 'MSL'} &middot; ${d.satellitesUsed ?? '?'} SVs`);
+    + `${escapeHtml(fmt(heightFor(d), 3, ' m'))} ${state.heightDatum === 'ellipsoidal' ? 'ellipsoidal' : 'MSL'} &middot; ${d.satellitesUsed ?? '?'} SVs`;
+  const popup = typeof marker.getPopup === 'function' ? marker.getPopup() : null;
+  if (popup && typeof popup.setContent === 'function') popup.setContent(popupHtml);
+  else marker.bindPopup(popupHtml);
 }
 
 /**
@@ -1008,7 +1020,8 @@ async function loadHistory() {
       throw new Error('Invalid history samples');
     }
     state.tracks = data.tracks || {};
-    const savedInterference = data.interference.slice(-MAX_INTERFERENCE_SAMPLES);
+    const savedInterference = capSeries(data.interference, MAX_INTERFERENCE_SAMPLES,
+      (sample) => String(sample.signal), keepInterferenceSample);
     // Interference samples already in memory with t at or after the request start arrived while the GET was in flight.
     const arrivedDuringRequest = state.interferenceHistory.filter((sample) => sample.t >= requestedAt);
     const keys = new Set(savedInterference.map((sample) => `${sample.t}:${sample.signal}:${sample.count}:${sample.maxPower}`));
@@ -1018,8 +1031,10 @@ async function loadHistory() {
     state.interferenceHistory.sort((a, b) => a.t - b.t);
     rememberHistoryDetection(state.interferenceHistory);
     if (Array.isArray(data.solution)) {
-      const savedSolution = data.solution.slice(-MAX_INTERFERENCE_SAMPLES)
-        .map((sample) => solutionSample(sample, sample?.t)).filter(Boolean).sort((a, b) => a.t - b.t);
+      const savedSolution = capSeries(
+        data.solution.map((sample) => solutionSample(sample, sample?.t)).filter(Boolean).sort((a, b) => a.t - b.t),
+        MAX_INTERFERENCE_SAMPLES, () => '', (previous, sample) => sample,
+      );
       const lastSaved = savedSolution.length ? savedSolution[savedSolution.length - 1].t : -Infinity;
       // Live solution samples from during the request are appended only when they are newer than the last saved sample.
       const solutionDuringRequest = (state.solutionHistory || []).filter((sample) => sample.t >= requestedAt && sample.t > lastSaved);
@@ -1044,16 +1059,102 @@ function capHistoryWindow(retentionMinutes) {
 }
 
 /**
+ * Time-sorted samples cut to at most limit. Same rule as reduceSamples in src/history.js.
+ * The newest Math.floor(limit / 2) samples stay as they are. Older samples are merged
+ * into time buckets that start at 1000 ms and double until the older set fits the
+ * remaining budget. key groups samples inside a bucket, and keep picks the survivor.
+ * A series already within limit is returned as the same array, so a short chart is unchanged.
+ * @param {object[]} samples Sorted by t.
+ * @param {number} limit Maximum length.
+ * @param {function(object): string} key Identity used before the time bucket.
+ * @param {function(object, object): object} keep Called as keep(previous, sample).
+ * @returns {object[]}
+ * Side effects: none. samples is not mutated.
+ */
+function boundSeries(samples, limit, key, keep) {
+  if (!Array.isArray(samples) || samples.length <= limit) return samples;
+  const recentCount = Math.floor(limit / 2);
+  const recent = samples.slice(samples.length - recentCount);
+  const older = samples.slice(0, samples.length - recentCount);
+  const budget = limit - recentCount;
+  let reduced = older;
+  for (let bucketMs = 1000; reduced.length > budget && bucketMs < 1e12; bucketMs *= 2) {
+    const kept = new Map();
+    for (const sample of older) {
+      const id = `${key(sample)}:${Math.floor(sample.t / bucketMs)}`;
+      const previous = kept.get(id);
+      kept.set(id, previous ? keep(previous, sample) : sample);
+    }
+    reduced = [...kept.values()].sort((a, b) => a.t - b.t);
+  }
+  // budget is 0 only when limit is 0. slice(-0) would keep the whole array.
+  const head = budget > 0 ? reduced.slice(-budget) : [];
+  return [...head, ...recent];
+}
+
+/**
+ * Picks the interference sample to keep inside one time bucket.
+ * A sample with count > 0 wins over a clear sample. Otherwise the higher finite
+ * maxPower wins. Equal or missing power keeps the sample already chosen.
+ * @param {object} previous Sample already kept for this bucket.
+ * @param {object} sample Candidate.
+ * @returns {object}
+ * Side effects: none.
+ */
+function keepInterferenceSample(previous, sample) {
+  if ((sample.count > 0) !== (previous.count > 0)) return sample.count > 0 ? sample : previous;
+  if (Number.isFinite(sample.maxPower) && (!Number.isFinite(previous.maxPower) || sample.maxPower > previous.maxPower)) {
+    return sample;
+  }
+  return previous;
+}
+
+/**
+ * Caps one series. Under the limit the same array is returned.
+ * A span of two hours or less keeps the newest `limit` samples, which is the ring the
+ * short-window charts already used. A longer span downsamples the older half so a 24 h
+ * window does not have to store every 1 Hz point, while the newest half stays sample for sample.
+ * @param {object[]} samples Time-sorted samples.
+ * @param {number} limit Hard maximum length.
+ * @param {function(object): string} key Series identity for downsampling.
+ * @param {function(object, object): object} keep Survivor inside a bucket.
+ * @returns {object[]}
+ * Side effects: none. The input array is not mutated.
+ */
+function capSeries(samples, limit, key, keep) {
+  if (!Array.isArray(samples) || samples.length <= limit) return samples;
+  const first = samples[0];
+  const last = samples[samples.length - 1];
+  const span = first && last && Number.isFinite(first.t) && Number.isFinite(last.t) ? last.t - first.t : 0;
+  const reduced = span > 2 * 60 * 60 * 1000 ? boundSeries(samples, limit, key, keep) : samples;
+  if (reduced.length <= limit) return reduced;
+  return reduced.slice(-limit);
+}
+
+/**
  * Drops client history older than the selected window and enforces the track and sample caps.
+ * Interference, solution, and satellite-view series longer than two hours are downsampled
+ * instead of keeping only the tail. Track points stay one sample per 20 s, capped at 1081, with at most 512 tracks.
  * @returns {void}
- * Side effects: state.interferenceHistory, solutionHistory, and tracks. events: none.
+ * Side effects: state.interferenceHistory, solutionHistory, satelliteViewHistory, and tracks. events: none.
  */
 function pruneClientHistory() {
   const cutoff = Date.now() - state.windowMinutes * 60000;
-  state.interferenceHistory = state.interferenceHistory.filter((s) => Number.isFinite(s.t) && s.t >= cutoff).slice(-MAX_INTERFERENCE_SAMPLES);
+  state.interferenceHistory = capSeries(
+    state.interferenceHistory.filter((s) => Number.isFinite(s.t) && s.t >= cutoff),
+    MAX_INTERFERENCE_SAMPLES, (sample) => String(sample.signal), keepInterferenceSample,
+  );
   if (state.solutionHistory) {
-    state.solutionHistory = state.solutionHistory.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff)
-      .slice(-MAX_INTERFERENCE_SAMPLES);
+    state.solutionHistory = capSeries(
+      state.solutionHistory.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff),
+      MAX_INTERFERENCE_SAMPLES, () => '', (previous, sample) => sample,
+    );
+  }
+  if (Array.isArray(state.satelliteViewHistory)) {
+    state.satelliteViewHistory = capSeries(
+      state.satelliteViewHistory.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff),
+      MAX_INTERFERENCE_SAMPLES, () => '', (previous, sample) => sample,
+    );
   }
   const tracks = Object.entries(state.tracks);
   for (const [index, [key, samples]] of tracks.entries()) {
@@ -1126,7 +1227,10 @@ function recordLiveHistory(record) {
     }
   }
   if (state.interferenceHistory.length > MAX_INTERFERENCE_SAMPLES) {
-    state.interferenceHistory.splice(0, state.interferenceHistory.length - MAX_INTERFERENCE_SAMPLES);
+    state.interferenceHistory = capSeries(
+      state.interferenceHistory, MAX_INTERFERENCE_SAMPLES,
+      (sample) => String(sample.signal), keepInterferenceSample,
+    );
   }
   if (record.name === 'BESTPOS' && record.data) recordSolution(record.data, now);
 }
@@ -1169,7 +1273,10 @@ function recordSolution(data, now) {
   if (last && now - last.t < SOLUTION_HEARTBEAT_MS && last.used === sample.used && last.tracked === sample.tracked
     && last.status === sample.status && last.type === sample.type) return;
   history.push(sample);
-  if (history.length > MAX_INTERFERENCE_SAMPLES) history.splice(0, history.length - MAX_INTERFERENCE_SAMPLES);
+  if (history.length > MAX_INTERFERENCE_SAMPLES) {
+    const capped = capSeries(history, MAX_INTERFERENCE_SAMPLES, () => '', (previous, next) => next);
+    if (capped !== history) state.solutionHistory = capped;
+  }
 }
 
 // --- interference timeline --------------------------------------------------
@@ -2045,16 +2152,29 @@ function spectrumAllocation([label, system, centerOrStart, widthOrEnd]) {
 }
 
 /**
- * Collapses detections that share a pixel, signal, frequency, and bandwidth, keeping the strongest.
+ * Collapses detections that share a pixel and a signal, keeping the strongest.
+ * Without yFor, frequency and bandwidth stay in the key so two tones on one time pixel stay distinct.
+ * With yFor, frequency and bandwidth are rounded to pixels: marks that occupy the same spot are one node.
  * @param {Array} hits Hit objects.
  * @param {Function} xFor Maps a time to an x position.
+ * @param {Function} [yFor] Maps a frequency in MHz to a y position.
  * @returns {Array}
  * Side effects: none. events: none.
  */
-function spectrumMarkers(hits, xFor) {
+function spectrumMarkers(hits, xFor, yFor) {
   const markers = new Map();
   for (const { sample, detection } of hits) {
-    const key = JSON.stringify([Math.round(xFor(sample.t)), sample.signal, detection.freq, detection.bandwidth]);
+    const x = Math.round(xFor(sample.t));
+    let key;
+    if (typeof yFor === 'function' && Number.isFinite(detection.freq)) {
+      const mhz = detection.freq / 1e6;
+      const y = Math.round(yFor(mhz));
+      const half = Number.isFinite(detection.bandwidth) && detection.bandwidth > 0 ? detection.bandwidth / 2e6 : 0;
+      const height = Math.round(Math.abs(yFor(mhz - half) - yFor(mhz + half)));
+      key = `${x}:${y}:${sample.signal}:${height}`;
+    } else {
+      key = JSON.stringify([x, sample.signal, detection.freq, detection.bandwidth]);
+    }
     const existing = markers.get(key);
     if (!existing) {
       markers.set(key, { sample, detection, count: 1, start: sample.t, end: sample.t });
@@ -2217,8 +2337,8 @@ function renderSpectrumPlots(start, end, windowMs) {
     };
     const plotHits = hitsIn(historyHits);
     const archivePlotHits = hitsIn(archiveHits);
-    const visibleHits = spectrumMarkers(plotHits, xFor);
-    const visibleArchiveHits = spectrumMarkers(archivePlotHits, xFor);
+    const visibleHits = spectrumMarkers(plotHits, xFor, yFor);
+    const visibleArchiveHits = spectrumMarkers(archivePlotHits, xFor, yFor);
     hitSummary.textContent = plotHits.length ? `${plotHits.length} hit${plotHits.length === 1 ? '' : 's'}` : 'No frequency hits';
     if (archivePlotHits.length) {
       hitSummary.textContent += ` · ${archivePlotHits.length} archive`;
@@ -2489,12 +2609,28 @@ function wallCursorActivity() {
 $('wall-toggle').addEventListener('click', () => setWallMode(!state.wall, { fullscreen: !state.wall }));
 document.addEventListener('pointermove', () => { if (state.wall) wallCursorActivity(); });
 document.addEventListener('visibilitychange', () => { if (!document.hidden) requestWallWakeLock(); });
-if (typeof ResizeObserver === 'function') {
-  new ResizeObserver(() => {
-    if (!state.wall) return;
+let wallResizeFrame = 0;
+
+/** One pending frame for a wall resize. Hidden tabs do not queue frames. */
+function scheduleWallReflow() {
+  if (!state.wall || document.hidden || wallResizeFrame) return;
+  wallResizeFrame = requestAnimationFrame(() => {
+    wallResizeFrame = 0;
+    if (document.hidden) return;
     timelineDirty = true;
-    requestAnimationFrame(() => flushUpdates());
-  }).observe($('timeline'));
+    flushUpdates();
+  });
+}
+
+/** Drops a wall resize frame that has not run yet. */
+function cancelWallReflow() {
+  if (!wallResizeFrame) return;
+  cancelAnimationFrame(wallResizeFrame);
+  wallResizeFrame = 0;
+}
+
+if (typeof ResizeObserver === 'function') {
+  new ResizeObserver(() => scheduleWallReflow()).observe($('timeline'));
 }
 // Deferred until the rest of the script has initialised the state that rendering relies on.
 if (new URLSearchParams(location.search).has('wall')) queueMicrotask(() => setWallMode(true));
@@ -4051,8 +4187,10 @@ function recordSatelliteView(record) {
   const unchanged = last && JSON.stringify([last.tracked, last.inView]) === JSON.stringify([tracked, inView]);
   if (last && (t <= last.t || (unchanged && t - last.t < SOLUTION_HEARTBEAT_MS))) return;
   history.push({ t, tracked, inView });
+  // A repeated snapshot has the same receivedAt, so the t <= last.t check above drops it.
   if (history.length > MAX_INTERFERENCE_SAMPLES) {
-    history.splice(0, history.length - MAX_INTERFERENCE_SAMPLES);
+    const capped = capSeries(history, MAX_INTERFERENCE_SAMPLES, () => '', (previous, next) => next);
+    if (capped !== history) state.satelliteViewHistory = capped;
   }
 }
 
@@ -5003,7 +5141,49 @@ function initTimeZone() {
   });
 }
 
+// Always-on screens can still grow outside the JS arrays (renderer, a leaked popup).
+// Above this heap, reload the same URL so ?wall=1 stays. heapmb=0 turns it off.
+// heapmb=N (megabytes) replaces the default. Absent means 768. A page younger than
+// 10 minutes is left alone, and a reload is not repeated inside 15 minutes.
+const HEAP_RELOAD_DEFAULT_MB = 768;
+const HEAP_RELOAD_MIN_UPTIME_MS = 10 * 60 * 1000;
+const HEAP_RELOAD_COOLDOWN_MS = 15 * 60 * 1000;
+
+/**
+ * Heap reload threshold in megabytes, or 0 when the safety net is off.
+ * @returns {number}
+ * Side effects: reads location.search. events: none.
+ */
+function heapReloadLimitMb() {
+  const params = new URLSearchParams(location.search);
+  if (!params.has('heapmb')) return HEAP_RELOAD_DEFAULT_MB;
+  const value = Number(params.get('heapmb'));
+  if (!Number.isFinite(value) || value <= 0) return 0;
+  return value;
+}
+
+/**
+ * Reloads the page when performance.memory is over the heap threshold.
+ * Browsers without performance.memory do nothing. The URL, including wall=1, is kept.
+ * @returns {void}
+ * Side effects: sessionStorage key gnssHeapReloadAt, console.warn, and location.reload. events: none.
+ */
+function maybeReloadForHeap() {
+  const limit = heapReloadLimitMb();
+  if (!limit || typeof performance === 'undefined' || !performance.memory) return;
+  if (Date.now() - liveStatusStartedAt < HEAP_RELOAD_MIN_UPTIME_MS) return;
+  const used = performance.memory.usedJSHeapSize;
+  if (!Number.isFinite(used) || used / (1024 * 1024) < limit) return;
+  let last = 0;
+  try { last = Number(sessionStorage.getItem('gnssHeapReloadAt')) || 0; } catch { /* private mode */ }
+  if (last && Date.now() - last < HEAP_RELOAD_COOLDOWN_MS) return;
+  try { sessionStorage.setItem('gnssHeapReloadAt', String(Date.now())); } catch { /* still reload */ }
+  console.warn(`JavaScript heap is ${Math.round(used / (1024 * 1024))} MB, above ${limit} MB. Reloading to release memory.`);
+  location.reload();
+}
+
 setInterval(() => flushUpdates(), 250);
+setInterval(maybeReloadForHeap, 60000);
 setInterval(() => {
   const tab = document.querySelector('.tab.active')?.dataset.tab;
   if (!document.hidden && tab === 'satellites') {
@@ -5022,12 +5202,14 @@ setInterval(() => {
 }, 15000);
 window.addEventListener('resize', () => { timelineDirty = true; });
 document.addEventListener('visibilitychange', () => {
-  // Hidden: close /events and abort the history request. Visible: open /events again and reload history. No backoff timer.
+  // Hidden: close /events, abort the history request, and cancel a queued wall frame.
+  // Visible: open /events again and reload history. No backoff timer. Listeners are not added again.
   if (document.hidden) {
     source?.close();
     source = null;
     historyRequest++;
     historyController?.abort();
+    cancelWallReflow();
   } else {
     connectStream();
     loadHistory();
