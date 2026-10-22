@@ -452,6 +452,62 @@ test('a closed live stream is opened again after a backoff', async () => {
   assert.equal(context.connection.offline, true);
 });
 
+/** Catches a localhost-only default, and a WEB_HOST override that is ignored. */
+test('WEB_HOST defaults to 0.0.0.0 and an explicit host is kept', () => {
+  const { spawnSync } = require('node:child_process');
+  const script = `process.stdout.write(require(${JSON.stringify(path.join(__dirname, '../src/config.js'))}).webHost)`;
+  /**
+   * Loads config in a child with only PATH, plus an optional WEB_HOST.
+   * @param {string|undefined} webHost Value to set, or undefined to leave it unset.
+   * @returns {string} The child's webHost.
+   */
+  const run = (webHost) => {
+    const env = { PATH: process.env.PATH };
+    if (webHost !== undefined) env.WEB_HOST = webHost;
+    const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8', env });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  };
+  assert.equal(run(undefined), '0.0.0.0');
+  assert.equal(run('127.0.0.1'), '127.0.0.1');
+  assert.equal(run(''), '0.0.0.0');
+});
+
+/** Catches a startup line that prints http://0.0.0.0, or that drops LAN addresses. */
+test('the UI log names localhost and LAN addresses when listening on all interfaces', () => {
+  const context = vm.createContext({
+    os: {
+      networkInterfaces() {
+        return {
+          eth0: [
+            { family: 'IPv4', internal: false, address: '192.168.1.20' },
+            { family: 'IPv6', internal: false, address: 'fe80::1' },
+            { family: 'IPv4', internal: true, address: '127.0.0.1' },
+          ],
+          eth1: [
+            { family: 4, internal: false, address: '10.0.0.8' },
+            { family: 4, internal: false, address: '192.168.1.20' },
+          ],
+        };
+      },
+    },
+  });
+  load(serverCode, 'function webListenLines(', 'server.listen(', context);
+  // The returned arrays belong to the vm realm, so compare their text.
+  const lines = (host, port) => context.webListenLines(host, port).join('\n');
+  assert.equal(lines('0.0.0.0', 8080), [
+    'http://127.0.0.1:8080',
+    'http://192.168.1.20:8080',
+    'http://10.0.0.8:8080',
+  ].join('\n'));
+  assert.equal(lines('127.0.0.1', 8080), 'http://127.0.0.1:8080');
+  assert.equal(lines('192.168.0.5', 8080), 'http://192.168.0.5:8080');
+  context.os.networkInterfaces = () => { throw new Error('unavailable'); };
+  assert.equal(lines('0.0.0.0', 8080), 'http://127.0.0.1:8080');
+  const listenAt = serverCode.indexOf('server.listen(config.webPort, config.webHost');
+  assert.match(serverCode.slice(listenAt, listenAt + 500), /webListenLines\(config\.webHost, config\.webPort\)/);
+});
+
 /** Catches the thread-pool size being set after the server module loads. */
 test('the start wrapper sets the libuv pool size before loading the server', () => {
   const start = fs.readFileSync(path.join(__dirname, '..', 'src', 'start.js'), 'utf8');

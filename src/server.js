@@ -14,6 +14,7 @@ if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = '16';
 
 const http = require('node:http');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { SerialPort } = require('serialport');
 
@@ -1060,15 +1061,52 @@ server.on('error', (error) => {
 });
 
 /**
+ * URLs to print when the HTTP server starts listening.
+ * 0.0.0.0 is not a useful browser address, so that bind prints
+ * http://127.0.0.1:port and then each non-internal IPv4 address from
+ * os.networkInterfaces(). A specific WEB_HOST is printed as-is.
+ * @param {string} host config.webHost.
+ * @param {number|string} port config.webPort.
+ * @returns {string[]} Absolute http URLs, localhost first when host is 0.0.0.0.
+ * Side effects: may call os.networkInterfaces(). A throw from that call is ignored
+ *   and only the localhost URL is returned. Does not log.
+ * @emits none
+ */
+function webListenLines(host, port) {
+  if (host !== '0.0.0.0') return [`http://${host}:${port}`];
+  const lines = [`http://127.0.0.1:${port}`];
+  const seen = new Set(['127.0.0.1']);
+  let interfaces = {};
+  try {
+    interfaces = os.networkInterfaces() || {};
+  } catch {
+    interfaces = {};
+  }
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries || []) {
+      if (!entry || entry.internal) continue;
+      if (entry.family !== 'IPv4' && entry.family !== 4) continue;
+      if (!entry.address || seen.has(entry.address)) continue;
+      seen.add(entry.address);
+      lines.push(`http://${entry.address}:${port}`);
+    }
+  }
+  return lines;
+}
+
+/**
  * Logs the listen addresses, starts the receiver, and starts archive auto-refresh.
  * @returns {void}
- * Side effects: console.log for the web URL, history retention, and receiver target.
+ * Side effects: one console.log per URL from webListenLines (localhost, then LAN
+ *   IPv4 addresses, when bound to 0.0.0.0), history retention, and receiver target.
  *   receiver.start(). archive.startAuto(5000). When archive auto is enabled, logs the
  *   archive root, day count, and refresh minutes.
  * @emits status through receiver.start.
  */
 server.listen(config.webPort, config.webHost, () => {
-  console.log(`[web] http://${config.webHost}:${config.webPort}`);
+  for (const url of webListenLines(config.webHost, config.webPort)) {
+    console.log(`[web] ${url}`);
+  }
   console.log(`[history] retaining ${config.historyRetentionMinutes} minutes${config.historyFile ? ` in ${config.historyFile}` : ' (memory only)'}`);
   const serialTarget = `${config.serialPath} @ ${config.serialBaudRate}`;
   const tcpTarget = `${config.receiverHost}:${config.receiverPort}`;

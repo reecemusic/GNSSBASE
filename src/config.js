@@ -224,9 +224,10 @@ const config = {
   // NOVATEL_IDLE_MS defaults to 30000.
   idleTimeoutMs: integerSetting('NOVATEL_IDLE_MS', 30000, 1),
 
-  // Local web UI. WEB_HOST defaults to 127.0.0.1. WEB_PORT defaults to 8080
+  // Web UI. WEB_HOST defaults to 0.0.0.0 so other devices on the LAN can open the page.
+  // Set WEB_HOST=127.0.0.1 to listen on localhost only. WEB_PORT defaults to 8080
   // and accepts an integer from 0 to 65535.
-  webHost: process.env.WEB_HOST || '127.0.0.1',
+  webHost: process.env.WEB_HOST || '0.0.0.0',
   webPort: integerSetting('WEB_PORT', 8080, 0, 65535),
 
   // How many recent ITDETECTSTATUS messages to replay to a newly opened browser.

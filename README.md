@@ -7,10 +7,12 @@ profile and displays them live in a browser. Node 22 or newer (current LTS). The
 ## Run
 
 ```bash
-npm start                       # tries COM11 @ 9600, then 20.20.20.50:3001; UI at http://127.0.0.1:8080
+npm start                       # tries COM11 @ 9600, then 20.20.20.50:3001; UI listens on all interfaces, still at http://127.0.0.1:8080
 ```
 
 `npm start` runs `node src/start.js`, which sets `UV_THREADPOOL_SIZE` to 16 when the variable is not already set, then loads the server. Set the variable in the service environment if you want a different pool size. It has to be set before the process uses the filesystem; changing it later does nothing.
+
+Other devices on the same network can open `http://<PC IP>:8080`. Windows Firewall will prompt to allow Node on private networks. The UI has no authentication, and the settings panel can change the receiver connection, so anyone on the network can do that. Set `WEB_HOST=127.0.0.1` to restrict the page to this PC.
 
 ## Running always-on
 
@@ -371,7 +373,7 @@ Band cards and statistics remain live-only.
 | `NOVATEL_SEND_LOG_CMD` | `false` | When `true`, sends `UNLOGALL THISPORT` plus its own `LOG ...A` requests on connect. Leave `false` when the receiver is running [profiles/GNSSBASE.txt](profiles/GNSSBASE.txt), which already pushes these logs to ICOM1 — `UNLOGALL THISPORT` would remove them. |
 | `NOVATEL_RECONNECT_MS` | `3000` | Reconnect delay |
 | `NOVATEL_IDLE_MS` | `30000` | Recycle the socket if no data arrives for this long |
-| `WEB_HOST` / `WEB_PORT` | `127.0.0.1` / `8080` | Web UI bind address. Localhost by default; the UI has no authentication. |
+| `WEB_HOST` / `WEB_PORT` | `0.0.0.0` / `8080` | Web UI bind address. `0.0.0.0` accepts connections from other devices. The UI has no authentication. Set `WEB_HOST=127.0.0.1` to listen on localhost only. |
 | `HISTORY_SIZE` / `RAW_LOG_SIZE` | `50` / `200` | Replay buffers sent to a newly opened browser |
 | `HISTORY_RETENTION_MIN` | `1440` | How far back skyplot traces and the interference timeline are kept. This is the longest window a browser can select. |
 | `TRACK_SAMPLE_SEC` | `20` | Minimum spacing between skyplot trace samples per satellite |
