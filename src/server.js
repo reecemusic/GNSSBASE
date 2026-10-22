@@ -184,6 +184,33 @@ function processReceiverLog(message) {
     record && record.receivedAt,
   );
 
+  /**
+   * Display copy of a raw frame. Strings past 16 KiB are cut so rawLog and snapshots
+   * cannot retain a multi-megabyte frame. Shorter text, including undefined, is unchanged.
+   * The page already shows this same truncation.
+   * @param {*} text Raw field.
+   * @returns {*}
+   * Side effects: none.
+   * @emits none
+   */
+  const storedRaw = (text) => {
+    if (typeof text !== 'string' || text.length <= 16384) return text;
+    return `${text.slice(0, 16384)} [display truncated]`;
+  };
+
+  /**
+   * Counts one message name. A 257th distinct name is ignored so store.counts stays bounded.
+   * Names already present keep incrementing.
+   * @param {string} messageName Log name.
+   * @returns {void}
+   * Side effects: store.counts.
+   * @emits none
+   */
+  const noteCount = (messageName) => {
+    if (!Object.hasOwn(store.counts, messageName) && Object.keys(store.counts).length >= 256) return;
+    store.counts[messageName] = (store.counts[messageName] || 0) + 1;
+  };
+
   let record;
   try {
     // A decode throw is logged, set on the receiver error, and counted.
@@ -193,8 +220,8 @@ function processReceiverLog(message) {
     console.error(`[receiver] could not decode log: ${error.message}`);
     if (typeof receiver !== 'undefined' && receiver && typeof receiver.setError === 'function') receiver.setError(error);
     const name = (message && message.header && message.header.messageName) || 'UNKNOWN';
-    store.counts[name] = (store.counts[name] || 0) + 1;
-    const diagnostic = `${error.message}\n${message && message.raw ? message.raw : ''}`.trim();
+    noteCount(name);
+    const diagnostic = storedRaw(`${error.message}\n${message && message.raw ? message.raw : ''}`.trim());
     const receivedAt = new Date().toISOString();
     store.rawLog.push({
       name, receivedAt, format: message && message.format, crcValid: message && message.crcValid, raw: diagnostic,
@@ -220,9 +247,10 @@ function processReceiverLog(message) {
   // CRC-valid records update live state. Failed CRC still reaches the raw log,
   // and ITDETECTSTATUS is still pushed onto itdetectHistory below.
   const trusted = record.crcValid === true;
+  if (typeof record.raw === 'string') record.raw = storedRaw(record.raw);
   if (trusted) store.latest[name] = record;
-  // Every decoded message is counted, including a failed CRC.
-  store.counts[name] = (store.counts[name] || 0) + 1;
+  // Every decoded message is counted, including a failed CRC. At most 256 names.
+  noteCount(name);
 
   // Only a CRC-valid ephemeris updates the per-satellite table.
   if (trusted && record.kind === 'ephemeris') {
@@ -233,7 +261,11 @@ function processReceiverLog(message) {
     const previous = entry.records[entry.lastSatellite];
     const hasParameters = record.data && record.data.parameters && record.data.parameters.length;
     // A record with no parameters does not replace a stored record for that satellite.
-    if (entry.lastSatellite && (hasParameters || !previous)) entry.records[entry.lastSatellite] = record;
+    // A new satellite id past 128 is ignored. An id already stored is still updated.
+    if (entry.lastSatellite && (hasParameters || !previous)
+      && (previous || Object.keys(entry.records).length < 128)) {
+      entry.records[entry.lastSatellite] = record;
+    }
     entry.satellites = Object.keys(entry.records);
     store.ephemeris[name] = entry;
   }
@@ -278,7 +310,9 @@ function processReceiverLog(message) {
   }
 
   // A decoded record is appended to the raw log whether or not its CRC matched.
-  store.rawLog.push({ name, receivedAt: record.receivedAt, format: record.format, crcValid: record.crcValid, raw: record.raw });
+  store.rawLog.push({
+    name, receivedAt: record.receivedAt, format: record.format, crcValid: record.crcValid, raw: storedRaw(record.raw),
+  });
   if (store.rawLog.length > config.rawLogSize) store.rawLog.shift();
 
   // ephemeris is undefined unless this record is a trusted ephemeris, so JSON.stringify omits it.

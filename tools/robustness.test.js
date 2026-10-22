@@ -1236,6 +1236,47 @@ test('a decode failure is logged and does not replace the last good record', () 
   assert.equal(context.store.counts.BESTSATS, 1);
 });
 
+/** Catches a raw log or live record that keeps a multi-megabyte frame, or an ephemeris map that grows past 128 satellites. */
+test('raw storage is truncated and ephemeris and message counts stay capped', () => {
+  const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  const context = vm.createContext({
+    decode: (record) => record,
+    store: { latest: {}, counts: {}, itdetectHistory: [], satvisBySystem: {}, ephemeris: {}, rawLog: [] },
+    config: { historySize: 50, rawLogSize: 200 },
+    history: { addSolution() {}, addSatellites() {}, addInterference() {} },
+    broadcast() {},
+    console: { warn() {}, error() {} },
+    saneTimestamp,
+  });
+  vm.runInContext(serverCode.slice(serverCode.indexOf('function processReceiverLog('), serverCode.indexOf('function broadcast(')), context);
+  const huge = 'R'.repeat(200000);
+  context.processReceiverLog({
+    name: 'RANGE', crcValid: true, raw: huge, receivedAt: '2026-10-22T00:00:00.000Z', format: 'ascii',
+  });
+  assert.ok(context.store.rawLog[0].raw.length < 16420);
+  assert.match(context.store.rawLog[0].raw, /display truncated/);
+  assert.ok(context.store.latest.RANGE.raw.length < 16420);
+  for (let index = 0; index < 200; index++) {
+    context.processReceiverLog({
+      name: 'GPSEPHEM', kind: 'ephemeris', crcValid: true, receivedAt: '2026-10-22T00:00:00.000Z',
+      data: { satelliteId: `S${index}`, parameters: [1] },
+    });
+  }
+  assert.equal(Object.keys(context.store.ephemeris.GPSEPHEM.records).length, 128);
+  context.processReceiverLog({
+    name: 'GPSEPHEM', kind: 'ephemeris', crcValid: true, receivedAt: '2026-10-22T00:00:01.000Z',
+    data: { satelliteId: 'S0', parameters: [2] },
+  });
+  assert.equal(context.store.ephemeris.GPSEPHEM.records.S0.data.parameters[0], 2);
+  for (let index = 0; index < 300; index++) {
+    context.processReceiverLog({ name: `M${index}`, crcValid: true, receivedAt: '2026-10-22T00:00:00.000Z' });
+  }
+  assert.equal(Object.keys(context.store.counts).length, 256);
+  const before = context.store.counts.M0;
+  context.processReceiverLog({ name: 'M0', crcValid: true, receivedAt: '2026-10-22T00:00:00.000Z' });
+  assert.equal(context.store.counts.M0, before + 1);
+});
+
 /** Catches a track map past 512 entries, or a replace that gives up on the first EPERM. */
 test('history keeps at most 512 satellite tracks and replaces a file after EPERM', () => {
   assert.equal(MAX_TRACKS, 512);

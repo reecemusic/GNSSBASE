@@ -231,7 +231,7 @@ function historyContext() {
     state: { windowMinutes: 60, interferenceHistory: [], tracks: {} },
     isValidSkyPosition: () => true,
   });
-  loadFunctions(browserCode, 'function pruneClientHistory()', '// --- interference timeline', context);
+  loadFunctions(browserCode, 'function boundSeries(', '// --- interference timeline', context);
   return context;
 }
 
@@ -265,6 +265,86 @@ test('satellite history retains its seed and limits loaded tracks', () => {
   assert.equal(context.state.tracks['GPS:1'].length, 1081);
 });
 
+/** Catches a 24 h series that keeps every 1 Hz point, or a downsample that drops a detection or the newest samples. */
+test('a long interference history is downsampled without dropping a detection or the newest half', () => {
+  const context = historyContext();
+  context.state.windowMinutes = 1440;
+  const now = Date.now();
+  const count = 80000;
+  const span = 20 * 60 * 60 * 1000;
+  context.state.interferenceHistory = Array.from({ length: count }, (_, index) => ({
+    t: now - span + Math.floor((index / (count - 1)) * span),
+    signal: 'L1',
+    count: index === 1000 ? 2 : 0,
+    maxPower: index === 1000 ? -35 : null,
+    index,
+  }));
+  context.pruneClientHistory();
+  const kept = context.state.interferenceHistory;
+  assert.ok(kept.length <= 10000);
+  assert.ok(kept.length < count);
+  assert.equal(kept[kept.length - 1].index, count - 1);
+  assert.equal(kept[kept.length - 5000].index, count - 5000, 'newest half stays sample for sample');
+  assert.ok(kept.some((sample) => sample.index === 1000 && sample.count === 2 && sample.maxPower === -35));
+});
+
+/** Catches a second snapshot of the same satellite report appending another point. */
+test('replaying a snapshot satellite report does not append a second point', () => {
+  const context = vm.createContext({
+    MAX_INTERFERENCE_SAMPLES: 100,
+    SOLUTION_HEARTBEAT_MS: 10000,
+    state: { satelliteViewHistory: [] },
+    trackedSatelliteSummary: () => [],
+    satellitesInViewBySystem: () => ({}),
+  });
+  loadFunctions(browserCode, 'function recordSatelliteView(', 'const SATELLITE_VIEW =', context);
+  const record = { name: 'RANGE', crcValid: true, receivedAt: '2026-10-22T12:00:00.000Z' };
+  context.recordSatelliteView(record);
+  context.recordSatelliteView(record);
+  assert.equal(context.state.satelliteViewHistory.length, 1);
+  context.recordSatelliteView({ ...record, receivedAt: '2026-10-22T12:00:05.000Z' });
+  assert.equal(context.state.satelliteViewHistory.length, 1, 'unchanged counts inside the heartbeat are one point');
+});
+
+/** Catches a heap safety net that reloads immediately, reloads twice, or ignores heapmb=0. */
+test('a high heap reloads once, and heapmb=0 does not reload', () => {
+  let reloaded = 0;
+  const store = new Map();
+  const context = vm.createContext({
+    URLSearchParams,
+    location: { search: '', reload() { reloaded += 1; } },
+    performance: { memory: { usedJSHeapSize: 900 * 1024 * 1024 } },
+    sessionStorage: {
+      getItem: (key) => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => store.set(key, value),
+    },
+    console: { warn() {} },
+    liveStatusStartedAt: Date.now(),
+    Date,
+  });
+  loadFunctions(browserCode, 'const HEAP_RELOAD_DEFAULT_MB =', 'setInterval(() => flushUpdates()', context);
+  assert.equal(context.heapReloadLimitMb(), 768);
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 0, 'a page younger than 10 minutes stays up');
+  context.liveStatusStartedAt = Date.now() - 11 * 60 * 1000;
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 1);
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 1, 'the cooldown blocks a second reload');
+  context.location.search = '?wall=1&heapmb=0';
+  store.clear();
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 1, 'heapmb=0 disables the reload');
+  assert.equal(context.heapReloadLimitMb(), 0);
+  context.location.search = '?heapmb=100';
+  context.performance.memory.usedJSHeapSize = 50 * 1024 * 1024;
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 1, 'an override below the heap does not reload');
+  context.performance.memory.usedJSHeapSize = 150 * 1024 * 1024;
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 2);
+});
+
 /** Catches a flush that renders a hidden tab, or queues that grow without the stated caps. */
 test('rendering coalesces input, bounds queues and skips inactive panels', () => {
   const renders = [];
@@ -290,6 +370,9 @@ test('rendering coalesces input, bounds queues and skips inactive panels', () =>
   assert.equal(context.pendingRaw.length, 300);
   assert.equal(context.pendingInterference.length, 50);
   assert.equal(context.dirtyRecords.size, 1);
+  context.applyRecord({ name: 'BESTPOS', crcValid: true, raw: 'z'.repeat(100000), data: {} });
+  assert.ok(context.latestByName.BESTPOS.raw.length < 16420);
+  assert.match(context.latestByName.BESTPOS.raw, /display truncated/);
   context.flushUpdates();
   assert(!renders.includes('renderBestPos'));
   tab = 'position';
@@ -783,6 +866,14 @@ test('frequency markers group only matching pixel-level detections and preserve 
   assert.equal(markers[0].sample.t, 101);
   assert.equal(context.spectrumMarkers(hits, (t) => t).length, 7, 'Zoom separates distinct times');
   assert.equal(context.spectrumMarkers([], (t) => t).length, 0);
+  const pixelY = (mhz) => mhz;
+  const overlapped = context.spectrumMarkers([
+    hit(100, -100, 1176.1e6),
+    hit(100, -70, 1176.4e6),
+    hit(100, -90, 1207.14e6),
+  ], () => 10, pixelY);
+  assert.equal(overlapped.length, 2, 'frequencies on one pixel collapse; a distant frequency stays');
+  assert.equal(overlapped[0].detection.power, -70);
 });
 
 /** Catches a wheel zoom that moves the time under the cursor, or a cancelled drag that keeps panning. */
