@@ -148,6 +148,13 @@ h2:first-child { margin-top: 0; }
 
 .height-card .card-header {
   min-height: 1.6rem;
+  flex-wrap: wrap;
+}
+
+/* The toggle hides overflow so its corners stay rounded, which lets a flex row
+   squeeze it to nothing and clip "Ellipsoidal". Keep the control at its text width. */
+.height-card .card-header .toggle {
+  flex-shrink: 0;
 }
 
 .card .label { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
@@ -163,6 +170,8 @@ h2:first-child { margin-top: 0; }
 .quality.none { border-color: var(--bad); color: var(--bad); background: rgba(255, 95, 86, .12); }
 
 table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+/* Wide tables scroll inside the page instead of stretching it. */
+.table-scroll { width: 100%; max-width: 100%; overflow-x: auto; }
 th, td { padding: .5rem .75rem; text-align: left; border-bottom: 1px solid var(--line); font-variant-numeric: tabular-nums; }
 th { color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
 tr:last-child td { border-bottom: none; }
@@ -271,6 +280,7 @@ select {
 .key-marker { width: .8rem; height: .8rem; border-radius: 50%; display: inline-block; flex: none; }
 .key-marker.used { background: var(--ok); }
 .key-marker.tracked { background: rgba(27, 32, 41, .9); border: 2px solid var(--ok); }
+.key-marker.unknown { background: rgba(27, 32, 41, .9); border: 2px dashed var(--ok); }
 .key-marker.visible { border: 2px dashed var(--muted); }
 .key-marker.missing { border: 2px dashed var(--warn); }
 .key-marker.unhealthy { border: 2px solid var(--bad); }
@@ -692,6 +702,36 @@ html.wall-idle, html.wall-idle * { cursor: none !important; }
 .wall .band:not([data-band="L1"]):not([data-band="L2"]):not([data-band="L5"]):not(.jammed) { display: none; }
 .wall .band { flex: 1 1 auto; min-height: 0; overflow: hidden; padding: .6rem 1rem .7rem; border-top-width: .4rem; border-radius: 10px; }
 .wall .band.jammed { flex-grow: 3; }
+/* Four cards (L1, L2, L5, plus a jammed band such as SBAS) share a fixed column.
+   The extra card inherits the page header's bottom margin and is then clipped
+   mid-sentence by overflow. Tighten only that case so the stats stay whole. */
+.wall .bands:has(.band.jammed:not([data-band="L1"]):not([data-band="L2"]):not([data-band="L5"])) {
+  gap: .4rem;
+}
+.wall .bands:has(.band.jammed:not([data-band="L1"]):not([data-band="L2"]):not([data-band="L5"])) > .band {
+  min-height: min-content;
+  overflow: visible;
+  padding-top: .35rem;
+  padding-bottom: .4rem;
+}
+.wall .bands:has(.band.jammed:not([data-band="L1"]):not([data-band="L2"]):not([data-band="L5"])) > .band > header {
+  margin-bottom: 0;
+  line-height: 1.15;
+}
+.wall .bands:has(.band.jammed:not([data-band="L1"]):not([data-band="L2"]):not([data-band="L5"])) .band-stats {
+  margin-top: .3rem;
+  padding-top: .25rem;
+  line-height: 1.3;
+}
+.wall .bands:has(.band.jammed:not([data-band="L1"]):not([data-band="L2"]):not([data-band="L5"])) .meter {
+  margin-top: .35rem;
+}
+.wall .bands:has(.band.jammed:not([data-band="L1"]):not([data-band="L2"]):not([data-band="L5"])) .band-detections {
+  margin-top: .3rem;
+}
+.wall .bands:has(.band.jammed:not([data-band="L1"]):not([data-band="L2"]):not([data-band="L5"])) .chips {
+  margin-top: .25rem;
+}
 .wall .band header { flex-wrap: nowrap; }
 .wall .band-title { font-size: 1.45rem; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wall .chip.muted-chip { display: none; }
