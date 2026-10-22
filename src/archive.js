@@ -390,10 +390,30 @@ function createItDetectScanner(summary) {
     }
   }
 
-  /** At end of file an abbreviated message cannot be followed by more rows, so the carried block is complete. */
+  /** A carried long header whose declared length is past the bytes we actually have. */
+  function declaredLengthOverruns(buf) {
+    if (!buf || buf.length < LONG_HEADER_LENGTH) return false;
+    if (buf[0] !== 0xaa || buf[1] !== 0x44 || buf[2] !== 0x12 || buf[3] !== LONG_HEADER_LENGTH) return false;
+    const total = buf[3] + buf.readUInt16LE(8) + 4;
+    return total <= MAX_FRAME_BYTES && total > buf.length;
+  }
+
+  /**
+   * At end of file an abbreviated message cannot be followed by more rows, so the carried block is complete.
+   * A non-target length that runs past EOF is not a real frame: rescan from the next byte.
+   */
   function end() {
-    if (carry && carry[0] === 0x3c && carry.indexOf(0x0a) !== -1) {
-      handleAscii(abbreviatedToAscii(carry.toString('latin1')));
+    let guard = carry ? carry.length : 0;
+    while (carry && carry.length && guard-- > 0) {
+      if (carry[0] === 0x3c && carry.indexOf(0x0a) !== -1) {
+        handleAscii(abbreviatedToAscii(carry.toString('latin1')));
+        break;
+      }
+      if (!declaredLengthOverruns(carry)) break;
+      const next = Buffer.from(carry.subarray(1));
+      carry = null;
+      push(next);
+      if (carry && carry.length >= next.length) break;
     }
     carry = null;
   }
@@ -471,6 +491,7 @@ class InterferenceArchive extends EventEmitter {
     this.view = null;
     this.hung = 0;
     this.pendingFs = 0;
+    this.stuckHandles = 0;
     this.autoTimer = null;
     this.autoState = { lastRunAt: null, nextRunAt: null, lastError: null };
     this.stream = null;
@@ -730,8 +751,10 @@ class InterferenceArchive extends EventEmitter {
       this.scheduleAuto(this.options.busyRetryMs);
       return;
     }
-    if (this.hung > 0 || this.pendingFs > 0) {
-      this.autoState.lastError = 'The network folder has not answered an earlier request yet; will retry';
+    if (this.hung > 0 || this.pendingFs > 0 || this.stuckHandles > 0) {
+      if (this.hung > 0 || this.pendingFs > 0 || !this.autoState.lastError) {
+        this.autoState.lastError = 'The network folder has not answered an earlier request yet; will retry';
+      }
       this.scheduleAuto(this.options.refreshMs);
       this.update({}, true);
       return;
@@ -742,7 +765,7 @@ class InterferenceArchive extends EventEmitter {
   }
 
   assertAvailable() {
-    if (this.hung > 0 || this.pendingFs > 0 || (this.stream && !this.stream.closed)) {
+    if (this.hung > 0 || this.pendingFs > 0 || this.stuckHandles > 0 || (this.stream && !this.stream.closed)) {
       throw new Error('Archive network folder still has an outstanding request; wait before retrying. Live data is unaffected.');
     }
   }
@@ -802,8 +825,17 @@ class InterferenceArchive extends EventEmitter {
     this.cancelScan = null;
     if (cancel) cancel();
     if (stream) {
-      if (!stream.closed) this.trackHung(new Promise((resolve) => stream.once('close', resolve)));
-      stream.destroy();
+      if (!stream.closed) {
+        this.stuckHandles++;
+        const closed = new Promise((resolve) => {
+          stream.once('close', () => {
+            if (this.stuckHandles > 0) this.stuckHandles--;
+            resolve();
+          });
+        });
+        this.trackHung(closed);
+      }
+      if (typeof stream.destroy === 'function') stream.destroy();
     }
   }
 
@@ -1015,23 +1047,40 @@ class InterferenceArchive extends EventEmitter {
     return path.join(this.options.cacheDir, `${key}.json.gz`);
   }
 
-  async readCache(file) {
-    const cachePath = this.cachePath(file);
-    if (!cachePath) return null;
+  cacheMatches(parsed, file) {
+    return Boolean(parsed) && parsed.version === CACHE_VERSION && parsed.path === file.path && parsed.size === file.size
+      && parsed.mtimeMs === file.mtimeMs && Array.isArray(parsed.coverage) && Array.isArray(parsed.samples)
+      && Array.isArray(parsed.solution) && Number.isFinite(parsed.solutionReports)
+      && Number.isFinite(parsed.solutionResolutionMs) && Array.isArray(parsed.bestsats)
+      && Number.isFinite(parsed.bestsatsReports) && Number.isFinite(parsed.bestsatsResolutionMs);
+  }
+
+  async readCacheFile(cachePath, file) {
+    let raw;
     try {
-      const parsed = JSON.parse(await gunzip(await fs.promises.readFile(cachePath)));
-      if (parsed.version !== CACHE_VERSION || parsed.path !== file.path || parsed.size !== file.size
-        || parsed.mtimeMs !== file.mtimeMs || !Array.isArray(parsed.coverage) || !Array.isArray(parsed.samples)
-        || !Array.isArray(parsed.solution) || !Number.isFinite(parsed.solutionReports)
-        || !Number.isFinite(parsed.solutionResolutionMs) || !Array.isArray(parsed.bestsats)
-        || !Number.isFinite(parsed.bestsatsReports) || !Number.isFinite(parsed.bestsatsResolutionMs)) {
-        return null;
-      }
-      return parsed;
+      raw = await fs.promises.readFile(cachePath);
     } catch (error) {
       if (error.code !== 'ENOENT') console.warn(`[archive] ignoring cache for ${file.path}: ${error.message}`);
       return null;
     }
+    try {
+      const parsed = JSON.parse(await gunzip(raw));
+      return this.cacheMatches(parsed, file) ? parsed : null;
+    } catch (error) {
+      console.warn(`[archive] ignoring cache for ${file.path}: ${error.message}`);
+      return null;
+    }
+  }
+
+  async readCache(file) {
+    const cachePath = this.cachePath(file);
+    if (!cachePath) return null;
+    const primary = await this.readCacheFile(cachePath, file);
+    if (primary) return primary;
+    const backup = await this.readCacheFile(`${cachePath}.bak`, file);
+    if (!backup) return null;
+    console.warn(`[archive] using cache backup for ${file.path}`);
+    return backup;
   }
 
   async writeCache(file, summary) {
@@ -1054,10 +1103,12 @@ class InterferenceArchive extends EventEmitter {
   async deleteCache(file) {
     const cachePath = this.cachePath(file);
     if (!cachePath) return;
-    try {
-      await fs.promises.unlink(cachePath);
-    } catch (error) {
-      if (error.code !== 'ENOENT') console.warn(`[archive] could not delete cache for ${file.path}: ${error.message}`);
+    for (const target of [cachePath, `${cachePath}.bak`]) {
+      try {
+        await fs.promises.unlink(target);
+      } catch (error) {
+        if (error.code !== 'ENOENT') console.warn(`[archive] could not delete cache for ${file.path}: ${error.message}`);
+      }
     }
   }
 
@@ -1070,7 +1121,8 @@ class InterferenceArchive extends EventEmitter {
       if (entries.length <= this.options.maxCacheFiles) return;
       entries.sort((a, b) => a.mtimeMs - b.mtimeMs);
       for (const entry of entries.slice(0, entries.length - this.options.maxCacheFiles)) {
-        fs.unlinkSync(path.join(dir, entry.name));
+        fs.rmSync(path.join(dir, entry.name), { force: true });
+        fs.rmSync(path.join(dir, `${entry.name}.bak`), { force: true });
       }
     } catch (error) {
       console.warn(`[archive] could not prune cache: ${error.message}`);

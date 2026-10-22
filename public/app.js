@@ -413,7 +413,7 @@ function applySnapshot(snap) {
   lastItReportHadDetections = false;
   (snap.itdetectHistory || []).forEach((record) => {
     rememberLastDetection(record);
-    if (record.receivedAt && (!latestByName.ITDETECTSTATUS
+    if (record.crcValid === true && record.receivedAt && (!latestByName.ITDETECTSTATUS
       || Date.parse(record.receivedAt) > Date.parse(latestByName.ITDETECTSTATUS.receivedAt))) {
       latestByName.ITDETECTSTATUS = record;
     }
@@ -849,9 +849,13 @@ function pruneClientHistory() {
 
 function recordLiveHistory(record) {
   if (record.crcValid !== true) return;
+  // Same rule as saneTimestamp in src/novatel.js: ignore week-0 and other GPS times far from the PC clock.
+  const nowMs = Date.now();
   const headerTime = Date.parse(record.header && record.header.utc);
   const receivedTime = Date.parse(record.receivedAt);
-  const now = Number.isFinite(headerTime) ? headerTime : Number.isFinite(receivedTime) ? receivedTime : Date.now();
+  const headerSane = Number.isFinite(headerTime) && headerTime >= Date.UTC(2020, 0, 1)
+    && Math.abs(headerTime - nowMs) <= 5 * 60 * 1000;
+  const now = headerSane ? headerTime : Number.isFinite(receivedTime) ? receivedTime : nowMs;
   if (record.name === 'SATVIS2' && record.data && record.data.visibilityValid !== false) {
     for (const sat of record.data.satellites || []) {
       if (!isValidSkyPosition(sat.elevation, sat.azimuth)) continue;

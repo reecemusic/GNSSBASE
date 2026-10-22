@@ -54,6 +54,20 @@ function gpsToUtc(week, seconds) {
   return ms === null ? null : new Date(ms).toISOString();
 }
 
+// Week 0 is 1980. Live charts and retention are measured on the computer clock, so a GPS
+// header is used only when it is recent and close to reception time.
+const SANE_GPS_EARLIEST_MS = Date.UTC(2020, 0, 1);
+const SANE_GPS_SKEW_MS = 5 * 60 * 1000;
+
+function saneTimestamp(headerUtc, receivedAt, now = Date.now()) {
+  const headerMs = typeof headerUtc === 'number' ? headerUtc : Date.parse(headerUtc);
+  if (Number.isFinite(headerMs) && headerMs >= SANE_GPS_EARLIEST_MS && Math.abs(headerMs - now) <= SANE_GPS_SKEW_MS) {
+    return headerMs;
+  }
+  const receivedMs = typeof receivedAt === 'number' ? receivedAt : Date.parse(receivedAt);
+  return Number.isFinite(receivedMs) ? receivedMs : now;
+}
+
 /**
  * Parses one NovAtel ASCII sentence (long or short header form).
  * Returns null for anything that is not a recognisable ASCII log
@@ -382,5 +396,8 @@ module.exports = {
   findSyncIndex,
   gpsToUtc,
   gpsToMs,
+  saneTimestamp,
+  SANE_GPS_EARLIEST_MS,
+  SANE_GPS_SKEW_MS,
   MESSAGE_NAMES_BY_ID,
 };

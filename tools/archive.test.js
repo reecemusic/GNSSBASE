@@ -672,6 +672,26 @@ test('abbreviated ASCII BESTSATS and BESTPOS (as logged on the NAS) are decoded 
   assert.equal(truncated.toJSON().crcErrors, 1);
 });
 
+test('a carried non-target length that overruns end of file does not swallow the tail', () => {
+  const start = NOW - 3600000;
+  const detection = binaryFrame(2065, start, itBody([{ rf: 5, center: 1176.45, bandwidth: 3, power: -90 }]));
+  const liar = Buffer.alloc(28);
+  liar.set([0xaa, 0x44, 0x12, 28]);
+  liar.writeUInt16LE(43, 4);
+  liar.writeUInt16LE(20000, 8);
+  const log = Buffer.concat([liar, detection]);
+  for (const size of [log.length, 7, 64]) {
+    const summary = new FileSummary();
+    const scanner = createItDetectScanner(summary);
+    for (let offset = 0; offset < log.length; offset += size) scanner.push(log.subarray(offset, offset + size));
+    scanner.end();
+    const json = summary.toJSON();
+    assert.equal(json.reportCount, 1, `chunk size ${size}`);
+    assert.equal(json.samples.length, 1);
+    assert.equal(json.samples[0].signal, 'L5');
+  }
+});
+
 test('a non-target frame whose length does not land on the next sync is not skipped over', () => {
   const start = NOW - 3600000;
   const detection = binaryFrame(2065, start, itBody([{ rf: 5, center: 1176.45, bandwidth: 3, power: -90 }]));
@@ -729,4 +749,61 @@ test('a network call that never settles stops blocking archive loads after hungR
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(archive.pendingFs, 0);
   assert.equal(archive.hung, 0);
+});
+
+test('a released hung read still blocks the next scan until the handle closes', async () => {
+  const { EventEmitter } = require('node:events');
+  const archive = new InterferenceArchive({
+    hungResetMs: 30, fsTimeoutMs: 20, cacheDir: null, settingsFile: null,
+    defaultRoot: path.parse(process.cwd()).root, refreshMs: 1000,
+  });
+  const stream = new EventEmitter();
+  stream.closed = false;
+  stream.destroy = () => {};
+  archive.stream = stream;
+  archive.stopStream();
+  assert.equal(archive.stuckHandles, 1);
+  assert.equal(archive.hung, 1);
+  assert.throws(() => archive.assertAvailable(), /outstanding request/);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(archive.hung, 0);
+  assert.equal(archive.stuckHandles, 1);
+  assert.throws(() => archive.assertAvailable(), /outstanding request/);
+  archive.settings.auto = true;
+  archive.autoState.lastError = 'A network folder request stayed open and was marked finished so archive loading can continue';
+  let started = 0;
+  archive.start = () => { started += 1; };
+  archive.autoTick();
+  archive.stopAuto();
+  assert.equal(started, 0);
+  assert.match(archive.autoState.lastError, /marked finished/);
+  stream.emit('close');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(archive.stuckHandles, 0);
+  assert.equal(archive.hung, 0);
+  assert.doesNotThrow(() => archive.assertAvailable());
+});
+
+test('archive cache falls back to its backup when the cache file is missing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cache-bak-'));
+  try {
+    const archive = new InterferenceArchive({
+      cacheDir: dir, settingsFile: null, defaultRoot: path.parse(dir).root,
+    });
+    const file = { path: path.join(dir, 'receiver.LOG'), size: 10, mtimeMs: 20 };
+    const summary = {
+      coverage: [], samples: [], solution: [], solutionReports: 0, solutionResolutionMs: 1000,
+      bestsats: [], bestsatsReports: 0, bestsatsResolutionMs: 1000, marker: 1,
+    };
+    await archive.writeCache(file, summary);
+    summary.marker = 2;
+    await archive.writeCache(file, summary);
+    const cachePath = archive.cachePath(file);
+    assert.ok(fs.existsSync(`${cachePath}.bak`));
+    fs.rmSync(cachePath);
+    const restored = await archive.readCache(file);
+    assert.equal(restored.marker, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

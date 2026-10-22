@@ -48,8 +48,15 @@ function validateConnectionSettings(saved) {
   return { transport: transportMode, receiverHost, receiverPort, serialPath, serialBaudRate };
 }
 
-function loadConnectionOverrides(file) {
-  if (!file) return null;
+function describeConnection(saved) {
+  const serial = `${saved.serialPath} @ ${saved.serialBaudRate}`;
+  const tcp = `${saved.receiverHost}:${saved.receiverPort}`;
+  if (saved.transport === 'serial') return `serial ${serial}`;
+  if (saved.transport === 'tcp') return `tcp ${tcp}`;
+  return `auto ${serial}, ${tcp}`;
+}
+
+function readConnectionFile(file) {
   try {
     return validateConnectionSettings(JSON.parse(fs.readFileSync(file, 'utf8')));
   } catch (error) {
@@ -57,6 +64,19 @@ function loadConnectionOverrides(file) {
     console.warn(`[config] ignoring connection settings ${file}: ${error.message}`);
     return null;
   }
+}
+
+function loadConnectionOverrides(file) {
+  if (!file) return null;
+  const saved = readConnectionFile(file);
+  if (saved) {
+    console.log(`[config] using saved connection settings from ${file} (${describeConnection(saved)})`);
+    return saved;
+  }
+  const backup = readConnectionFile(`${file}.bak`);
+  if (!backup) return null;
+  console.log(`[config] using saved connection settings from ${file}.bak (${describeConnection(backup)})`);
+  return backup;
 }
 
 function saveConnectionSettings(file, settings) {

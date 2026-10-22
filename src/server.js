@@ -8,6 +8,7 @@ const { SerialPort } = require('serialport');
 const config = require('./config');
 const { ReceiverClient } = require('./receiver');
 const { decode } = require('./messages');
+const { saneTimestamp } = require('./novatel');
 const { History } = require('./history');
 const { InterferenceArchive } = require('./archive');
 
@@ -93,10 +94,10 @@ receiver.on('log', (message) => {
 });
 
 function processReceiverLog(message) {
-  const reportTimestamp = (record) => {
-    const parsed = Date.parse(record && record.header && record.header.utc);
-    return Number.isFinite(parsed) ? parsed : Date.now();
-  };
+  const reportTimestamp = (record) => saneTimestamp(
+    record && record.header && record.header.utc,
+    record && record.receivedAt,
+  );
 
   let record;
   try {
@@ -326,6 +327,19 @@ function connectionSettings() {
   };
 }
 
+/** Returns an error message when the settings file could not be written. The live receiver is already reconfigured. */
+function persistConnectionSettings() {
+  try {
+    config.saveConnectionSettings(config.connectionSettingsFile, connectionSettings());
+    return null;
+  } catch (error) {
+    const message = `Could not save connection settings: ${error.message}`;
+    console.warn(`[config] ${message}`);
+    receiver.setError(new Error(message));
+    return message;
+  }
+}
+
 const server = http.createServer((req, res) => {
   try {
     handleRequest(req, res);
@@ -401,10 +415,11 @@ function handleRequest(req, res) {
         return;
       }
 
-      try {
-        config.saveConnectionSettings(config.connectionSettingsFile, connectionSettings());
-      } catch (error) {
-        console.warn(`[config] could not save connection settings: ${error.message}`);
+      const saveError = persistConnectionSettings();
+      if (saveError) {
+        res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(saveError);
+        return;
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(connectionSettings()));
@@ -569,17 +584,21 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     receiver.stop();
     archive.stopAuto();
     archive.cancel();
-    history.saveSync();
     const shutdownTimer = setTimeout(() => {
       console.error(`[shutdown] forcing exit after ${SHUTDOWN_TIMEOUT_MS} ms`);
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
       process.exit(1);
     }, SHUTDOWN_TIMEOUT_MS);
-    server.close(() => {
-      clearTimeout(shutdownTimer);
-      process.exit(0);
+    history.flush().then(() => {
+      server.close(() => {
+        clearTimeout(shutdownTimer);
+        process.exit(0);
+      });
+      for (const client of clients) client.destroy();
+      clients.clear();
+    }).catch((error) => {
+      console.error(`[shutdown] history flush failed: ${error.message}`);
+      process.exit(1);
     });
-    for (const client of clients) client.destroy();
-    clients.clear();
   });
 }

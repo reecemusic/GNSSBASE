@@ -9,7 +9,7 @@ const { EventEmitter } = require('node:events');
 const { test } = require('node:test');
 const { ReceiverClient } = require('../src/receiver');
 const { History, MAX_TRACKS, replaceFileSync } = require('../src/history');
-const { parseAsciiLog, readBinaryLog, novatelCrc32, decodeItDetectStatusBinary, scaleFrequencyHz, interpretItDetectStatus } = require('../src/novatel');
+const { parseAsciiLog, readBinaryLog, novatelCrc32, decodeItDetectStatusBinary, scaleFrequencyHz, interpretItDetectStatus, saneTimestamp } = require('../src/novatel');
 const { decode } = require('../src/messages');
 const code = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
 
@@ -82,7 +82,7 @@ test('CRC failures and invalid visibility never enter server or browser history'
     config: { historySize: 50, rawLogSize: 200 },
     history: { addSolution: () => calls.push('solution'), addSatellites: () => calls.push('sky'),
       addInterference: () => calls.push('interference') },
-    broadcast() {}, console: { warn() {} },
+    broadcast() {}, console: { warn() {} }, saneTimestamp,
   });
   vm.runInContext(serverCode.slice(serverCode.indexOf('function processReceiverLog('),
     serverCode.indexOf('function broadcast(')), context);
@@ -1131,6 +1131,7 @@ test('a decode failure is logged and does not replace the last good record', () 
     broadcast() {},
     console: { warn(message) { warnings.push(message); }, error(message) { errors.push(message); } },
     receiver: { setError(error) { this.lastError = error.message; } },
+    saneTimestamp,
   });
   vm.runInContext(serverCode.slice(serverCode.indexOf('function processReceiverLog('), serverCode.indexOf('function broadcast(')), context);
   context.processReceiverLog({ fail: true, header: { messageName: 'BESTSATS' }, raw: '%BESTSATSA;bad', crcValid: true, format: 'ascii' });
@@ -1174,6 +1175,7 @@ test('history keeps at most 512 satellite tracks and replaces a file after EPERM
   try {
     replaceFileSync(destination, temporary);
     assert.equal(fs.readFileSync(destination, 'utf8'), 'new');
+    assert.equal(fs.readFileSync(`${destination}.bak`, 'utf8'), 'old');
   } finally {
     fs.renameSync = rename;
     fs.rmSync(dir, { recursive: true, force: true });
@@ -1188,9 +1190,20 @@ test('connection settings round-trip and retention above 31 days is clamped', ()
   try {
     const settings = { transport: 'serial', receiverHost: '10.1.1.5', receiverPort: 3001, serialPath: 'COM9', serialBaudRate: 115200 };
     config.saveConnectionSettings(file, settings);
-    assert.deepEqual(config.loadConnectionOverrides(file), settings);
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (message) => logs.push(String(message));
+    try {
+      assert.deepEqual(config.loadConnectionOverrides(file), settings);
+    } finally {
+      console.log = originalLog;
+    }
+    assert.match(logs.join('\n'), /using saved connection settings from/);
+    assert.match(logs.join('\n'), /COM9/);
     fs.writeFileSync(file, '{');
     assert.equal(config.loadConnectionOverrides(file), null);
+    fs.writeFileSync(`${file}.bak`, JSON.stringify(settings));
+    assert.deepEqual(config.loadConnectionOverrides(file), settings);
     assert.equal(config.loadConnectionOverrides(''), null);
     assert.throws(() => config.saveConnectionSettings(file, { transport: 'nope' }), /transport/);
   } finally {
@@ -1302,4 +1315,238 @@ test('a silent serial port is recycled without falling straight through to TCP',
   assert.ok(timers.some((timer) => !timer.cleared && timer.ms === 3000));
   assert.equal(ports.length, 1);
   receiver.stop();
+});
+
+test('GPS header time is used only when it is recent and close to the computer clock', () => {
+  const now = Date.UTC(2026, 9, 22, 12, 0, 0);
+  const receivedAt = new Date(now).toISOString();
+  assert.equal(saneTimestamp('1980-01-06T00:00:00.000Z', receivedAt, now), now);
+  assert.equal(saneTimestamp(new Date(now - 60 * 1000).toISOString(), receivedAt, now), now - 60 * 1000);
+  assert.equal(saneTimestamp(new Date(now - 10 * 60 * 1000).toISOString(), receivedAt, now), now);
+  assert.equal(saneTimestamp(undefined, undefined, now), now);
+
+  const browser = vm.createContext({
+    Date, MAX_INTERFERENCE_SAMPLES: 100, MAX_TRACK_SAMPLES: 10, MAX_TRACKS: 512,
+    state: { tracks: {}, interferenceHistory: [] }, isValidSkyPosition: () => true, recordSolution() {},
+  });
+  load(browser, 'function recordLiveHistory(', '// Unchanged solutions');
+  const liveReceived = new Date().toISOString();
+  browser.recordLiveHistory({
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: liveReceived,
+    header: { utc: '1980-01-06T00:00:00.000Z' }, data: { detections: [] },
+  });
+  assert.equal(browser.state.interferenceHistory[0].t, Date.parse(liveReceived));
+  const headerUtc = new Date(Date.now() - 60 * 1000).toISOString();
+  browser.recordLiveHistory({
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: liveReceived,
+    header: { utc: headerUtc }, data: { detections: [] },
+  });
+  assert.equal(browser.state.interferenceHistory[1].t, Date.parse(headerUtc));
+
+  const stamps = [];
+  const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  const context = vm.createContext({
+    decode: (record) => record,
+    store: { latest: {}, counts: {}, itdetectHistory: [], satvisBySystem: {}, ephemeris: {}, rawLog: [] },
+    config: { historySize: 50, rawLogSize: 200 },
+    history: {
+      addInterference: (signal, detections, timestamp) => stamps.push(timestamp),
+      addSolution() {}, addSatellites() {},
+    },
+    broadcast() {}, console: { warn() {} }, saneTimestamp,
+  });
+  vm.runInContext(serverCode.slice(serverCode.indexOf('function processReceiverLog('), serverCode.indexOf('function broadcast(')), context);
+  context.processReceiverLog({
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: liveReceived,
+    header: { utc: '1980-01-06T00:00:00.000Z' },
+    data: { detections: [{ signalType: 'L1', powerDbm: -80, centerFrequencyHz: 1, bandwidthHz: 1 }] },
+  });
+  context.processReceiverLog({
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: liveReceived,
+    header: { utc: headerUtc },
+    data: { detections: [{ signalType: 'L1', powerDbm: -70, centerFrequencyHz: 1, bandwidthHz: 1 }] },
+  });
+  assert.equal(stamps[0], Date.parse(liveReceived));
+  assert.equal(stamps[1], Date.parse(headerUtc));
+});
+
+test('a snapshot keeps CRC-failed interference out of the live display', () => {
+  const latestByName = {};
+  const queued = [];
+  const context = vm.createContext({
+    latestByName,
+    state: { counts: {}, ephemeris: {}, itBySignal: {}, itSeen: 0, satvis: {} },
+    pendingRaw: [], pendingInterference: [],
+    renderStatus() {}, applyArchiveStatus() {},
+    applyRecord(record) { if (record && record.crcValid === true) latestByName[record.name] = record; },
+    recordSatelliteView() {}, rememberLastDetection() {},
+    queueRecord(queue, record) { queued.push(record); },
+    $: () => ({ replaceChildren() {} }),
+    MAX_IT_ROWS: 50, MAX_RAW_ROWS: 300,
+  });
+  load(context, 'function applySnapshot(', 'function applyPayload(');
+  const valid = {
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: '2026-10-22T12:00:01.000Z', data: { detections: [] },
+  };
+  const failed = {
+    name: 'ITDETECTSTATUS', crcValid: false, receivedAt: '2026-10-22T12:00:02.000Z',
+    data: { detections: [{ signalType: 'L1' }] },
+  };
+  context.applySnapshot({ latest: { ITDETECTSTATUS: valid }, itdetectHistory: [valid, failed], counts: {} });
+  assert.equal(context.latestByName.ITDETECTSTATUS.receivedAt, valid.receivedAt);
+  assert.equal(context.latestByName.ITDETECTSTATUS.crcValid, true);
+  assert.equal(queued.length, 2);
+  const newer = { ...valid, receivedAt: '2026-10-22T12:00:03.000Z', data: { detections: [{ signalType: 'L2' }] } };
+  context.applySnapshot({ latest: { ITDETECTSTATUS: valid }, itdetectHistory: [failed, newer], counts: {} });
+  assert.equal(context.latestByName.ITDETECTSTATUS.receivedAt, newer.receivedAt);
+});
+
+test('a failed replace restores the previous file and load falls back to the backup', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'replace-restore-'));
+  const destination = path.join(dir, 'history.json');
+  const temporary = path.join(dir, 'next.json.tmp');
+  fs.writeFileSync(destination, 'old');
+  fs.writeFileSync(temporary, 'new');
+  const rename = fs.renameSync;
+  let placing = false;
+  fs.renameSync = (from, to) => {
+    if (placing && String(from).endsWith('.tmp')) {
+      const error = new Error('disk full');
+      error.code = 'ENOSPC';
+      throw error;
+    }
+    const result = rename(from, to);
+    if (String(to).endsWith('.bak')) placing = true;
+    return result;
+  };
+  try {
+    assert.throws(() => replaceFileSync(destination, temporary), /disk full/);
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'old');
+  } finally {
+    fs.renameSync = rename;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('shutdown flush wins over an older async save, and a bad history file is not overwritten', async () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-flush-'));
+  const file = path.join(dir, 'history.json');
+  const history = new History({
+    retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
+  });
+  const sample = (power) => [{ powerDbm: power, centerFrequencyHz: 1.5e9, bandwidthHz: 1000, type: 'CW' }];
+  const now = Date.now();
+  history.addInterference('L1', sample(-90), now);
+  let releaseFirst;
+  const originalWrite = fs.promises.writeFile;
+  const seen = new Promise((resolve) => {
+    fs.promises.writeFile = (...args) => {
+      if (!releaseFirst && String(args[0]).startsWith(file)) {
+        return new Promise((resolveWrite, rejectWrite) => {
+          releaseFirst = () => originalWrite(...args).then(resolveWrite, rejectWrite);
+          resolve();
+        });
+      }
+      return originalWrite(...args);
+    };
+  });
+  try {
+    const pending = history.save();
+    await seen;
+    history.addInterference('L1', sample(-70), now + 1);
+    const flushing = history.flush();
+    releaseFirst();
+    await flushing;
+    await pending;
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(saved.interference.length, 2);
+    assert.equal(saved.interference[1].maxPower, -70);
+  } finally {
+    fs.promises.writeFile = originalWrite;
+  }
+
+  history.addInterference('L1', sample(-60), now + 2);
+  history.saveSync();
+  fs.writeFileSync(file, '{');
+  const blocked = new History({
+    retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
+  });
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (message) => warnings.push(String(message));
+  try {
+    blocked.load();
+  } finally {
+    console.warn = originalWarn;
+  }
+  assert.equal(blocked.savesDisabled, true);
+  assert.ok(blocked.interference.length >= 1);
+  blocked.addInterference('L1', sample(-50), now + 3);
+  await blocked.save();
+  blocked.saveSync();
+  assert.equal(fs.readFileSync(file, 'utf8'), '{');
+  assert.match(warnings.join('\n'), /saves disabled/);
+
+  fs.rmSync(file);
+  const fromBackup = new History({
+    retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
+  });
+  fromBackup.load();
+  assert.equal(fromBackup.savesDisabled, false);
+  assert.ok(fromBackup.interference.length >= 1);
+  await fromBackup.save();
+  assert.notEqual(fs.readFileSync(file, 'utf8'), '{');
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('an oversize history file is left untouched', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-size-'));
+  const file = path.join(dir, 'history.json');
+  fs.writeFileSync(file, '{"version":1}');
+  const realStat = fs.statSync;
+  fs.statSync = (target, options) => {
+    const stat = realStat(target, options);
+    if (target === file) {
+      return new Proxy(stat, { get: (obj, prop, receiver) => (prop === 'size' ? (65 * 1024 * 1024) : Reflect.get(obj, prop, receiver)) });
+    }
+    return stat;
+  };
+  try {
+    const history = new History({
+      retentionMs: 60000, trackSampleMs: 1, maxInterferenceSamples: 10, filePath: file,
+    });
+    history.load();
+    assert.equal(history.savesDisabled, true);
+    history.saveSync();
+    assert.equal(fs.readFileSync(file, 'utf8'), '{"version":1}');
+  } finally {
+    fs.statSync = realStat;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a connection settings save failure is reported instead of a silent success', () => {
+  const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  assert.match(serverCode, /const saveError = persistConnectionSettings\(\)/);
+  assert.match(serverCode.slice(serverCode.indexOf('const saveError')), /writeHead\(500/);
+  const warnings = [];
+  const context = vm.createContext({
+    config: {
+      connectionSettingsFile: 'settings.json',
+      saveConnectionSettings() { throw new Error('disk full'); },
+    },
+    connectionSettings: () => ({ transport: 'serial' }),
+    receiver: { setError(error) { this.lastError = error.message; } },
+    console: { warn(message) { warnings.push(String(message)); } },
+  });
+  vm.runInContext(serverCode.slice(
+    serverCode.indexOf('function persistConnectionSettings('),
+    serverCode.indexOf('\nconst server ='),
+  ), context);
+  assert.match(context.persistConnectionSettings(), /disk full/);
+  assert.match(context.receiver.lastError, /Could not save connection settings: disk full/);
+  assert.match(warnings[0], /Could not save connection settings/);
+  context.config.saveConnectionSettings = () => {};
+  assert.equal(context.persistConnectionSettings(), null);
+  assert.equal(context.receiver.lastError, 'Could not save connection settings: disk full');
 });

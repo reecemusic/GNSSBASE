@@ -11,24 +11,79 @@ function temporaryPath(filePath) {
   return `${filePath}.${process.pid}.${Date.now()}.${temporarySerial}.tmp`;
 }
 
-/** Replaces `destination`. On Windows, rename over an existing file throws EPERM or EEXIST. */
+/**
+ * Replaces `destination` without deleting it first. The previous file becomes `destination.bak`.
+ * If the new file cannot be moved into place, the backup is renamed back. On Windows, rename
+ * onto an existing file throws EPERM or EEXIST, so the old backup is removed before the move.
+ */
 function replaceFileSync(destination, temporary) {
+  if (!fs.existsSync(destination)) {
+    fs.renameSync(temporary, destination);
+    return;
+  }
+  const backup = `${destination}.bak`;
+  fs.rmSync(backup, { force: true });
+  moveAsideSync(destination, backup);
   try {
     fs.renameSync(temporary, destination);
   } catch (error) {
-    if (error.code !== 'EPERM' && error.code !== 'EEXIST') throw error;
-    fs.rmSync(destination, { force: true });
-    fs.renameSync(temporary, destination);
+    restoreBackupSync(backup, destination);
+    throw error;
   }
 }
 
 async function replaceFile(destination, temporary) {
   try {
+    await fs.promises.access(destination);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await fs.promises.rename(temporary, destination);
+    return;
+  }
+  const backup = `${destination}.bak`;
+  await fs.promises.rm(backup, { force: true });
+  await moveAside(destination, backup);
+  try {
     await fs.promises.rename(temporary, destination);
   } catch (error) {
+    await restoreBackup(backup, destination);
+    throw error;
+  }
+}
+
+function moveAsideSync(from, to) {
+  try {
+    fs.renameSync(from, to);
+  } catch (error) {
     if (error.code !== 'EPERM' && error.code !== 'EEXIST') throw error;
-    await fs.promises.rm(destination, { force: true });
-    await fs.promises.rename(temporary, destination);
+    fs.rmSync(to, { force: true });
+    fs.renameSync(from, to);
+  }
+}
+
+async function moveAside(from, to) {
+  try {
+    await fs.promises.rename(from, to);
+  } catch (error) {
+    if (error.code !== 'EPERM' && error.code !== 'EEXIST') throw error;
+    await fs.promises.rm(to, { force: true });
+    await fs.promises.rename(from, to);
+  }
+}
+
+function restoreBackupSync(backup, destination) {
+  try {
+    moveAsideSync(backup, destination);
+  } catch (error) {
+    console.warn(`[history] could not restore ${destination} from backup: ${error.message}`);
+  }
+}
+
+async function restoreBackup(backup, destination) {
+  try {
+    await moveAside(backup, destination);
+  } catch (error) {
+    console.warn(`[history] could not restore ${destination} from backup: ${error.message}`);
   }
 }
 
@@ -49,6 +104,9 @@ class History {
     this.interference = [];
     this.solution = [];
     this.trackCapWarned = false;
+    this.savesDisabled = false;
+    this.saveSkipLogged = false;
+    this._saveGeneration = 0;
     this._saveChain = Promise.resolve();
   }
 
@@ -165,7 +223,7 @@ class History {
 
   /** Periodic save. Stringify failures are reported before the first await so a timer cannot reject. */
   save() {
-    if (!this.filePath) return Promise.resolve();
+    if (!this.filePath || this.skipSave()) return Promise.resolve();
     let payload;
     try {
       payload = this.serialize();
@@ -173,54 +231,126 @@ class History {
       console.warn(`[history] could not save: ${err.message}`);
       return Promise.resolve();
     }
-    const write = this._saveChain.then(() => this.writePayload(payload)).catch((err) => {
+    const generation = ++this._saveGeneration;
+    const write = this._saveChain.then(() => this.writePayload(payload, generation)).catch((err) => {
       console.warn(`[history] could not save: ${err.message}`);
     });
     this._saveChain = write.then(() => {}, () => {});
     return write;
   }
 
-  async writePayload(payload) {
+  async writePayload(payload, generation) {
+    if (!this.currentSave(generation)) return;
     await fs.promises.mkdir(path.dirname(this.filePath), { recursive: true });
     const temporary = temporaryPath(this.filePath);
     await fs.promises.writeFile(temporary, payload);
-    await replaceFile(this.filePath, temporary);
+    if (!this.currentSave(generation)) {
+      await fs.promises.rm(temporary, { force: true });
+      return;
+    }
+    try {
+      replaceFileSync(this.filePath, temporary);
+    } catch (error) {
+      await fs.promises.rm(temporary, { force: true }).catch(() => {});
+      throw error;
+    }
   }
 
   /** Shutdown flush. Must finish before the process exits. */
   saveSync() {
-    if (!this.filePath) return;
+    if (!this.filePath || this.skipSave()) return;
+    this._saveGeneration++;
     try {
       const payload = this.serialize();
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
       const temporary = temporaryPath(this.filePath);
       fs.writeFileSync(temporary, payload);
-      replaceFileSync(this.filePath, temporary);
+      try {
+        replaceFileSync(this.filePath, temporary);
+      } catch (error) {
+        fs.rmSync(temporary, { force: true });
+        throw error;
+      }
     } catch (err) {
       console.warn(`[history] could not save: ${err.message}`);
     }
   }
 
-  load() {
-    if (!this.filePath || !fs.existsSync(this.filePath)) return;
-    try {
-      if (fs.statSync(this.filePath).size > 64 * 1024 * 1024) throw new Error('History file exceeds the 64 MiB load limit');
-      const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
-      if (!parsed || parsed.version !== 1) throw new Error('Unsupported history file version');
-      this.tracks = parsed.satvisFieldLayout === 2
-        ? new Map(Object.entries(parsed.tracks || {}))
-        : new Map();
-      this.interference = Array.isArray(parsed.interference) ? parsed.interference : [];
-      this.solution = Array.isArray(parsed.solution) ? parsed.solution : [];
-      this.prune();
-      console.log(`[history] restored ${this.tracks.size} satellite tracks, ${this.interference.length} interference samples, `
-        + `${this.solution.length} solution samples`);
-    } catch (err) {
-      console.warn(`[history] could not load: ${err.message}`);
-      this.tracks = new Map();
-      this.interference = [];
-      this.solution = [];
+  /**
+   * Drops any in-flight periodic save, waits for that write to notice, then writes one snapshot.
+   * An older rename must not land after this snapshot.
+   */
+  async flush() {
+    this._saveGeneration++;
+    await this._saveChain;
+    this.saveSync();
+  }
+
+  currentSave(generation) {
+    return !this.savesDisabled && generation === this._saveGeneration;
+  }
+
+  skipSave() {
+    if (!this.savesDisabled) return false;
+    if (!this.saveSkipLogged) {
+      this.saveSkipLogged = true;
+      console.warn(`[history] not saving; ${this.filePath} could not be loaded and will not be overwritten`);
     }
+    return true;
+  }
+
+  load() {
+    if (!this.filePath) return;
+    const primary = this.readStored(this.filePath);
+    if (primary.status === 'ok') {
+      this.savesDisabled = false;
+      this.applyParsed(primary.parsed);
+      return;
+    }
+    if (primary.status === 'missing') {
+      const backup = this.readStored(`${this.filePath}.bak`);
+      if (backup.status === 'ok') {
+        console.warn(`[history] ${this.filePath} is missing; restored ${this.filePath}.bak`);
+        this.savesDisabled = false;
+        this.applyParsed(backup.parsed);
+      }
+      return;
+    }
+    this.savesDisabled = true;
+    this.tracks = new Map();
+    this.interference = [];
+    this.solution = [];
+    console.warn(`[history] saves disabled until ${this.filePath} can be loaded`);
+    const backup = this.readStored(`${this.filePath}.bak`);
+    if (backup.status === 'ok') {
+      console.warn(`[history] using ${this.filePath}.bak in memory; ${this.filePath} will not be overwritten`);
+      this.applyParsed(backup.parsed);
+      this.savesDisabled = true;
+    }
+  }
+
+  readStored(filePath) {
+    if (!fs.existsSync(filePath)) return { status: 'missing' };
+    try {
+      if (fs.statSync(filePath).size > 64 * 1024 * 1024) throw new Error('History file exceeds the 64 MiB load limit');
+      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+      if (!parsed || parsed.version !== 1) throw new Error('Unsupported history file version');
+      return { status: 'ok', parsed };
+    } catch (err) {
+      console.warn(`[history] could not load: ${err.message} (${filePath})`);
+      return { status: 'error' };
+    }
+  }
+
+  applyParsed(parsed) {
+    this.tracks = parsed.satvisFieldLayout === 2
+      ? new Map(Object.entries(parsed.tracks || {}))
+      : new Map();
+    this.interference = Array.isArray(parsed.interference) ? parsed.interference : [];
+    this.solution = Array.isArray(parsed.solution) ? parsed.solution : [];
+    this.prune();
+    console.log(`[history] restored ${this.tracks.size} satellite tracks, ${this.interference.length} interference samples, `
+      + `${this.solution.length} solution samples`);
   }
 }
 
