@@ -54,16 +54,18 @@ function gpsToUtc(week, seconds) {
   return ms === null ? null : new Date(ms).toISOString();
 }
 
-// Week 0 is 1980. Live charts and retention are measured on the computer clock, so a GPS
-// header is used only when it is recent and close to reception time.
+// Week 0 is 1980. Live charts end at the computer's clock, so a GPS header is used only
+// when it is after 2020, no more than a couple of seconds ahead, and no more than five
+// minutes behind. A header further ahead would be stored and then clipped off the chart.
 const SANE_GPS_EARLIEST_MS = Date.UTC(2020, 0, 1);
 const SANE_GPS_SKEW_MS = 5 * 60 * 1000;
+const SANE_GPS_AHEAD_MS = 2 * 1000;
 
 function saneTimestamp(headerUtc, receivedAt, now = Date.now()) {
   const headerMs = typeof headerUtc === 'number' ? headerUtc : Date.parse(headerUtc);
-  if (Number.isFinite(headerMs) && headerMs >= SANE_GPS_EARLIEST_MS && Math.abs(headerMs - now) <= SANE_GPS_SKEW_MS) {
-    return headerMs;
-  }
+  const usable = Number.isFinite(headerMs) && headerMs >= SANE_GPS_EARLIEST_MS
+    && headerMs >= now - SANE_GPS_SKEW_MS && headerMs <= now + SANE_GPS_AHEAD_MS;
+  if (usable) return headerMs;
   const receivedMs = typeof receivedAt === 'number' ? receivedAt : Date.parse(receivedAt);
   return Number.isFinite(receivedMs) ? receivedMs : now;
 }
@@ -399,5 +401,6 @@ module.exports = {
   saneTimestamp,
   SANE_GPS_EARLIEST_MS,
   SANE_GPS_SKEW_MS,
+  SANE_GPS_AHEAD_MS,
   MESSAGE_NAMES_BY_ID,
 };

@@ -1317,12 +1317,66 @@ test('a silent serial port is recycled without falling straight through to TCP',
   receiver.stop();
 });
 
-test('GPS header time is used only when it is recent and close to the computer clock', () => {
+test('a close error from a serial port that is no longer current is ignored', () => {
+  const ports = [];
+  const timers = [];
+  class FakePort extends EventEmitter {
+    constructor(options) {
+      super();
+      this.options = options;
+      ports.push(this);
+    }
+    open(callback) { this.openCallback = callback; }
+    write() {}
+    close(callback) {
+      this.isOpen = false;
+      this.closeCallback = callback;
+    }
+  }
+  const context = vm.createContext({
+    Buffer, module: { exports: {} },
+    console: { warn() {}, log() {}, error() {} },
+    setTimeout(callback, ms) { timers.push({ callback, ms, cleared: false }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
+    require: (name) => name === 'serialport' ? { SerialPort: FakePort }
+      : name === 'node:net' ? { createConnection() { throw new Error('TCP should not be opened'); } }
+        : name === './novatel' ? require('../src/novatel') : require(name),
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
+  const receiver = new context.module.exports.ReceiverClient({
+    transport: 'serial', serialPath: 'COM11', serialBaudRate: 9600, serialProbeMs: 0,
+    receiverHost: '20.20.20.50', receiverPort: 3001, reconnectDelayMs: 3000, idleTimeoutMs: 30000,
+  });
+  receiver.start();
+  ports[0].isOpen = true;
+  ports[0].openCallback(null);
+  const idle = timers.filter((timer) => !timer.cleared && timer.ms === 30000).pop();
+  idle.callback();
+  const denied = new Error('Access denied');
+  denied.code = 'EACCES';
+  ports[0].closeCallback(denied);
+  assert.match(receiver.state.lastError, /No data received for 30000 ms/);
+  const retry = timers.filter((timer) => !timer.cleared && timer.ms === 3000).pop();
+  retry.callback();
+  ports[1].isOpen = true;
+  ports[1].openCallback(null);
+  assert.equal(receiver.state.lastError, null);
+  ports[0].closeCallback(denied);
+  assert.equal(receiver.state.lastError, null);
+  receiver.stop();
+});
+
+test('GPS header time is used only when it is recent, at most 2 s ahead, and at most 5 min behind', () => {
   const now = Date.UTC(2026, 9, 22, 12, 0, 0);
   const receivedAt = new Date(now).toISOString();
   assert.equal(saneTimestamp('1980-01-06T00:00:00.000Z', receivedAt, now), now);
   assert.equal(saneTimestamp(new Date(now - 60 * 1000).toISOString(), receivedAt, now), now - 60 * 1000);
+  assert.equal(saneTimestamp(new Date(now - 5 * 60 * 1000).toISOString(), receivedAt, now), now - 5 * 60 * 1000);
+  assert.equal(saneTimestamp(new Date(now - 5 * 60 * 1000 - 1).toISOString(), receivedAt, now), now);
   assert.equal(saneTimestamp(new Date(now - 10 * 60 * 1000).toISOString(), receivedAt, now), now);
+  assert.equal(saneTimestamp(new Date(now + 2000).toISOString(), receivedAt, now), now + 2000);
+  assert.equal(saneTimestamp(new Date(now + 2001).toISOString(), receivedAt, now), now);
+  assert.equal(saneTimestamp(new Date(now + 5 * 60 * 1000).toISOString(), receivedAt, now), now);
   assert.equal(saneTimestamp(undefined, undefined, now), now);
 
   const browser = vm.createContext({
@@ -1342,6 +1396,18 @@ test('GPS header time is used only when it is recent and close to the computer c
     header: { utc: headerUtc }, data: { detections: [] },
   });
   assert.equal(browser.state.interferenceHistory[1].t, Date.parse(headerUtc));
+  const ahead = new Date(Date.now() + 5000).toISOString();
+  browser.recordLiveHistory({
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: liveReceived,
+    header: { utc: ahead }, data: { detections: [] },
+  });
+  assert.equal(browser.state.interferenceHistory[2].t, Date.parse(liveReceived));
+  const slightAhead = new Date(Date.now() + 1000).toISOString();
+  browser.recordLiveHistory({
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: liveReceived,
+    header: { utc: slightAhead }, data: { detections: [] },
+  });
+  assert.equal(browser.state.interferenceHistory[3].t, Date.parse(slightAhead));
 
   const stamps = [];
   const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
@@ -1368,6 +1434,12 @@ test('GPS header time is used only when it is recent and close to the computer c
   });
   assert.equal(stamps[0], Date.parse(liveReceived));
   assert.equal(stamps[1], Date.parse(headerUtc));
+  context.processReceiverLog({
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: liveReceived,
+    header: { utc: new Date(Date.now() + 5000).toISOString() },
+    data: { detections: [{ signalType: 'L1', powerDbm: -60, centerFrequencyHz: 1, bandwidthHz: 1 }] },
+  });
+  assert.equal(stamps[2], Date.parse(liveReceived));
 });
 
 test('a snapshot keeps CRC-failed interference out of the live display', () => {
@@ -1521,6 +1593,107 @@ test('an oversize history file is left untouched', () => {
     assert.equal(fs.readFileSync(file, 'utf8'), '{"version":1}');
   } finally {
     fs.statSync = realStat;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a locked history file is retried and then merged without dropping the previous samples', () => {
+  const sample = (power) => [{ powerDbm: power, centerFrequencyHz: 1.5e9, bandwidthHz: 1000, type: 'CW' }];
+  const realStat = fs.statSync;
+  try {
+    for (const code of ['EPERM', 'EBUSY', 'EIO']) {
+      const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-lock-'));
+      const file = path.join(dir, 'history.json');
+      const history = new History({
+        retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
+      });
+      const now = Date.now();
+      history.addInterference('L1', sample(-80), now);
+      history.saveSync();
+      const original = fs.readFileSync(file, 'utf8');
+      let locked = true;
+      fs.statSync = (target, options) => {
+        if (locked && target === file) {
+          const error = new Error('locked');
+          error.code = code;
+          throw error;
+        }
+        return realStat(target, options);
+      };
+      const blocked = new History({
+        retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
+      });
+      blocked.load();
+      assert.equal(blocked.savesDisabled, false, code);
+      blocked.addInterference('L1', sample(-50), now + 1);
+      blocked.saveSync();
+      assert.equal(fs.readFileSync(file, 'utf8'), original, code);
+      locked = false;
+      blocked.saveSync();
+      const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+      assert.equal(saved.interference.length, 2, code);
+      assert.ok(saved.interference.some((item) => item.maxPower === -80), code);
+      assert.ok(saved.interference.some((item) => item.maxPower === -50), code);
+      fs.statSync = realStat;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  } finally {
+    fs.statSync = realStat;
+  }
+});
+
+test('a history file that disappears is reread before it is replaced', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-missing-'));
+  const file = path.join(dir, 'history.json');
+  const history = new History({
+    retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
+  });
+  history.addInterference('L1', [{ powerDbm: -70, centerFrequencyHz: 1.5e9, bandwidthHz: 1000, type: 'CW' }], Date.now());
+  history.saveSync();
+  const realStat = fs.statSync;
+  let missing = true;
+  fs.statSync = (target, options) => {
+    if (missing && target === file) {
+      const error = new Error('gone');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return realStat(target, options);
+  };
+  try {
+    const reloaded = new History({
+      retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
+    });
+    reloaded.load();
+    assert.equal(reloaded.savesDisabled, false);
+    assert.equal(reloaded.interference.length, 0);
+    assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).interference[0].maxPower, -70);
+    missing = false;
+    reloaded.saveSync();
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(saved.interference.length, 1);
+    assert.equal(saved.interference[0].maxPower, -70);
+  } finally {
+    fs.statSync = realStat;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a history file with the wrong version is not replaced', () => {
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-version-'));
+  const file = path.join(dir, 'history.json');
+  const original = '{"version":2,"interference":[]}';
+  fs.writeFileSync(file, original);
+  try {
+    const history = new History({
+      retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
+    });
+    history.load();
+    assert.equal(history.savesDisabled, true);
+    history.addInterference('L1', [{ powerDbm: -40, centerFrequencyHz: 1.5e9, bandwidthHz: 1000, type: 'CW' }], Date.now());
+    history.saveSync();
+    assert.equal(fs.readFileSync(file, 'utf8'), original);
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

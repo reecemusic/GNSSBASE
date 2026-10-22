@@ -849,12 +849,12 @@ function pruneClientHistory() {
 
 function recordLiveHistory(record) {
   if (record.crcValid !== true) return;
-  // Same rule as saneTimestamp in src/novatel.js: ignore week-0 and other GPS times far from the PC clock.
+  // Same rule as saneTimestamp in src/novatel.js: after 2020, at most 2 s ahead of the PC, at most 5 min behind.
   const nowMs = Date.now();
   const headerTime = Date.parse(record.header && record.header.utc);
   const receivedTime = Date.parse(record.receivedAt);
   const headerSane = Number.isFinite(headerTime) && headerTime >= Date.UTC(2020, 0, 1)
-    && Math.abs(headerTime - nowMs) <= 5 * 60 * 1000;
+    && headerTime >= nowMs - 5 * 60 * 1000 && headerTime <= nowMs + 2000;
   const now = headerSane ? headerTime : Number.isFinite(receivedTime) ? receivedTime : nowMs;
   if (record.name === 'SATVIS2' && record.data && record.data.visibilityValid !== false) {
     for (const sat of record.data.satellites || []) {

@@ -106,6 +106,9 @@ class History {
     this.trackCapWarned = false;
     this.savesDisabled = false;
     this.saveSkipLogged = false;
+    this.readState = 'unread';
+    this.recheckMissing = false;
+    this.retrySkipLogged = false;
     this._saveGeneration = 0;
     this._saveChain = Promise.resolve();
   }
@@ -223,7 +226,7 @@ class History {
 
   /** Periodic save. Stringify failures are reported before the first await so a timer cannot reject. */
   save() {
-    if (!this.filePath || this.skipSave()) return Promise.resolve();
+    if (!this.readyToSave()) return Promise.resolve();
     let payload;
     try {
       payload = this.serialize();
@@ -254,11 +257,13 @@ class History {
       await fs.promises.rm(temporary, { force: true }).catch(() => {});
       throw error;
     }
+    this.readState = 'loaded';
+    this.recheckMissing = false;
   }
 
   /** Shutdown flush. Must finish before the process exits. */
   saveSync() {
-    if (!this.filePath || this.skipSave()) return;
+    if (!this.readyToSave()) return;
     this._saveGeneration++;
     try {
       const payload = this.serialize();
@@ -271,6 +276,8 @@ class History {
         fs.rmSync(temporary, { force: true });
         throw error;
       }
+      this.readState = 'loaded';
+      this.recheckMissing = false;
     } catch (err) {
       console.warn(`[history] could not save: ${err.message}`);
     }
@@ -290,6 +297,28 @@ class History {
     return !this.savesDisabled && generation === this._saveGeneration;
   }
 
+  /**
+   * A locked or vanished file is read again before it is replaced. A file that failed
+   * the size, JSON, or version check is never replaced.
+   */
+  readyToSave() {
+    if (!this.filePath) return false;
+    if (this.readState === 'retry' || this.recheckMissing) this.load();
+    if (this.readState === 'retry') {
+      if (!this.retrySkipLogged) {
+        this.retrySkipLogged = true;
+        console.warn(`[history] not saving yet; ${this.filePath} could not be read and will not be replaced`);
+      }
+      return false;
+    }
+    this.retrySkipLogged = false;
+    return !this.skipSave();
+  }
+
+  hasSamples() {
+    return this.tracks.size > 0 || this.interference.length > 0 || this.solution.length > 0;
+  }
+
   skipSave() {
     if (!this.savesDisabled) return false;
     if (!this.saveSkipLogged) {
@@ -303,55 +332,143 @@ class History {
     if (!this.filePath) return;
     const primary = this.readStored(this.filePath);
     if (primary.status === 'ok') {
+      const merge = this.hasSamples() && this.readState !== 'unread' && this.readState !== 'loaded';
+      this.readState = 'loaded';
+      this.recheckMissing = false;
+      this.retrySkipLogged = false;
       this.savesDisabled = false;
-      this.applyParsed(primary.parsed);
+      this.applyParsed(primary.parsed, merge);
+      return;
+    }
+    if (primary.status === 'invalid') {
+      this.failPermanent();
       return;
     }
     if (primary.status === 'missing') {
-      const backup = this.readStored(`${this.filePath}.bak`);
-      if (backup.status === 'ok') {
-        console.warn(`[history] ${this.filePath} is missing; restored ${this.filePath}.bak`);
-        this.savesDisabled = false;
-        this.applyParsed(backup.parsed);
-      }
+      this.noteMissing();
       return;
     }
+    this.noteRetry();
+  }
+
+  /** Size, JSON, and version failures. The file on disk stays where it is. */
+  failPermanent() {
+    const first = this.readState !== 'invalid';
+    this.readState = 'invalid';
+    this.recheckMissing = false;
     this.savesDisabled = true;
-    this.tracks = new Map();
-    this.interference = [];
-    this.solution = [];
+    if (!first) return;
     console.warn(`[history] saves disabled until ${this.filePath} can be loaded`);
-    const backup = this.readStored(`${this.filePath}.bak`);
-    if (backup.status === 'ok') {
-      console.warn(`[history] using ${this.filePath}.bak in memory; ${this.filePath} will not be overwritten`);
-      this.applyParsed(backup.parsed);
-      this.savesDisabled = true;
+    if (!this.hasSamples()) {
+      this.tracks = new Map();
+      this.interference = [];
+      this.solution = [];
     }
+    if (this.restoreBackup('invalid')) this.savesDisabled = true;
+  }
+
+  /**
+   * ENOENT is not a corrupt file. Look once more on the next save so a file that
+   * reappears is loaded, then create it if it is still gone.
+   */
+  noteMissing() {
+    const again = this.readState === 'missing';
+    this.readState = 'missing';
+    this.savesDisabled = false;
+    if (!again && !this.restoreBackup('missing')) {
+      console.warn(`[history] ${this.filePath} is missing; will check again before saving`);
+    }
+    this.recheckMissing = !again;
+  }
+
+  /** EPERM, EBUSY, and any other read error that is not a bad file. */
+  noteRetry() {
+    if (this.readState !== 'retry') {
+      console.warn(`[history] will retry loading ${this.filePath} before saving`);
+    }
+    this.readState = 'retry';
+    this.recheckMissing = false;
+  }
+
+  restoreBackup(kind) {
+    const backupPath = `${this.filePath}.bak`;
+    const backup = this.readStored(backupPath);
+    if (backup.status !== 'ok') return false;
+    console.warn(kind === 'missing'
+      ? `[history] ${this.filePath} is missing; restored ${backupPath}`
+      : `[history] using ${backupPath} in memory; ${this.filePath} will not be overwritten`);
+    this.applyParsed(backup.parsed, this.hasSamples());
+    return true;
   }
 
   readStored(filePath) {
-    if (!fs.existsSync(filePath)) return { status: 'missing' };
+    let text;
     try {
-      if (fs.statSync(filePath).size > 64 * 1024 * 1024) throw new Error('History file exceeds the 64 MiB load limit');
-      const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      if (!parsed || parsed.version !== 1) throw new Error('Unsupported history file version');
+      if (fs.statSync(filePath).size > 64 * 1024 * 1024) {
+        console.warn(`[history] could not load: History file exceeds the 64 MiB load limit (${filePath})`);
+        return { status: 'invalid' };
+      }
+      text = fs.readFileSync(filePath, 'utf8');
+    } catch (err) {
+      if (err.code === 'ENOENT') return { status: 'missing' };
+      console.warn(`[history] could not load: ${err.message} (${filePath})`);
+      return { status: 'retry', code: err.code || '' };
+    }
+    try {
+      const parsed = JSON.parse(text);
+      if (!parsed || parsed.version !== 1) {
+        console.warn(`[history] could not load: Unsupported history file version (${filePath})`);
+        return { status: 'invalid' };
+      }
       return { status: 'ok', parsed };
     } catch (err) {
       console.warn(`[history] could not load: ${err.message} (${filePath})`);
-      return { status: 'error' };
+      return { status: 'invalid' };
     }
   }
 
-  applyParsed(parsed) {
-    this.tracks = parsed.satvisFieldLayout === 2
+  applyParsed(parsed, merge) {
+    const tracks = parsed.satvisFieldLayout === 2
       ? new Map(Object.entries(parsed.tracks || {}))
       : new Map();
-    this.interference = Array.isArray(parsed.interference) ? parsed.interference : [];
-    this.solution = Array.isArray(parsed.solution) ? parsed.solution : [];
+    const interference = Array.isArray(parsed.interference) ? parsed.interference : [];
+    const solution = Array.isArray(parsed.solution) ? parsed.solution : [];
+    if (merge) {
+      for (const [key, samples] of tracks) {
+        const existing = this.tracks.get(key);
+        this.tracks.set(key, mergeSamples(Array.isArray(existing) ? existing : [], samples, (sample) => (
+          `${sample.t}:${sample.el}:${sample.az}`
+        )));
+      }
+      this.interference = mergeSamples(this.interference, interference, (sample) => (
+        `${sample.t}:${sample.signal}:${sample.count}:${sample.maxPower}`
+      ));
+      this.solution = mergeSamples(this.solution, solution, (sample) => (
+        `${sample.t}:${sample.used}:${sample.tracked}:${sample.status}:${sample.type}`
+      ));
+    } else {
+      this.tracks = tracks;
+      this.interference = interference;
+      this.solution = solution;
+    }
     this.prune();
     console.log(`[history] restored ${this.tracks.size} satellite tracks, ${this.interference.length} interference samples, `
       + `${this.solution.length} solution samples`);
   }
+}
+
+function mergeSamples(existing, incoming, id) {
+  const seen = new Set(existing.map(id));
+  const merged = existing.slice();
+  for (const sample of Array.isArray(incoming) ? incoming : []) {
+    if (!sample) continue;
+    const key = id(sample);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(sample);
+  }
+  merged.sort((a, b) => a.t - b.t);
+  return merged;
 }
 
 const SOLUTION_HEARTBEAT_MS = 10000;

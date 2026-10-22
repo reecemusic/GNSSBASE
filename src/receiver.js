@@ -104,7 +104,7 @@ class ReceiverClient extends EventEmitter {
     if (port && port.isOpen) {
       try {
         port.close((error) => {
-          if (error && error.code !== 'ERR_PORT_NOT_OPEN') this.setError(error);
+          if (port === this.port && error && error.code !== 'ERR_PORT_NOT_OPEN') this.setError(error);
         });
       } catch (error) {
         this.setError(error);
