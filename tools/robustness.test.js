@@ -1,3 +1,8 @@
+/**
+ * Locks in robustness of framing, CRC checks, history retention, and connection
+ * handling: bad frames stay out of history, incomplete payloads are rejected,
+ * and serial, TCP, and file saves fail closed.
+ */
 'use strict';
 
 const assert = require('node:assert/strict');
@@ -13,6 +18,13 @@ const { parseAsciiLog, readBinaryLog, novatelCrc32, decodeItDetectStatusBinary, 
 const { decode } = require('../src/messages');
 const code = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
 
+/**
+ * Evaluates a slice of public/app.js inside a vm context.
+ * @param {object} context vm context that receives the slice.
+ * @param {string} start First source substring. The slice begins at this match.
+ * @param {string} end Source substring that ends the slice, exclusive.
+ * @returns {void}
+ */
 function load(context, start, end) {
   const first = code.indexOf(start);
   const last = code.indexOf(end, first + start.length);
@@ -20,6 +32,7 @@ function load(context, start, end) {
   vm.runInContext(code.slice(first, last), context);
 }
 
+/** Catches a parser that treats a missing checksum as valid or a garbled CRC as unchecked. */
 test('malformed CRC text is a failure, not an unchecked report', () => {
   const body = 'BESTSATSA,USB1,0,50,FINESTEERING,2441,100,00000000,0000;0';
   const checksum = novatelCrc32(body).toString(16).padStart(8, '0');
@@ -30,7 +43,14 @@ test('malformed CRC text is a failure, not an unchecked report', () => {
   }
 });
 
+/** Catches decoders that invent observation or detection counts from a short or blank payload. */
 test('RANGE, SATVIS2 and interference decoders reject incomplete payloads instead of inventing counts', () => {
+  /**
+   * Decodes one ASCII log through the shared message decoder.
+   * @param {string} name Message name, such as RANGE or SATVIS2.
+   * @param {string[]} fields ASCII field list.
+   * @returns {object} Decoded message.
+   */
   const ascii = (name, fields) => decode({ format: 'ascii', header: { messageName: name }, fields });
   for (const fields of [[], [''], ['-1'], ['1.5'], ['2049'], ['1', ...Array(9).fill('0')]]) {
     assert.throws(() => ascii('RANGE', fields), /RANGE/);
@@ -55,6 +75,7 @@ test('RANGE, SATVIS2 and interference decoders reject incomplete payloads instea
   assert.throws(() => decode({ format: 'binary', header: { messageName: 'RANGE' }, body: truncated }), /incomplete/);
 });
 
+/** Catches history that records a CRC-failed or visibility-invalid report, or that drops the next valid clear. */
 test('CRC failures and invalid visibility never enter server or browser history', () => {
   const records = [
     { name: 'ITDETECTSTATUS', crcValid: false, data: { detections: [] } },
@@ -93,6 +114,10 @@ test('CRC failures and invalid visibility never enter server or browser history'
   assert.deepEqual(calls, ['interference'], 'the next valid clear report is retained');
 });
 
+/**
+ * Catches a banner that ignores a 5 s stall, disconnect grace, or a CRC failure.
+ * Also catches a device summary that drops GLONASS or mislabels RESERVED tracking.
+ */
 test('interference banner ages clear reports, errors after five seconds, and recovers on fresh data', () => {
   const elements = new Map();
   let now = 100000;
@@ -124,6 +149,7 @@ test('interference banner ages clear reports, errors after five seconds, and rec
           classList: { toggle() {} },
           rows: [],
           replaceChildren() { this.rows = []; },
+          /** @returns {object} A fake row whose insertCell records the cell. Side effects: pushes onto this.rows. Events: none. */
           insertRow() {
             const row = { cells: [], insertCell(text, className) {
               const td = { text, className, append() {} };
@@ -209,6 +235,11 @@ test('interference banner ages clear reports, errors after five seconds, and rec
   context.state.lastDetection = { at: now, detection: { signalType: 'L2', type: 'STATISTICANALYSIS' } };
   assert.equal(context.lastDetectionSummary(context.state.lastDetection),
     'L2 (label:STATISTICANALYSIS) · power and frequency not reported by this detector');
+  /**
+   * Packs a tracking-status code into the hex field RANGE observations use.
+   * @param {number} code Status code shifted into the tracking-status word.
+   * @returns {string} Hex status word.
+   */
   const status = (code) => (code << 21).toString(16);
   context.latestByName.RANGE = { data: { observations: [
     { system: 'GPS', prn: 1, trackingStatus: status(0) },
@@ -239,6 +270,10 @@ test('interference banner ages clear reports, errors after five seconds, and rec
   assert.equal(elements.get('it-banner').className, 'banner device-error', 'a CRC failure cannot restore live status');
 });
 
+/**
+ * Builds a vm context with stubbed DOM helpers and loads the skyplot slices.
+ * @returns {object} Context exposing skyplot helpers and the captured element map.
+ */
 function satelliteContext() {
   const elements = new Map();
   const context = vm.createContext({
@@ -270,6 +305,7 @@ function satelliteContext() {
   return context;
 }
 
+/** Catches QZSS totals that drop a used satellite, double-count a signal, or follow the skyplot hide filter. */
 test('QZSS tracked totals include used satellites, deduplicate signals and ignore skyplot filters', () => {
   const context = satelliteContext();
   context.state.satvis.QZSS = { data: { visibilityValid: true, satellites: [
@@ -302,6 +338,7 @@ test('QZSS tracked totals include used satellites, deduplicate signals and ignor
   assert.equal(context.satellitesInViewBySystem().QZSS, 4);
 });
 
+/** Catches tracking counts that follow BESTSATS exclusions or invent visibility when sky geometry is missing. */
 test('tracking remains independent of BESTSATS exclusions and missing sky geometry', () => {
   const context = satelliteContext();
   context.latestByName.RANGE = { data: { observations: [
@@ -340,6 +377,7 @@ test('tracking remains independent of BESTSATS exclusions and missing sky geomet
   assert.equal(context.tableSatellites.length, 0, 'empty data clears the status table');
 });
 
+/** Catches counts that keep an invalid PRN, visibility-invalid SATVIS2, or CRC-failed RANGE and BESTSATS. */
 test('satellite counts reject invalid IDs, invalid visibility and CRC failures', () => {
   const context = satelliteContext();
   const invalid = [null, undefined, '', ' ', 0, -1, NaN, Infinity, 'abc', '2x', 1.5];
@@ -364,6 +402,7 @@ test('satellite counts reject invalid IDs, invalid visibility and CRC failures',
   assert.equal(context.trackedSatelliteSummary().size, 0);
 });
 
+/** Catches a band breakdown that counts every tracked signal, or that still counts after a BESTSATS CRC failure. */
 test('used-signal counts use BESTSATS masks rather than every tracked band', () => {
   const context = satelliteContext();
   context.SIGNAL_BANDS = ['L1', 'L2', 'L5', 'Other'];
@@ -395,7 +434,13 @@ test('used-signal counts use BESTSATS masks rather than every tracked band', () 
     { L1: 0, L2: 0, L5: 0, Other: 0 });
 });
 
+/** Catches a BESTSATS decoder that accepts a short block, keeps duplicate IDs, or ignores a conflicting status or mask. */
 test('BESTSATSA validates exact block sizes, deduplicates IDs and rejects conflicting counts explicitly', () => {
+  /**
+   * Decodes one BESTSATS ASCII field list.
+   * @param {string[]} fields BESTSATS fields, including the leading count.
+   * @returns {object} Decoded BESTSATS data.
+   */
   const decodeFields = (fields) => decode({
     format: 'ascii', header: { messageName: 'BESTSATS' }, fields, crcValid: true,
   }).data;
@@ -418,6 +463,7 @@ test('BESTSATSA validates exact block sizes, deduplicates IDs and rejects confli
   assert.equal(decodeFields(['1', 'GPS', '1', 'FUTURE_STATUS', '03']).satellites[0].status, 'FUTURE_STATUS');
 });
 
+/** Catches a used count padded to match BESTPOS, or a stale or same-epoch mismatch that is hidden. */
 test('BESTSATS freshness and same-epoch disagreement are visible without altering receiver counts', () => {
   const context = satelliteContext();
   const now = 100000;
@@ -445,6 +491,7 @@ test('BESTSATS freshness and same-epoch disagreement are visible without alterin
   assert.match(context.elements.get('sv-status-note').textContent, /5 s old/);
 });
 
+/** Catches a split BESTSATSA frame that is emitted early or that drops the valid frame after it. */
 test('fragmented and malformed BESTSATSA frames do not corrupt the next valid satellite report', () => {
   const receiver = new ReceiverClient({});
   const records = [];
@@ -461,6 +508,7 @@ test('fragmented and malformed BESTSATSA frames do not corrupt the next valid sa
   assert.equal(receiver.buffer.length, 0);
 });
 
+/** Catches mask totals that count an unselected or repeated band, or that ignore a hidden constellation. */
 test('BESTSATS mask counts include only selected solution bands and deduplicate multi-signal bands', () => {
   const context = satelliteContext();
   context.SIGNAL_BANDS = ['L1', 'L2', 'L5', 'Other'];
@@ -473,12 +521,17 @@ test('BESTSATS mask counts include only selected solution bands and deduplicate 
     { system: 'NAVIC', prn: '5', state: 'tracked', signalMask: '04' },
   ];
   context.latestByName.BESTSATS = { data: { satellites } };
+  /**
+   * Reads the current signal-band breakdown as plain JSON.
+   * @returns {object} Counts keyed by band.
+   */
   const counts = () => JSON.parse(JSON.stringify(context.signalBreakdown(satellites)));
   assert.deepEqual(counts(), { L1: 3, L2: 0, L5: 2, Other: 1 });
   context.state.hiddenSystems.add('GALILEO');
   assert.deepEqual(counts(), { L1: 2, L2: 0, L5: 1, Other: 1 });
 });
 
+/** Catches a missing BESTSATS report that labels satellites not used, or a CRC-failed BESTPOS used as the count. */
 test('missing BESTSATS displays BESTPOS total without inventing per-satellite solution status', () => {
   const context = satelliteContext();
   context.latestByName.BESTPOS = { data: { satellitesUsed: 21, satellitesTracked: 29 } };
@@ -506,6 +559,7 @@ test('missing BESTSATS displays BESTPOS total without inventing per-satellite so
   assert.equal(context.elements.get('sv-missing').textContent, 0);
 });
 
+/** Catches per-constellation used, not-used, and missing totals that drift from the reference mix. */
 test('manufacturer reference counts match per-constellation used, not-used and missing states', () => {
   const context = satelliteContext();
   const reference = {
@@ -553,6 +607,7 @@ test('manufacturer reference counts match per-constellation used, not-used and m
   }
 });
 
+/** Catches a connect that skips or repeats BESTSATS, leaves ITDETECTSTATUS ONCHANGED, sends RANGE while logging is off, or writes UNLOGALL. */
 test('serial and configured logging both explicitly request BESTSATS once per connection', () => {
   for (const sendLogCommands of [false, true]) {
     const writes = [];
@@ -569,8 +624,16 @@ test('serial and configured logging both explicitly request BESTSATS once per co
   }
 });
 
+/** Catches TRACKSTAT rows that count idle channels, treat below-cutoff channels as missing, or accept a short channel block. */
 test('TRACKSTAT decodes assigned channels and counts unobserved satellites without counting idle channels', () => {
   const fields = ['SOL_COMPUTED', 'SINGLE', '5', '5'];
+  /**
+   * Builds one TRACKSTAT channel field group.
+   * @param {number} prn Satellite PRN or slot.
+   * @param {number} system Receiver system code.
+   * @param {number} state Channel state word.
+   * @returns {string[]} Ten ASCII channel fields.
+   */
   const channel = (prn, system, state) => [
     String(prn), '0', ((system << 16) | state).toString(16), '0', '0', '0', '0', '0', 'NA', '0',
   ];
@@ -600,6 +663,7 @@ test('TRACKSTAT decodes assigned channels and counts unobserved satellites witho
   }), /incomplete channel data/);
 });
 
+/** Catches history restore that skips a newer detection or overwrites a newer live detection. */
 test('last interference detected is seeded from restored history when newer', () => {
   const context = vm.createContext({ state: { lastDetection: { at: 500, detection: {} } } });
   load(context, 'function rememberHistoryDetection(', 'function lastDetectionSummary(');
@@ -619,6 +683,7 @@ test('last interference detected is seeded from restored history when newer', ()
   assert.equal(context.state.lastDetection.at, 5000, 'a newer live detection is kept');
 });
 
+/** Catches view history that drops tracked or in-view counts, or a plot that omits the total and constellation lines. */
 test('satellite view history stores tracked and in-view counts and renders a horizontal time plot', () => {
   const context = vm.createContext({
     MAX_INTERFERENCE_SAMPLES: 10, SOLUTION_HEARTBEAT_MS: 10000,
@@ -662,6 +727,7 @@ test('satellite view history stores tracked and in-view counts and renders a hor
   assert.equal(chart.children.filter((element) => element.tag === 'text' && element.text === '0').length, 1);
 });
 
+/** Catches a timeline heading that omits the live-reset control, or repeats it before the next closing div. */
 test('wall keeps an always-visible live reset beside the timeline heading', () => {
   const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
   const headingStart = html.indexOf('<h2 id="timeline-heading">');
@@ -671,6 +737,7 @@ test('wall keeps an always-visible live reset beside the timeline heading', () =
   assert(!html.slice(headingEnd, html.indexOf('</div>', headingEnd)).includes('id="timeline-live"'));
 });
 
+/** Catches a live-reset control that leaves a custom pan in place or skips the redraw. */
 test('wall live reset clears a custom timeline pan and redraws the live view', () => {
   const handlers = new Map();
   let renders = 0;
@@ -688,12 +755,14 @@ test('wall live reset clears a custom timeline pan and redraws the live view', (
   assert.equal(renders, 1);
 });
 
+/** Catches startup that throws on broken preferences, or a storage failure that stays silent. */
 test('corrupt and unavailable preferences display errors without preventing startup', () => {
   const notice = {};
   const errors = [];
   const context = vm.createContext({
     document: { getElementById: () => notice },
     localStorage: {
+      /** @param {string} key @returns {string|null} Broken JSON for hiddenSignals, an invalid zone, otherwise null. Side effects: none. Events: none. */
       getItem(key) {
         if (key === 'hiddenSignals') return '{broken';
         if (key === 'timeZone') return 'Invalid/Zone';
@@ -714,6 +783,7 @@ test('corrupt and unavailable preferences display errors without preventing star
   assert.equal(context.readPreference('test', 'default'), 'default');
 });
 
+/** Catches a stream handler that accepts bad or oversized JSON, or that stops after one thrown handler. */
 test('malformed and oversized live events are reported and the next valid event is processed', () => {
   const errors = [];
   const context = vm.createContext({
@@ -731,6 +801,7 @@ test('malformed and oversized live events are reported and the next valid event 
   assert.equal(errors.length, 5);
 });
 
+/** Catches a renderer wrapper that hides an error or blocks the next render. */
 test('renderer exceptions are surfaced without preventing subsequent updates', () => {
   const errors = [];
   const context = vm.createContext({ reportClientError: (label, error) => errors.push(error) });
@@ -742,6 +813,7 @@ test('renderer exceptions are surfaced without preventing subsequent updates', (
   assert.equal(errors.length, 1);
 });
 
+/** Catches a request helper that treats an HTTP error as success or waits forever on a stalled body. */
 test('requests reject HTTP errors and time out while waiting for the response body', async () => {
   let timeout;
   let cleared = 0;
@@ -768,6 +840,7 @@ test('requests reject HTTP errors and time out while waiting for the response bo
   assert.equal(cleared, 2);
 });
 
+/** Catches a history reload that clears the visible samples when the request fails. */
 test('failed history requests retain the currently visible data and report the failure', async () => {
   const samples = [{ t: Date.now(), signal: 'L1', count: 1 }];
   const errors = [];
@@ -787,6 +860,7 @@ test('failed history requests retain the currently visible data and report the f
   assert.equal(errors.length, 1);
 });
 
+/** Catches a raw-log row that keeps the full payload or the decoded body. */
 test('raw pending records are compact and cannot retain full decoded reports', () => {
   const context = vm.createContext({});
   load(context, 'function rawDisplayRecord(', 'function renderSafely(');
@@ -798,6 +872,7 @@ test('raw pending records are compact and cannot retain full decoded reports', (
   assert.equal(record.data, undefined);
 });
 
+/** Catches pruning or a capped response that drops the newest samples or cuts off the older half. */
 test('server history limits restored samples and caps browser responses', () => {
   const now = Date.now();
   const history = new History({ retentionMs: 3600000, maxInterferenceSamples: 500 });
@@ -815,6 +890,7 @@ test('server history limits restored samples and caps browser responses', () => 
   assert(response.interference.every((sample, index, all) => index === 0 || sample.t >= all[index - 1].t));
 });
 
+/** Catches a long-window response that drops the oldest hours or a detection while capping length. */
 test('history responses downsample a long window instead of dropping its oldest hours', () => {
   const now = Date.now();
   const history = new History({ retentionMs: 86400000, maxInterferenceSamples: 100000 });
@@ -831,6 +907,7 @@ test('history responses downsample a long window instead of dropping its oldest 
   assert(response.solution[0].t < now - 86000000);
 });
 
+/** Catches ASCII parsing that throws when the GPS week or seconds field is outside the finite range. */
 test('out-of-range GPS timestamps cannot throw during receiver parsing', () => {
   assert.doesNotThrow(() => {
     const result = parseAsciiLog('%TESTA,1e300,1e300;0');
@@ -838,11 +915,14 @@ test('out-of-range GPS timestamps cannot throw during receiver parsing', () => {
   });
 });
 
+/** Catches auto mode that opens TCP before serial, treats a silent or CRC-failed port as healthy, or skips serial on the next cycle. */
 test('auto transport tries serial first and falls back to TCP when serial does not connect', () => {
   const ports = [];
   const sockets = [];
   const timers = [];
+  /** Serial stand-in. open stores its callback. close marks the port shut and invokes the callback immediately. Emits nothing itself. */
   class FakePort extends EventEmitter {
+    /** @param {object} options Path and baud stored on the instance. Side effects: pushes this onto ports. Events: none. */
     constructor(options) {
       super();
       this.options = options;
@@ -853,6 +933,7 @@ test('auto transport tries serial first and falls back to TCP when serial does n
     close(callback) { this.isOpen = false; if (callback) callback(); }
   }
   const fakeNet = {
+    /** @param {object} options @returns {EventEmitter} A socket with no-op writes. Side effects: pushes the socket onto sockets. Events: none until the test emits them. */
     createConnection(options) {
       const socket = Object.assign(new EventEmitter(), {
         options, destroyed: false,
@@ -921,6 +1002,7 @@ test('auto transport tries serial first and falls back to TCP when serial does n
   receiver.stop();
 });
 
+/** Catches a TCP session that drops the echoed test log, skips the ITDETECTSTATUS command, or stays connected after disconnect. */
 test('receiver isolates valid logs, reports connection state and disconnects cleanly', async () => {
   const receivedCommands = [];
   const sockets = new Set();
@@ -932,6 +1014,7 @@ test('receiver isolates valid logs, reports connection state and disconnects cle
       socket.write('#TESTA,COM1,0,0,FINESTEERING,2200,1.0,00000000,00000000;ok\n');
     });
 
+    /** Catches ingest that drops the next frame after a log listener throws. */
     test('a failed log handler does not corrupt the following frame', () => {
       const receiver = new ReceiverClient({});
       const logs = [];
@@ -945,16 +1028,20 @@ test('receiver isolates valid logs, reports connection state and disconnects cle
       assert.equal(receiver.buffer.length, 0);
     });
 
+    /** Catches readBinaryLog returning a message when the header-length byte is 1. */
     test('invalid binary header lengths are rejected without unsafe reads', () => {
       const frame = Buffer.alloc(28);
       frame.set([0xaa, 0x44, 0x12, 1]);
       assert.equal(readBinaryLog(frame), null);
     });
 
+    /** Catches a failed serial open that keeps the port or never schedules another attempt. */
     test('failed serial opens release the port and schedule another attempt', () => {
       const ports = [];
       const timers = [];
+      /** Serial stand-in whose open callback is stored and not invoked here. Side effects: none until the test calls it. Events: none. */
       class FakePort extends EventEmitter {
+        /** Side effects: pushes this onto ports. Events: none. */
         constructor() {
           super();
           ports.push(this);
@@ -982,6 +1069,7 @@ test('receiver isolates valid logs, reports connection state and disconnects cle
       receiver.stop();
     });
 
+    /** Catches a JSON body that is answered twice, accepted when invalid or oversized, or passed to the handler. */
     test('JSON body errors produce one explicit response without invoking the handler', () => {
       const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
       const context = vm.createContext({ Buffer, console });
@@ -1006,6 +1094,7 @@ test('receiver isolates valid logs, reports connection state and disconnects cle
       }
     });
 
+    /** Catches history.save throwing on a circular sample instead of warning once. */
     test('history serialization failures are logged rather than escaping the save timer', () => {
       const warnings = [];
       const context = vm.createContext({
@@ -1068,6 +1157,7 @@ test('receiver isolates valid logs, reports connection state and disconnects cle
   }
 });
 
+/** Catches a short binary header that leaves the buffer stuck so the following CRC-valid ASCII log is never emitted. */
 test('an implausible binary header does not stall the following ASCII log', () => {
   const receiver = new ReceiverClient({ idleTimeoutMs: 30000 });
   const logs = [];
@@ -1084,6 +1174,7 @@ test('an implausible binary header does not stall the following ASCII log', () =
   assert.equal(receiver.buffer.length, 0);
 });
 
+/** Catches a centre left in MHz, or a kHz bandwidth scaled as if it were MHz. */
 test('frequency scaling keeps MHz centers and does not treat kHz bandwidth as MHz', () => {
   assert.equal(scaleFrequencyHz(1176.45, 'center'), 1176.45e6);
   assert.equal(scaleFrequencyHz(1.57542e9, 'center'), 1.57542e9);
@@ -1098,6 +1189,7 @@ test('frequency scaling keeps MHz centers and does not treat kHz bandwidth as MH
   assert.equal(narrow.detections[0].centerFrequencyHz, 1575420000);
 });
 
+/** Catches RXSTATUS accepting a short word list, or a binary RANGE channel whose system or GLONASS frequency is wrong. */
 test('RXSTATUS rejects incomplete words and binary GLONASS channels are signed', () => {
   assert.throws(() => decode({ format: 'ascii', header: { messageName: 'RXSTATUS' }, fields: ['zz', '0', '00000000'] }), /RXSTATUS/);
   assert.throws(() => decode({ format: 'ascii', header: { messageName: 'RXSTATUS' }, fields: ['00000000', '0', '12'] }), /RXSTATUS/);
@@ -1116,11 +1208,13 @@ test('RXSTATUS rejects incomplete words and binary GLONASS channels are signed',
   assert.equal(gps.data.observations[0].gloFrequency, 9);
 });
 
+/** Catches a decode error that replaces the last good BESTSATS or omits the raw-log note. */
 test('a decode failure is logged and does not replace the last good record', () => {
   const warnings = [];
   const errors = [];
   const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
   const context = vm.createContext({
+    /** @param {object} message @returns {object} Throws when message.fail is set. Side effects: none. Events: none. */
     decode(message) {
       if (message.fail) throw new Error('BESTSATS has an invalid observation count');
       return message;
@@ -1142,6 +1236,7 @@ test('a decode failure is logged and does not replace the last good record', () 
   assert.equal(context.store.counts.BESTSATS, 1);
 });
 
+/** Catches a track map past 512 entries, or a replace that gives up on the first EPERM. */
 test('history keeps at most 512 satellite tracks and replaces a file after EPERM', () => {
   assert.equal(MAX_TRACKS, 512);
   const history = new History({ retentionMs: 3600000, trackSampleMs: 1, maxInterferenceSamples: 10 });
@@ -1183,6 +1278,7 @@ test('history keeps at most 512 satellite tracks and replaces a file after EPERM
   assert.equal(denied, true);
 });
 
+/** Catches settings that do not round-trip, a broken file that ignores its backup, retention above 31 days, or an out-of-range WEB_PORT. */
 test('connection settings round-trip and retention above 31 days is clamped', () => {
   const config = require('../src/config');
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'connection-'));
@@ -1219,9 +1315,15 @@ test('connection settings round-trip and retention above 31 days is clamped', ()
   assert.match(invalidPort.stderr, /WEB_PORT/);
 });
 
+/** Catches invented ephemeris health, a throw on a null MSL height, or raw HTML in the map popup. */
 test('missing ephemeris health is unknown, blank height does not throw, and map text is escaped', () => {
   const health = vm.createContext({});
   load(health, 'function ephemerisParameters(', 'function buildEphemerisTable(');
+  /**
+   * Wraps name/value pairs as the parameter list ephemerisHealth reads.
+   * @param {Array<[string, *]>} pairs Parameter names and values.
+   * @returns {{parameters: object[]}}
+   */
   const data = (pairs) => ({ parameters: pairs.map(([name, value]) => ({ name, value })) });
   assert.equal(health.ephemerisHealth('GLOEPHEMERIS', data([])), null);
   assert.equal(health.ephemerisHealth('GLOEPHEMERIS', data([['health', 1]])), true);
@@ -1277,10 +1379,13 @@ test('missing ephemeris health is unknown, blank height does not throw, and map 
   assert.doesNotMatch(popup, /<img>/);
 });
 
+/** Catches an idle serial port that opens TCP instead of scheduling another serial attempt. */
 test('a silent serial port is recycled without falling straight through to TCP', () => {
   const ports = [];
   const timers = [];
+  /** Serial stand-in. close invokes its callback immediately with no error. Side effects: recorded in ports. Events: none. */
   class FakePort extends EventEmitter {
+    /** @param {object} options @returns {void} Side effects: pushes this onto ports. Events: none. */
     constructor(options) {
       super();
       this.options = options;
@@ -1317,10 +1422,13 @@ test('a silent serial port is recycled without falling straight through to TCP',
   receiver.stop();
 });
 
+/** Catches a close error from a replaced serial port that overwrites the current port's error. */
 test('a close error from a serial port that is no longer current is ignored', () => {
   const ports = [];
   const timers = [];
+  /** Serial stand-in that stores the close callback instead of calling it. Side effects: recorded in ports. Events: none. */
   class FakePort extends EventEmitter {
+    /** @param {object} options @returns {void} Side effects: pushes this onto ports. Events: none. */
     constructor(options) {
       super();
       this.options = options;
@@ -1328,6 +1436,12 @@ test('a close error from a serial port that is no longer current is ignored', ()
     }
     open(callback) { this.openCallback = callback; }
     write() {}
+    /**
+     * Records the callback so the test can fire a late error.
+     * @param {Function} callback
+     * @returns {void}
+     * Side effects: sets isOpen false and closeCallback. Events: none.
+     */
     close(callback) {
       this.isOpen = false;
       this.closeCallback = callback;
@@ -1366,6 +1480,7 @@ test('a close error from a serial port that is no longer current is ignored', ()
   receiver.stop();
 });
 
+/** Catches history that keeps a GPS time more than 5 min old, more than 2 s ahead, or stuck at the 1980 epoch. */
 test('GPS header time is used only when it is recent, at most 2 s ahead, and at most 5 min behind', () => {
   const now = Date.UTC(2026, 9, 22, 12, 0, 0);
   const receivedAt = new Date(now).toISOString();
@@ -1442,6 +1557,7 @@ test('GPS header time is used only when it is recent, at most 2 s ahead, and at 
   assert.equal(stamps[2], Date.parse(liveReceived));
 });
 
+/** Catches a snapshot that shows a CRC-failed interference report as the live status. */
 test('a snapshot keeps CRC-failed interference out of the live display', () => {
   const latestByName = {};
   const queued = [];
@@ -1473,6 +1589,7 @@ test('a snapshot keeps CRC-failed interference out of the live display', () => {
   assert.equal(context.latestByName.ITDETECTSTATUS.receivedAt, newer.receivedAt);
 });
 
+/** Catches a replace that leaves the destination changed when the final rename fails with ENOSPC. */
 test('a failed replace restores the previous file and load falls back to the backup', () => {
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'replace-restore-'));
   const destination = path.join(dir, 'history.json');
@@ -1500,12 +1617,21 @@ test('a failed replace restores the previous file and load falls back to the bac
   }
 });
 
+/**
+ * Catches a flush that loses a newer sample, a save that overwrites an unreadable
+ * history file, or a deleted file whose backup is not loaded.
+ */
 test('shutdown flush wins over an older async save, and a bad history file is not overwritten', async () => {
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-flush-'));
   const file = path.join(dir, 'history.json');
   const history = new History({
     retentionMs: 24 * 60 * 60 * 1000, trackSampleMs: 1, maxInterferenceSamples: 100, filePath: file,
   });
+  /**
+   * Builds one interference detection used by the history save tests.
+   * @param {number} power Power in dBm.
+   * @returns {object[]} Single-detection list.
+   */
   const sample = (power) => [{ powerDbm: power, centerFrequencyHz: 1.5e9, bandwidthHz: 1000, type: 'CW' }];
   const now = Date.now();
   history.addInterference('L1', sample(-90), now);
@@ -1571,6 +1697,7 @@ test('shutdown flush wins over an older async save, and a bad history file is no
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
+/** Catches a load or save that rewrites a history file whose size is reported as 65 MiB. */
 test('an oversize history file is left untouched', () => {
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-size-'));
   const file = path.join(dir, 'history.json');
@@ -1597,7 +1724,13 @@ test('an oversize history file is left untouched', () => {
   }
 });
 
+/** Catches a locked history file that is replaced before it can be read, or a retry that drops the older sample. */
 test('a locked history file is retried and then merged without dropping the previous samples', () => {
+  /**
+   * Builds one interference detection used by the history save tests.
+   * @param {number} power Power in dBm.
+   * @returns {object[]} Single-detection list.
+   */
   const sample = (power) => [{ powerDbm: power, centerFrequencyHz: 1.5e9, bandwidthHz: 1000, type: 'CW' }];
   const realStat = fs.statSync;
   try {
@@ -1642,6 +1775,7 @@ test('a locked history file is retried and then merged without dropping the prev
   }
 });
 
+/** Catches a save that replaces a history file the load could not stat without rereading the copy still on disk. */
 test('a history file that disappears is reread before it is replaced', () => {
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-missing-'));
   const file = path.join(dir, 'history.json');
@@ -1679,6 +1813,7 @@ test('a history file that disappears is reread before it is replaced', () => {
   }
 });
 
+/** Catches a save that overwrites a history file whose version is 2. */
 test('a history file with the wrong version is not replaced', () => {
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-version-'));
   const file = path.join(dir, 'history.json');
@@ -1698,6 +1833,7 @@ test('a history file with the wrong version is not replaced', () => {
   }
 });
 
+/** Catches a failed settings save reported as success, or a later save that clears the previous error. */
 test('a connection settings save failure is reported instead of a silent success', () => {
   const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
   assert.match(serverCode, /const saveError = persistConnectionSettings\(\)/);

@@ -1,28 +1,55 @@
 'use strict';
 
-// Fake PwrPak: serves the GNSSBASE profile's core logs (ASCII and binary) on a TCP
-// port so the viewer can be exercised without hardware.
-//   npm run sim
-//   NOVATEL_HOST=127.0.0.1 npm start
+/**
+ * Simulator that emits synthetic NovAtel logs. A fake PwrPak serves the
+ * GNSSBASE profile's core ASCII and binary logs on TCP so the viewer can
+ * run without a receiver.
+ *   npm run sim
+ *   NOVATEL_HOST=127.0.0.1 npm start
+ */
 
 const net = require('node:net');
 const { novatelCrc32, novatelCrc32Buffer } = require('../src/novatel');
 
 const PORT = Number(process.env.SIM_PORT || 3001);
 const HOST = process.env.SIM_HOST || '127.0.0.1';
+// GPS week written into every ASCII header and at binary offset 14.
 const WEEK = 2222;
 
 const BASE_LAT = 51.1163;
 const BASE_LON = -114.0387;
 const BASE_HGT = 1064.5;
 
+/**
+ * Builds one CRC-terminated ASCII log.
+ * week and seconds are written into the FINESTEERING header.
+ * novatelCrc32 of that sentence is appended as * and eight hex digits.
+ * @param {string} name Log name without the trailing A.
+ * @param {number} week GPS week.
+ * @param {number} seconds Seconds of week.
+ * @param {string} body Fields after the semicolon.
+ * @returns {Buffer} `#` line ending in CRLF.
+ */
 function ascii(name, week, seconds, body) {
+  // GPS week and seconds-of-week in the FINESTEERING header.
   const sentence = `${name}A,COM1,0,72.5,FINESTEERING,${week},${seconds.toFixed(3)},02000020,0000,32768;${body}`;
+  // CRC32 of the sentence, appended as * and eight hex digits.
   return Buffer.from(`#${sentence}*${novatelCrc32(sentence).toString(16).padStart(8, '0')}\r\n`, 'ascii');
 }
 
+/**
+ * Builds one binary frame. Bytes 0-2 are sync AA 44 12 and byte 3 is header length 28.
+ * GPS week is stored at offset 14. Math.round(seconds * 1000) is stored at offset 16.
+ * The last four bytes are novatelCrc32Buffer of the header and body.
+ * @param {number} messageId NovAtel message id.
+ * @param {number} week GPS week.
+ * @param {number} seconds Seconds of week.
+ * @param {Buffer} body Message body, copied at offset 28.
+ * @returns {Buffer} 28-byte header, body, and 4-byte CRC.
+ */
 function binary(messageId, week, seconds, body) {
   const frame = Buffer.alloc(28 + body.length + 4);
+  // Sync AA 44 12 and header length 28.
   frame[0] = 0xaa; frame[1] = 0x44; frame[2] = 0x12; frame[3] = 28;
   frame.writeUInt16LE(messageId, 4);
   frame[6] = 0x00; // message type: binary, original
@@ -31,15 +58,24 @@ function binary(messageId, week, seconds, body) {
   frame.writeUInt16LE(0, 10);
   frame[12] = 145;
   frame[13] = 180; // FINESTEERING
+  // GPS week at offset 14. Milliseconds-of-week (seconds × 1000) at offset 16.
   frame.writeUInt16LE(week, 14);
   frame.writeUInt32LE(Math.round(seconds * 1000), 16);
   frame.writeUInt32LE(0x02000020, 20);
   frame.writeUInt16LE(32768, 26);
   body.copy(frame, 28);
+  // CRC32 of the header and body, excluding these four bytes.
   frame.writeUInt32LE(novatelCrc32Buffer(frame, 0, frame.length - 4), frame.length - 4);
   return frame;
 }
 
+/**
+ * Builds a BESTPOS binary frame around a fixed base position with small jitter.
+ * Week, seconds, sync, and CRC are attached by binary().
+ * @param {number} week GPS week.
+ * @param {number} seconds Seconds of week.
+ * @returns {Buffer} Message id 42 frame.
+ */
 function bestPosBinary(week, seconds) {
   const body = Buffer.alloc(72);
   body.writeUInt32LE(0, 0); // SOL_COMPUTED
@@ -59,6 +95,13 @@ function bestPosBinary(week, seconds) {
   return binary(42, week, seconds, body);
 }
 
+/**
+ * Builds a RANGE ASCII log for satellites currently above 10 degrees.
+ * Week, seconds, and CRC are attached by ascii().
+ * @param {number} week GPS week.
+ * @param {number} seconds Seconds of week.
+ * @returns {Buffer}
+ */
 function rangeAscii(week, seconds) {
   const tracked = trackedSats();
   const parts = [String(tracked.length)];
@@ -82,6 +125,15 @@ const IT_SIGNALS = [
   ['NAVICS', 2492.028e6],
 ];
 
+/**
+ * Builds an ITDETECTSTATUS ASCII log, usually clear and sometimes with detections.
+ * Week, seconds, and CRC are attached by ascii().
+ * @param {number} week GPS week.
+ * @param {number} seconds Seconds of week.
+ * @param {string} signalType Signal name written as the first field.
+ * @param {number} centerHz Centre frequency in Hz, jittered when a detection is emitted.
+ * @returns {Buffer}
+ */
 function itDetectAscii(week, seconds, signalType, centerHz) {
   const detections = Math.random() < 0.65 ? 0 : 1 + Math.floor(Math.random() * 2);
   const parts = [signalType, String(detections)];
@@ -117,11 +169,20 @@ const SKY = CONSTELLATIONS.map(([system, count]) => ({
 
 const SYSTEM_CODE = { GPS: 0, GLONASS: 1, SBAS: 2, GALILEO: 3, BEIDOU: 4, QZSS: 5 };
 
+/**
+ * Tracking-status word with the constellation code placed at bit 16.
+ * @param {string} system Key in SYSTEM_CODE.
+ * @returns {number} Unsigned 32-bit status word.
+ */
 function trackingStatus(system) {
   return ((0x08109c04 & ~(0x7 << 16)) | (SYSTEM_CODE[system] << 16)) >>> 0;
 }
 
-/** Satellites above 10 degrees are "tracked"; C/No rises with elevation. */
+/**
+ * Satellites above 10 degrees are tracked. C/No rises with elevation.
+ * Reads SKY and does not mutate it.
+ * @returns {Array<{system: string, sat: object, cno: number}>}
+ */
 function trackedSats() {
   const out = [];
   for (const entry of SKY) {
@@ -137,6 +198,14 @@ function trackedSats() {
   return out;
 }
 
+/**
+ * Builds a SATVIS2 ASCII log and steps each satellite's azimuth and elevation.
+ * Week, seconds, and CRC are attached by ascii().
+ * @param {number} week GPS week.
+ * @param {number} seconds Seconds of week.
+ * @param {{system: string, sats: object[]}} entry Constellation entry from SKY.
+ * @returns {Buffer} Mutates sat.azimuth and sat.elevation.
+ */
 function satVisAscii(week, seconds, entry) {
   const parts = [entry.system, 'TRUE', 'FALSE', String(entry.sats.length)];
   for (const sat of entry.sats) {
@@ -147,6 +216,13 @@ function satVisAscii(week, seconds, entry) {
   return ascii('SATVIS2', week, seconds, parts.join(','));
 }
 
+/**
+ * Builds a BESTSATS ASCII log for the satellites trackedSats() returns.
+ * Week, seconds, and CRC are attached by ascii().
+ * @param {number} week GPS week.
+ * @param {number} seconds Seconds of week.
+ * @returns {Buffer}
+ */
 function bestSatsAscii(week, seconds) {
   const tracked = trackedSats();
   const parts = [String(tracked.length)];
@@ -162,6 +238,7 @@ function bestSatsAscii(week, seconds) {
 
 const server = net.createServer((socket) => {
   console.log(`[sim] client connected from ${socket.remoteAddress}`);
+  // Seconds of week. Each tick adds one, and binary() stores that as milliseconds.
   let seconds = 243000;
   let tick = 0;
 
@@ -178,6 +255,7 @@ const server = net.createServer((socket) => {
   for (const entry of SKY) socket.write(satVisAscii(WEEK, seconds, entry));
 
   const timer = setInterval(() => {
+    // Advance GPS seconds-of-week by one.
     seconds += 1;
     tick += 1;
 

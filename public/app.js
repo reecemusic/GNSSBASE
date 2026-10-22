@@ -1,5 +1,12 @@
 'use strict';
 
+/**
+ * Browser client for the GNSS monitor page.
+ * It renders the existing page, holds live state, opens an EventSource to /events,
+ * and draws the skyplot, interference timeline, and archive view.
+ * It emits no Node events.
+ */
+
 const $ = (id) => document.getElementById(id);
 const MAX_RAW_ROWS = 300;
 const MAX_IT_ROWS = 50;
@@ -19,7 +26,15 @@ let ephemerisDirty = false;
 let timelineDirty = false;
 let lastErrorNotice = '';
 
+/**
+ * Shows a display failure in #client-error and logs each distinct message once.
+ * @param {string} context What failed.
+ * @param {*} error Error or other thrown value.
+ * @returns {void}
+ * Side effects: DOM text on #client-error, console.error, and lastErrorNotice. events: none.
+ */
 function reportClientError(context, error) {
+  // Writes #client-error and console.error once per distinct message. Does not dispatch an event.
   const message = `${context}: ${error instanceof Error ? error.message : String(error)}`;
   const notice = $('client-error');
   if (notice) {
@@ -30,7 +45,16 @@ function reportClientError(context, error) {
   lastErrorNotice = message;
 }
 
+/**
+ * Reads one localStorage preference and parses it when the key is present.
+ * @param {string} key Storage key.
+ * @param {*} fallback Used when the key is missing or reading throws.
+ * @param {Function} [parse] Maps the stored string to a value. Defaults to identity.
+ * @returns {*}
+ * Side effects: localStorage read. On failure, reportClientError and the fallback. events: none.
+ */
 function readPreference(key, fallback, parse = (value) => value) {
+  // localStorage getItem. A missing key returns fallback. A throw from storage or parse is reported and fallback is returned.
   try {
     const value = localStorage.getItem(key);
     return value === null ? fallback : parse(value);
@@ -40,7 +64,15 @@ function readPreference(key, fallback, parse = (value) => value) {
   }
 }
 
+/**
+ * Writes one localStorage preference.
+ * @param {string} key Storage key.
+ * @param {string} value Value passed to setItem.
+ * @returns {void}
+ * Side effects: localStorage write. On failure, reportClientError. events: none.
+ */
 function writePreference(key, value) {
+  // localStorage setItem. A throw is reported and otherwise ignored.
   try {
     localStorage.setItem(key, value);
   } catch (error) {
@@ -48,8 +80,17 @@ function writePreference(key, value) {
   }
 }
 
+/**
+ * Fetches a URL and aborts after 15 seconds, also honouring options.signal.
+ * @param {string} url Request URL.
+ * @param {object} [options] Fetch options.
+ * @param {boolean} [json] When true, resolve with the parsed body.
+ * @returns {Promise<Response|*>}
+ * Side effects: network fetch and a timer. Throws when the response is not ok. events: none.
+ */
 async function request(url, options = {}, json = false) {
   const controller = new AbortController();
+  /** Aborts this request's controller. No params. Returns undefined. Side effects: aborts the fetch. Events: none. */
   const abort = () => controller.abort();
   options.signal?.addEventListener('abort', abort, { once: true });
   if (options.signal?.aborted) controller.abort();
@@ -64,6 +105,12 @@ async function request(url, options = {}, json = false) {
   }
 }
 
+/**
+ * Loads a set of hidden names from a JSON array of at most 512 strings.
+ * @param {string} key Storage key.
+ * @returns {Set<string>}
+ * Side effects: readPreference reports a client error and an empty set is used when the value is missing or invalid. events: none.
+ */
 function readHiddenPreference(key) {
   return new Set(readPreference(key, [], (value) => {
     const parsed = JSON.parse(value);
@@ -124,6 +171,11 @@ $('height-toggle').addEventListener('click', (event) => {
   if (latestByName.BESTGNSSPOS) renderBestGnssPos(latestByName.BESTGNSSPOS);
 });
 
+/**
+ * Marks the active height-datum button and copies that label onto both height captions.
+ * @returns {void}
+ * Side effects: DOM class and text on the height toggle and the two height labels. events: none.
+ */
 function syncHeightToggle() {
   for (const button of $('height-toggle').children) {
     button.classList.toggle('active', button.dataset.datum === state.heightDatum);
@@ -216,12 +268,22 @@ connectionForm.addEventListener('submit', async (event) => {
   }
 });
 
+/**
+ * Shows the TCP fields, the serial fields, or both, from the transport select.
+ * @returns {void}
+ * Side effects: hidden on #tcp-fields and #serial-fields. events: none.
+ */
 function updateConnectionFields() {
   const transport = connectionTransport.value;
   $('tcp-fields').hidden = transport === 'serial';
   $('serial-fields').hidden = transport === 'tcp';
 }
 
+/**
+ * Phase used by the connection bar: offline, connecting, connected, or the status phase.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function connectionPhase() {
   const status = connection.status;
   if (connection.offline) return 'offline';
@@ -230,6 +292,13 @@ function connectionPhase() {
   return status.phase || 'waiting';
 }
 
+/**
+ * Formats the serial path and baud, or the TCP host and port, for a status object.
+ * @param {object} status Receiver status.
+ * @param {string} [transport] Override; defaults to status.transport.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function connectionTarget(status, transport = status.transport) {
   return transport === 'serial'
     ? `USB serial ${status.serialPath} @ ${status.baudRate} baud`
@@ -314,6 +383,12 @@ function renderConnectionBar() {
   }
 }
 
+/**
+ * GET /api/serial-ports and rebuilds the serial-path select, keeping the selected path.
+ * @param {string} [selectedPath] Option to select. Defaults to the current select value.
+ * @returns {Promise<void>}
+ * Side effects: network and DOM on the select and #connection-message. Failures set the message text. events: none.
+ */
 async function refreshSerialPorts(selectedPath = serialPathSelect.value) {
   const message = $('connection-message');
   try {
@@ -338,6 +413,11 @@ async function refreshSerialPorts(selectedPath = serialPathSelect.value) {
   }
 }
 
+/**
+ * GET /api/connection and fills the connection form, then refreshes serial ports.
+ * @returns {Promise<void>}
+ * Side effects: network and DOM form fields. Failures set #connection-message. events: none.
+ */
 async function loadConnectionSettings() {
   try {
     const settings = await request('/api/connection', {}, true);
@@ -359,7 +439,16 @@ loadConnectionSettings();
 
 let source = null;
 
+/**
+ * Parses one EventSource message and passes the object to handler.
+ * @param {string} context Label passed to reportClientError.
+ * @param {MessageEvent} event Event whose data is JSON text.
+ * @param {Function} handler Called with the parsed object.
+ * @returns {void}
+ * Side effects: reportClientError when the text is over the size limit, JSON is invalid, the value is not a plain object, or handler throws. events: none.
+ */
 function handleStreamEvent(context, event, handler) {
+  // Parses event.data as JSON and runs handler only for a plain object. Oversize text and bad JSON are reported and skipped.
   try {
     if (event.data.length > MAX_EVENT_CHARS) throw new Error('Live event exceeds the display size limit');
     const data = JSON.parse(event.data);
@@ -370,9 +459,16 @@ function handleStreamEvent(context, event, handler) {
   }
 }
 
+/**
+ * Opens an EventSource on /events when the tab is visible and no source is already open.
+ * @returns {void}
+ * Side effects: network SSE. Listens for status, snapshot, message, archive, open, and error. error marks the page offline and redraws the bar; it does not close the source or start a backoff timer. A hidden tab is skipped; the visibility listener closes the source and calls this again when the tab is shown. events: none.
+ */
 function connectStream() {
+  // No second connection, and no connection while the tab is hidden. This does not arm a reconnect timer.
   if (source || document.hidden) return;
   source = new EventSource('/events');
+  // SSE names listened for: status, snapshot, message, and archive. Also the EventSource open and error events.
   source.addEventListener('status', (event) => handleStreamEvent('Receiver status', event, renderStatus));
   source.addEventListener('snapshot', (event) => handleStreamEvent('Loading live snapshot', event, applySnapshot));
   source.addEventListener('message', (event) => handleStreamEvent('Reading live report', event, applyPayload));
@@ -381,12 +477,19 @@ function connectStream() {
     connection.offline = false;
     renderConnectionBar();
   });
+  // error marks the page offline and redraws the bar. The source stays open; no backoff is scheduled here.
   source.addEventListener('error', () => {
     connection.offline = true;
     renderConnectionBar();
   });
 }
 
+/**
+ * Replaces counters, ephemeris, satvis, latest reports, and the raw and interference logs from a snapshot.
+ * @param {object} snap Snapshot object from the snapshot SSE event.
+ * @returns {void}
+ * Side effects: state, latestByName, pending queues, DOM logs, and dirty flags. History copies ITDETECTSTATUS onto latestByName only when crcValid === true, receivedAt is set, and no report is stored yet or this receivedAt is later. events: none.
+ */
 function applySnapshot(snap) {
   if (snap.status) renderStatus(snap.status);
   if (snap.archive) applyArchiveStatus(snap.archive);
@@ -413,6 +516,7 @@ function applySnapshot(snap) {
   lastItReportHadDetections = false;
   (snap.itdetectHistory || []).forEach((record) => {
     rememberLastDetection(record);
+    // Copied onto latestByName only when crcValid === true, receivedAt is set, and either nothing is stored yet or this receivedAt is later.
     if (record.crcValid === true && record.receivedAt && (!latestByName.ITDETECTSTATUS
       || Date.parse(record.receivedAt) > Date.parse(latestByName.ITDETECTSTATUS.receivedAt))) {
       latestByName.ITDETECTSTATUS = record;
@@ -424,6 +528,12 @@ function applySnapshot(snap) {
   countsDirty = ephemerisDirty = timelineDirty = true;
 }
 
+/**
+ * Applies one live report to counts, history, latestByName, and the raw and interference queues.
+ * @param {object} payload Object with record, counts, and optional ephemeris.
+ * @returns {void}
+ * Side effects: state and queues. validateRecord and recordLiveHistory may throw. events: none.
+ */
 function applyPayload(payload) {
   validateRecord(payload.record);
   state.counts = payload.counts;
@@ -443,11 +553,25 @@ function applyPayload(payload) {
   if (payload.ephemeris) ephemerisDirty = true;
 }
 
+/**
+ * Appends a record and drops the oldest entries past limit.
+ * @param {Array} queue Queue mutated in place.
+ * @param {object} record Record to append.
+ * @param {number} limit Maximum length kept.
+ * @returns {void}
+ * Side effects: mutates queue. events: none.
+ */
 function queueRecord(queue, record, limit) {
   queue.push(record);
   if (queue.length > limit) queue.splice(0, queue.length - limit);
 }
 
+/**
+ * Copies the fields shown in the raw log and truncates raw text past 16384 characters.
+ * @param {object} record Source report.
+ * @returns {object}
+ * Side effects: none. events: none.
+ */
 function rawDisplayRecord(record) {
   const text = String(record.raw ?? '');
   return {
@@ -456,6 +580,13 @@ function rawDisplayRecord(record) {
   };
 }
 
+/**
+ * Runs a renderer and reports a throw without letting it stop later updates.
+ * @param {string} label Context passed to reportClientError.
+ * @param {Function} render Callback.
+ * @returns {void}
+ * Side effects: reportClientError when render throws. events: none.
+ */
 function renderSafely(label, render) {
   try {
     render();
@@ -464,6 +595,12 @@ function renderSafely(label, render) {
   }
 }
 
+/**
+ * Renders the active tab when it is dirty, or always when force is set.
+ * @param {boolean} [force] Draw the active tab even if its dirty flag is clear.
+ * @returns {void}
+ * Side effects: DOM via the tab renderers. Clears that tab dirty flag and dirtyRecords. Returns immediately when the tab is hidden. events: none.
+ */
 function flushUpdates(force = false) {
   if (document.hidden) return;
   const tab = document.querySelector('.tab.active')?.dataset.tab;
@@ -509,14 +646,27 @@ function flushUpdates(force = false) {
   dirtyRecords.clear();
 }
 
+/**
+ * Stores receiver status, clears the offline flag, and redraws the connection bar.
+ * @param {object} status Status object from the status SSE event or a snapshot.
+ * @returns {void}
+ * Side effects: connection.status, connection.offline, and the connection-bar DOM. May start or stop the retry countdown timer. events: none.
+ */
 function renderStatus(status) {
   connection.status = status;
   connection.offline = false;
   renderConnectionBar();
 }
 
+/**
+ * Stores a CRC-valid report on latestByName. An error or any other crcValid only registers the raw-log name.
+ * @param {object} record Decoded report.
+ * @returns {void}
+ * Side effects: validateRecord may throw. On success, latestByName, dirtyRecords, satvis, last detection, the version line, and the raw filter. events: none.
+ */
 function applyRecord(record) {
   validateRecord(record);
+  // Not stored when record.error is set or crcValid is not exactly true. The raw-log filter still learns the name.
   if (record.error || record.crcValid !== true) {
     registerFilterOption(record.name);
     return;
@@ -529,16 +679,26 @@ function applyRecord(record) {
   registerFilterOption(record.name);
 }
 
+/**
+ * Rejects a report with a bad name, non-object data, a 257th message type, or an oversized detections, satellites, observations, or components array.
+ * @param {object} record Report to check.
+ * @returns {void}
+ * Side effects: none. Throws instead of storing the report. events: none.
+ */
 function validateRecord(record) {
+  // Rejected: missing record, or a name that is not 1-64 characters of A-Z, digits, and underscores.
   if (!record || typeof record.name !== 'string' || !/^[A-Z][A-Z0-9_]{0,63}$/.test(record.name)) {
     throw new Error('Report has an invalid message name');
   }
+  // Rejected: data that is present but not a plain object. null and undefined are allowed.
   if (record.data !== undefined && record.data !== null && (typeof record.data !== 'object' || Array.isArray(record.data))) {
     throw new Error(`${record.name} has invalid report data`);
   }
+  // Rejected: a new message name when 256 distinct types are already stored.
   if (Object.keys(latestByName).length >= 256 && !Object.hasOwn(latestByName, record.name)) {
     throw new Error('Too many distinct message types');
   }
+  // Rejected: a detections, satellites, observations, or components value that is not an array of at most 2048 objects.
   for (const key of ['detections', 'satellites', 'observations', 'components']) {
     const values = record.data?.[key];
     if (values !== undefined && (!Array.isArray(values) || values.length > 2048
@@ -607,6 +767,13 @@ const QUALITY_LABEL = {
   none: 'No usable fix',
 };
 
+/**
+ * Looks up solution-status text and the position-type quality tier.
+ * @param {string} solutionStatus Receiver solution status.
+ * @param {string} positionType Receiver position type.
+ * @returns {object}
+ * Side effects: none. Returns text and quality (quality is null when the type is unknown). events: none.
+ */
 function explainSolution(solutionStatus, positionType) {
   const status = SOLUTION_STATUS_TEXT[solutionStatus] || solutionStatus || '';
   const type = POSITION_TYPE_TEXT[positionType];
@@ -615,6 +782,12 @@ function explainSolution(solutionStatus, positionType) {
   return { text: `${status}. ${type[0]}${accuracy}.`, quality: type[1] };
 }
 
+/**
+ * Fills the BESTPOS fields and updates the map from one report.
+ * @param {object} record BESTPOS report.
+ * @returns {void}
+ * Side effects: DOM position fields and the map. Returns when data is missing. events: none.
+ */
 function renderBestPos(record) {
   const d = record.data;
   if (!d) return;
@@ -650,6 +823,12 @@ let map = null;
 let marker = null;
 let accuracyCircle = null;
 
+/**
+ * Escapes &, <, >, quotes, and apostrophes for HTML text.
+ * @param {*} value Value coerced with String.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, (char) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -697,6 +876,12 @@ function updateMap(d) {
     + `${escapeHtml(fmt(heightFor(d), 3, ' m'))} ${state.heightDatum === 'ellipsoidal' ? 'ellipsoidal' : 'MSL'} &middot; ${d.satellitesUsed ?? '?'} SVs`);
 }
 
+/**
+ * Fills the BESTGNSSPOS readout from one report.
+ * @param {object} record BESTGNSSPOS report.
+ * @returns {void}
+ * Side effects: DOM GNSS position fields. Returns when data is missing. events: none.
+ */
 function renderBestGnssPos(record) {
   const d = record.data;
   if (!d) return;
@@ -723,6 +908,12 @@ const CONSTELLATIONS = {
   SBAS: '#9aa4b5',
 };
 
+/**
+ * Colour for a constellation name, or the fallback grey.
+ * @param {string} system Constellation name.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function constellationColor(system) {
   return CONSTELLATIONS[(system || '').toUpperCase()] || '#9aa4b5';
 }
@@ -734,11 +925,26 @@ function skyPosition(elevationDeg, azimuthDeg) {
   return { x: SKY.cx + radius * Math.sin(azimuth), y: SKY.cy - radius * Math.cos(azimuth) };
 }
 
+/**
+ * True when elevation is 0-90 and azimuth is 0 inclusive to 360 exclusive.
+ * @param {number} elevation Elevation in degrees.
+ * @param {number} azimuth Azimuth in degrees.
+ * @returns {boolean}
+ * Side effects: none. events: none.
+ */
 function isValidSkyPosition(elevation, azimuth) {
   return Number.isFinite(elevation) && elevation >= 0 && elevation <= 90
     && Number.isFinite(azimuth) && azimuth >= 0 && azimuth < 360;
 }
 
+/**
+ * Creates an SVG element with attributes and optional text.
+ * @param {string} tag SVG tag name.
+ * @param {object} attrs Attribute map.
+ * @param {string} [text] textContent when provided.
+ * @returns {SVGElement}
+ * Side effects: none until the caller inserts the element. events: none.
+ */
 function svg(tag, attrs, text) {
   const el = document.createElementNS(SVG_NS, tag);
   for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, value);
@@ -778,6 +984,11 @@ $('show-traces').addEventListener('change', (event) => {
 
 let historyRequest = 0;
 let historyController = null;
+/**
+ * GET /api/history for the selected window and merges it with samples that arrived during the request.
+ * @returns {Promise<void>}
+ * Side effects: aborts the previous history fetch. Replaces tracks. Merges interference and, when data.solution is an array, solution history. A stale generation or a hidden tab returns before applying. Other failures are reported and existing samples stay. events: none.
+ */
 async function loadHistory() {
   const generation = ++historyRequest;
   historyController?.abort();
@@ -797,8 +1008,10 @@ async function loadHistory() {
     }
     state.tracks = data.tracks || {};
     const savedInterference = data.interference.slice(-MAX_INTERFERENCE_SAMPLES);
+    // Interference samples already in memory with t at or after the request start arrived while the GET was in flight.
     const arrivedDuringRequest = state.interferenceHistory.filter((sample) => sample.t >= requestedAt);
     const keys = new Set(savedInterference.map((sample) => `${sample.t}:${sample.signal}:${sample.count}:${sample.maxPower}`));
+    // Saved history (capped) is kept. In-flight samples are appended only when t:signal:count:maxPower is not already saved, then sorted by t.
     state.interferenceHistory = [...savedInterference, ...arrivedDuringRequest.filter((sample) =>
       !keys.has(`${sample.t}:${sample.signal}:${sample.count}:${sample.maxPower}`))];
     state.interferenceHistory.sort((a, b) => a.t - b.t);
@@ -807,6 +1020,7 @@ async function loadHistory() {
       const savedSolution = data.solution.slice(-MAX_INTERFERENCE_SAMPLES)
         .map((sample) => solutionSample(sample, sample?.t)).filter(Boolean).sort((a, b) => a.t - b.t);
       const lastSaved = savedSolution.length ? savedSolution[savedSolution.length - 1].t : -Infinity;
+      // Live solution samples from during the request are appended only when they are newer than the last saved sample.
       const solutionDuringRequest = (state.solutionHistory || []).filter((sample) => sample.t >= requestedAt && sample.t > lastSaved);
       state.solutionHistory = [...savedSolution, ...solutionDuringRequest];
     }
@@ -828,6 +1042,11 @@ function capHistoryWindow(retentionMinutes) {
   }
 }
 
+/**
+ * Drops client history older than the selected window and enforces the track and sample caps.
+ * @returns {void}
+ * Side effects: state.interferenceHistory, solutionHistory, and tracks. events: none.
+ */
 function pruneClientHistory() {
   const cutoff = Date.now() - state.windowMinutes * 60000;
   state.interferenceHistory = state.interferenceHistory.filter((s) => Number.isFinite(s.t) && s.t >= cutoff).slice(-MAX_INTERFERENCE_SAMPLES);
@@ -847,9 +1066,17 @@ function pruneClientHistory() {
   }
 }
 
+/**
+ * Appends CRC-valid SATVIS2 tracks, ITDETECTSTATUS samples, and BESTPOS solution samples.
+ * @param {object} record Decoded report.
+ * @returns {void}
+ * Side effects: state.tracks, interferenceHistory, and solution history. Returns immediately unless crcValid is true. Throws 'Too many satellite tracks' when a new key would exceed 512 tracks. events: none.
+ */
 function recordLiveHistory(record) {
+  // crcValid must be true. A new satellite track when 512 already exist throws 'Too many satellite tracks'.
   if (record.crcValid !== true) return;
   // Same rule as saneTimestamp in src/novatel.js: after 2020, at most 2 s ahead of the PC, at most 5 min behind.
+  // Header time is used only when it parses, is >= Date.UTC(2020, 0, 1), is >= now-5min, and is <= now+2s. Otherwise receivedAt when that parses, else Date.now().
   const nowMs = Date.now();
   const headerTime = Date.parse(record.header && record.header.utc);
   const receivedTime = Date.parse(record.receivedAt);
@@ -906,9 +1133,18 @@ function recordLiveHistory(record) {
 // Unchanged solutions are thinned to one sample per heartbeat, matching the server history.
 const SOLUTION_HEARTBEAT_MS = 10000;
 
+/**
+ * Builds a solution-history sample, or null when time or both used and type are unusable.
+ * @param {object} data BESTPOS-like fields.
+ * @param {number} t Sample time in milliseconds.
+ * @returns {object|null}
+ * Side effects: none. events: none.
+ */
 function solutionSample(data, t) {
   if (!data || !Number.isFinite(t)) return null;
+  /** @param {*} value @returns {number|null} An integer from 0 to 255, otherwise null. Side effects: none. Events: none. */
   const count = (value) => (Number.isInteger(value) && value >= 0 && value <= 255 ? value : null);
+  /** @param {*} value @returns {string|null} A non-empty string trimmed to 32 characters, otherwise null. Side effects: none. Events: none. */
   const text = (value) => (typeof value === 'string' && value ? value.slice(0, 32) : null);
   const sample = {
     t, used: count(data.used ?? data.satellitesUsed), tracked: count(data.tracked ?? data.satellitesTracked),
@@ -917,6 +1153,13 @@ function solutionSample(data, t) {
   return sample.used === null && sample.type === null ? null : sample;
 }
 
+/**
+ * Pushes a BESTPOS solution sample unless the same values were stored within the heartbeat.
+ * @param {object} data BESTPOS data.
+ * @param {number} now Sample time in milliseconds.
+ * @returns {void}
+ * Side effects: state.solutionHistory, capped at MAX_INTERFERENCE_SAMPLES. events: none.
+ */
 function recordSolution(data, now) {
   const sample = solutionSample(data, now);
   if (!sample) return;
@@ -939,10 +1182,17 @@ const TIMELINE_BAND_INFO = {
   L5: { coverage: 'E5 / B2', range: '1164–1215 MHz' },
 };
 
+/**
+ * Visible timeline range. While following, the end is the clock, so a future timestamp is outside the range.
+ * @param {number} [now] Clock used as the live end. Defaults to Date.now().
+ * @returns {object}
+ * Side effects: none. A non-following end is also clamped so it is not after now. events: none.
+ */
 function timelineViewport(now = Date.now()) {
   const historyMs = state.windowMinutes * 60000;
   const spanMs = timelineSpanMs(now);
   const windowMs = Math.min(spanMs, Math.max(10000, state.timelineView?.windowMs || historyMs));
+  // While following, the viewport ends at now, so a future timestamp is outside it and is not drawn. A pinned end is clamped to now as well.
   const end = state.timelineView && !state.timelineView.follow
     ? Math.max(now - spanMs + windowMs, Math.min(now, state.timelineView.end))
     : now;
@@ -964,6 +1214,12 @@ const TIMELINE_TICK_STEPS = [
   3600e3, 7200e3, 10800e3, 21600e3, 43200e3, 86400e3, 172800e3, 345600e3, 604800e3,
 ];
 
+/**
+ * Axis length in milliseconds, the viewport plus the right-hand headroom.
+ * @param {number} windowMs Viewport length.
+ * @returns {number}
+ * Side effects: none. events: none.
+ */
 function timelineAxisMs(windowMs) {
   return windowMs / (1 - TIMELINE_NOW_INSET);
 }
@@ -974,12 +1230,19 @@ function timelineAxis(start, windowMs, plotWidth, now = Date.now()) {
   const end = start + axisMs;
   return {
     start, end, axisMs, plotWidth,
+    // dataEnd is min(now, axis end), so a sample after now is not drawn.
     dataEnd: Math.min(now, end),
     now: now >= start && now <= end ? now : null,
     x: (time) => (time - start) / axisMs * plotWidth,
   };
 }
 
+/**
+ * Relative label such as minutes or hours ago for a non-negative duration.
+ * @param {number} ms Duration in milliseconds.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatTimeSince(ms) {
   const seconds = Math.max(0, Math.round(ms / 1000));
   if (seconds < 60) return `${seconds} s ago`;
@@ -1011,6 +1274,7 @@ function timelineTicks(axis, now = Date.now()) {
 function appendTimeAxis(chart, axis, layout, now = Date.now()) {
   const { left, top, bottom, labelY, nowLabelY, gridClass, labelClass } = layout;
   const right = left + axis.plotWidth;
+  /** @param {number} x Plot x. @returns {'start'|'middle'|'end'} Keeps a tick label inside the plot. Side effects: none. Events: none. */
   const anchorFor = (x) => (x - left < 40 ? 'start' : right - x < 40 ? 'end' : 'middle');
   for (const time of timelineTicks(axis, now)) {
     const x = left + axis.x(time);
@@ -1063,6 +1327,12 @@ function syncTimelinePreset(now = Date.now()) {
   if (select.value !== value) select.value = value;
 }
 
+/**
+ * Applies a View choice: live, the whole archive, or a following window of that length.
+ * @param {string} value Option value from the timeline preset select.
+ * @returns {void}
+ * Side effects: state.timelineView and a timeline redraw. events: none.
+ */
 function applyTimelinePreset(value) {
   if (value === 'live') state.timelineView = null;
   else if (value === 'archive') showWholeArchive();
@@ -1073,6 +1343,13 @@ function applyTimelinePreset(value) {
   renderTimeline();
 }
 
+/**
+ * Pins the viewport to end and windowMs, then reclamps it through timelineViewport.
+ * @param {number} end Requested viewport end.
+ * @param {number} windowMs Requested viewport length.
+ * @returns {void}
+ * Side effects: state.timelineView and a timeline redraw. events: none.
+ */
 function setTimelineView(end, windowMs) {
   state.timelineView = { end, windowMs };
   const view = timelineViewport();
@@ -1080,6 +1357,13 @@ function setTimelineView(end, windowMs) {
   renderTimeline();
 }
 
+/**
+ * Zooms the viewport around a fraction of the axis and pins the result.
+ * @param {number} factor Scale applied to the current window.
+ * @param {number} [fraction] Anchor along the axis. Defaults to 0.5.
+ * @returns {void}
+ * Side effects: state.timelineView and a timeline redraw via setTimelineView. events: none.
+ */
 function zoomTimeline(factor, fraction = 0.5) {
   const view = timelineViewport();
   const windowMs = Math.max(10000, Math.min(timelineSpanMs(), view.windowMs * factor));
@@ -1087,6 +1371,11 @@ function zoomTimeline(factor, fraction = 0.5) {
   setTimelineView(anchor - fraction * timelineAxisMs(windowMs) + windowMs, windowMs);
 }
 
+/**
+ * Binds timeline zoom, pan, live, and chart navigation controls.
+ * @returns {void}
+ * Side effects: DOM click listeners. events: none.
+ */
 function initTimelineControls() {
   $('timeline-zoom-in').addEventListener('click', () => zoomTimeline(0.5));
   $('timeline-zoom-out').addEventListener('click', () => zoomTimeline(2));
@@ -1103,9 +1392,20 @@ function initTimelineControls() {
   initTimePlotNavigation($('timeline'));
 }
 
+/**
+ * Wheel zoom and pointer pan on one time-plot SVG, or point selection when select mode is on.
+ * @param {SVGElement} chart Plot element.
+ * @returns {void}
+ * Side effects: listeners on chart. preventDefault on a wheel zoom. events: none.
+ */
 function initTimePlotNavigation(chart) {
   let drag = null;
   if (state.selectMode) chart.classList.add('select-mode');
+  /**
+   * Maps the plot area from the SVG viewBox into client pixels.
+   * @returns {{ left: number, width: number }}
+   * Side effects: reads the chart's bounding box. Events: none.
+   */
   const geometry = () => {
     const rect = chart.getBoundingClientRect();
     const width = chart.viewBox.baseVal.width;
@@ -1135,6 +1435,12 @@ function initTimePlotNavigation(chart) {
     const offset = (event.clientX - drag.x) / drag.width * timelineAxisMs(drag.view.windowMs);
     setTimelineView(drag.view.end - offset, drag.view.windowMs);
   });
+  /**
+   * Ends a pan when the pointer is released or cancelled.
+   * @param {PointerEvent} event
+   * @returns {void}
+   * Side effects: clears `drag`, releases pointer capture, removes the panning class. Events: none.
+   */
   const endDrag = (event) => {
     if (!drag || event.pointerId !== drag.id) return;
     const id = drag.id;
@@ -1147,6 +1453,14 @@ function initTimePlotNavigation(chart) {
   chart.addEventListener('lostpointercapture', endDrag);
 }
 
+/**
+ * Y position for a power in dBm inside one band row, or null when power is not finite.
+ * @param {number} power Power in dBm.
+ * @param {number} index Band row index.
+ * @param {number} rowHeight Row height in user units.
+ * @returns {number|null}
+ * Side effects: none. events: none.
+ */
 function timelinePowerY(power, index, rowHeight) {
   if (!Number.isFinite(power)) return null;
   return TIMELINE.top + index * rowHeight + 20
@@ -1166,6 +1480,12 @@ function appendYLabel(chart, y, text, width, className = 'tl-label') {
 const WALL_DESIGN_WIDTH = 900;
 const WALL_MIN_HEIGHT = 400;
 
+/**
+ * User-unit size of the timeline SVG. Wall mode scales the drawing down so strokes grow on screen.
+ * @param {SVGElement} chart Timeline element.
+ * @returns {object}
+ * Side effects: none. Reads the element rectangle. events: none.
+ */
 function timelineSize(chart) {
   const rect = chart.getBoundingClientRect();
   if (state.wall && rect.width > 0 && rect.height > 0) {
@@ -1176,6 +1496,11 @@ function timelineSize(chart) {
   return { width, height: TIMELINE.height, solutionRows: TIMELINE_SOLUTION_ROWS };
 }
 
+/**
+ * Redraws the interference timeline, archive layer, spectrum plots, and solution rows for the viewport.
+ * @returns {void}
+ * Side effects: DOM SVG and range text. Samples after axis.dataEnd are omitted. May schedule an archive fetch. events: none.
+ */
 function renderTimeline() {
   const chart = $('timeline');
   chart.replaceChildren();
@@ -1320,6 +1645,12 @@ function timelineBandSamples(samples, band) {
   return result;
 }
 
+/**
+ * Short duration label in seconds, minutes, hours, or days.
+ * @param {number} ms Duration in milliseconds.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatSpan(ms) {
   if (ms < 120000) return `${Math.round(ms / 1000)} s`;
   if (ms < 7200000) return `${Math.round(ms / 60000)} min`;
@@ -1342,6 +1673,7 @@ function timelineArchiveSamples(start, end) {
 function drawArchiveTimeline(chart, axis, archive, bandIds, rowHeight, width) {
   const minX = TIMELINE.left;
   const maxX = width - TIMELINE.right;
+  /** @param {number} time @returns {number} Plot x for a timestamp. Side effects: none. Events: none. */
   const xFor = (time) => TIMELINE.left + axis.x(time);
   const gapMs = Math.max(15000, archive.bucketMs * 1.5);
   bandIds.forEach((band, index) => {
@@ -1453,6 +1785,15 @@ function timelineSolutionSamples(start, end) {
   return mergeSolutionIntervals(bestpos, bestsats.map((sample) => ({ ...sample, archive: true, source: 'BESTSATS' })), start, end);
 }
 
+/**
+ * Fills gaps in primary solution intervals with fallback samples clipped to the range.
+ * @param {Array} primary Preferred intervals.
+ * @param {Array} fallback Samples used only in gaps.
+ * @param {number} start Range start.
+ * @param {number} end Range end.
+ * @returns {Array}
+ * Side effects: none. events: none.
+ */
 function mergeSolutionIntervals(primary, fallback, start, end) {
   const combined = [...primary];
   let primaryIndex = 0;
@@ -1490,6 +1831,13 @@ function liveSolution(now = Date.now()) {
 const SOLUTION_ROLL_MS = 450;
 let solutionRoll = { used: undefined, fix: undefined, usedAt: 0, fixAt: 0, usedDirection: 'up' };
 
+/**
+ * CSS class and negative animation-delay while a live solution value is still rolling.
+ * @param {string} key used or fix.
+ * @param {number} now Clock in milliseconds.
+ * @returns {object}
+ * Side effects: none. Reads solutionRoll. events: none.
+ */
 function solutionRollAttributes(key, now) {
   const elapsed = now - solutionRoll[`${key}At`];
   if (elapsed >= SOLUTION_ROLL_MS) return {};
@@ -1548,8 +1896,10 @@ function drawSolutionLive(chart, top, rowHeight, now) {
 function drawSolutionTimeline(chart, axis, top, width) {
   const rowHeight = TIMELINE.solutionRow;
   const right = width - TIMELINE.right;
+  /** @param {number} time @returns {number} Plot x clamped to the solution row. Side effects: none. Events: none. */
   const xFor = (time) => Math.max(TIMELINE.left, Math.min(right, TIMELINE.left + axis.x(time)));
   const samples = timelineSolutionSamples(axis.start, axis.dataEnd);
+  /** @param {object} run @returns {string} The run's time span, plus an archive or BESTSATS note when present. Side effects: none. Events: none. */
   const range = (run) => `${formatTimestamp(run.start, true)} – ${formatTimestamp(run.end, true)}${run.first.archive ? ' (archive)' : ''}`
     + `${run.first.source === 'BESTSATS' ? ' · BESTSATS: GOOD satellites; fix type unavailable' : ''}`;
   const rows = [
@@ -1578,6 +1928,7 @@ function drawSolutionTimeline(chart, axis, top, width) {
   const satBottom = top + rowHeight - 10;
   const usedRuns = solutionRuns(samples, axis.start, axis.dataEnd, (sample) => sample.used);
   const maxUsed = Math.max(5, Math.ceil(Math.max(0, ...usedRuns.map((run) => run.value)) / 5) * 5);
+  /** @param {number} count Satellites used. @returns {number} Y inside the satellite row. Side effects: none. Events: none. */
   const satY = (count) => satBottom - count / maxUsed * (satBottom - satTop);
   for (const count of [0, Math.round(maxUsed / 2), maxUsed]) {
     const y = satY(count);
@@ -1602,6 +1953,7 @@ function drawSolutionTimeline(chart, axis, top, width) {
   // Fix type: one lane per quality tier, coloured bars where the solution was in that tier.
   const fixTop = top + rowHeight + 6;
   const laneHeight = (rowHeight - 12) / FIX_TIERS.length;
+  /** @param {number} tier Fix-tier index. @returns {number} Top y of that lane. Side effects: none. Events: none. */
   const laneY = (tier) => fixTop + (FIX_TIERS.length - 1 - tier) * laneHeight;
   FIX_TIERS.forEach((tier, index) => {
     appendYLabel(chart, laneY(index) + laneHeight / 2 + 4, tier.label, width, 'tl-label tl-fix-label');
@@ -1677,6 +2029,12 @@ const SPECTRUM_COLORS = {
 };
 const spectrumCharts = new Map();
 
+/**
+ * Turns a centre-plus-width or a start-end pair into a frequency span in MHz.
+ * @param {Array} allocation Label, system, centre or start, width or end.
+ * @returns {object}
+ * Side effects: none. events: none.
+ */
 function spectrumAllocation([label, system, centerOrStart, widthOrEnd]) {
   return {
     label,
@@ -1685,6 +2043,13 @@ function spectrumAllocation([label, system, centerOrStart, widthOrEnd]) {
   };
 }
 
+/**
+ * Collapses detections that share a pixel, signal, frequency, and bandwidth, keeping the strongest.
+ * @param {Array} hits Hit objects.
+ * @param {Function} xFor Maps a time to an x position.
+ * @returns {Array}
+ * Side effects: none. events: none.
+ */
 function spectrumMarkers(hits, xFor) {
   const markers = new Map();
   for (const { sample, detection } of hits) {
@@ -1706,6 +2071,14 @@ function spectrumMarkers(hits, xFor) {
   return [...markers.values()];
 }
 
+/**
+ * Draws the L1, L2, and L5 frequency-time plots for live and archive hits in the viewport.
+ * @param {number} start Viewport start.
+ * @param {number} end Viewport end.
+ * @param {number} windowMs Viewport length.
+ * @returns {void}
+ * Side effects: DOM spectrum sections and SVG. The first build adds click and pointer listeners. events: none.
+ */
 function renderSpectrumPlots(start, end, windowMs) {
   const container = $('spectrum-plots');
   const availableWidth = Math.min(1920, Math.max(360, Math.round(container.getBoundingClientRect().width) || 900));
@@ -1724,7 +2097,9 @@ function renderSpectrumPlots(start, end, windowMs) {
     const plotHeight = 220;
     const height = top + plotHeight + axisHeight;
     const plotWidth = availableWidth - left - right;
+    /** @param {number} time @returns {number} X on this frequency plot. Side effects: none. Events: none. */
     const xFor = (time) => left + axis.x(time);
+    /** @param {number} frequency MHz. @returns {number} Y, high frequency toward the top. Side effects: none. Events: none. */
     const yFor = (frequency) => top + (plot.max - frequency) / (plot.max - plot.min) * plotHeight;
     let elements = spectrumCharts.get(plot.id);
     if (!elements) {
@@ -1818,6 +2193,12 @@ function renderSpectrumPlots(start, end, windowMs) {
       });
     }
 
+    /**
+     * Detections whose centre, widened by half the bandwidth, intersects this plot's MHz range.
+     * @param {object[]} samples
+     * @returns {{ sample: object, detection: object }[]}
+     * Side effects: none. Events: none.
+     */
     const hitsIn = (samples) => {
       const hits = [];
       for (const sample of samples) {
@@ -1890,10 +2271,24 @@ function renderSpectrumPlots(start, end, windowMs) {
   }
 }
 
+/**
+ * Formats a timeline timestamp in the selected time zone.
+ * @param {number} timestamp Epoch milliseconds.
+ * @param {number} [windowMs] Window used to choose the fields.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function utcLabel(timestamp, windowMs = timelineViewport().windowMs) {
   return timelineTimeLabel(timestamp, windowMs);
 }
 
+/**
+ * Formats a timestamp, adding seconds under one hour and the day above one day.
+ * @param {number} timestamp Epoch milliseconds.
+ * @param {number} windowMs Viewport length.
+ * @returns {string}
+ * Side effects: may cache an Intl formatter via dateFormatter. events: none.
+ */
 function timelineTimeLabel(timestamp, windowMs) {
   return dateFormatter({
     timeZone: state.timeZone, hour: '2-digit', minute: '2-digit',
@@ -1903,6 +2298,12 @@ function timelineTimeLabel(timestamp, windowMs) {
   }).format(new Date(timestamp));
 }
 
+/**
+ * Colour for a detection power: red above -95 dBm, amber above -110, otherwise pale.
+ * @param {number} powerDbm Power in dBm.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function powerColour(powerDbm) {
   if (!Number.isFinite(powerDbm)) return '#ffb02e';
   if (powerDbm > -95) return '#ff5f56';
@@ -1910,11 +2311,23 @@ function powerColour(powerDbm) {
   return '#ffd98a';
 }
 
+/**
+ * History-window label in hours or minutes.
+ * @param {number} minutes Window length in minutes.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatWindow(minutes) {
   if (minutes >= 60) return `${Math.round(minutes / 60)} h`;
   return `${minutes} min`;
 }
 
+/**
+ * Compact age label in seconds, minutes, or hours.
+ * @param {number} timestamp Epoch milliseconds.
+ * @returns {string}
+ * Side effects: none. Reads Date.now(). events: none.
+ */
 function timeAgo(timestamp) {
   const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
@@ -1926,6 +2339,12 @@ function timeAgo(timestamp) {
 
 const SELECT_RADIUS_PX = 14;
 
+/**
+ * Turns timeline point selection on or off and updates the toggle button.
+ * @param {boolean} enabled Whether select mode should be on.
+ * @returns {void}
+ * Side effects: state.selectMode and DOM classes and button text. events: none.
+ */
 function setSelectMode(enabled) {
   state.selectMode = Boolean(enabled);
   const button = $('timeline-select');
@@ -1935,10 +2354,21 @@ function setSelectMode(enabled) {
   for (const chart of timePlotCharts()) chart.classList.toggle('select-mode', state.selectMode);
 }
 
+/**
+ * The interference timeline SVG plus any spectrum plot SVGs already built.
+ * @returns {Array<SVGElement>}
+ * Side effects: none. events: none.
+ */
 function timePlotCharts() {
   return [$('timeline'), ...[...spectrumCharts.values()].map(({ svgChart }) => svgChart)];
 }
 
+/**
+ * Stores a pinned time-plot selection and redraws the timeline.
+ * @param {object|null} selection Selection with plot, time, y, and text, or null to clear.
+ * @returns {void}
+ * Side effects: state.timelineSelection, the selection panel DOM, and a timeline redraw. events: none.
+ */
 function setTimelineSelection(selection) {
   state.timelineSelection = selection;
   const panel = $('timeline-selection');
@@ -1967,6 +2397,14 @@ function pickTimePlotElement(chart, clientX, clientY) {
   return best;
 }
 
+/**
+ * Pins the titled mark under a click, or clears the selection when nothing is in range.
+ * @param {SVGElement} chart Plot that received the pointer.
+ * @param {number} clientX Pointer x.
+ * @param {number} clientY Pointer y.
+ * @returns {void}
+ * Side effects: state and DOM via setTimelineSelection. Returns without a change when the screen matrix is missing. events: none.
+ */
 function selectTimePlotPoint(chart, clientX, clientY) {
   const axis = chart.timeAxis;
   const hit = pickTimePlotElement(chart, clientX, clientY);
@@ -2011,6 +2449,7 @@ function setWallMode(enabled, { fullscreen = false } = {}) {
   else url.searchParams.delete('wall');
   history.replaceState(null, '', url);
   if (state.wall) {
+    // Dispatches a DOM click on the Interference tab button.
     document.querySelector('button.tab[data-tab="interference"]')?.click();
     if (state.selectMode) setSelectMode(false);
     state.timelineView = null;
@@ -2064,6 +2503,12 @@ if (new URLSearchParams(location.search).has('wall')) queueMicrotask(() => setWa
 const ARCHIVE_BUSY = new Set(['listing', 'scanning']);
 const archiveFetch = { timer: null, delay: 0, controller: null, wanted: null, generation: 0, startedAt: 0 };
 
+/**
+ * Byte count as GB, MB, or kB, or a question mark when not finite.
+ * @param {number} bytes Size in bytes.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes)) return '?';
   if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`;
@@ -2071,6 +2516,12 @@ function formatBytes(bytes) {
   return `${Math.round(bytes / 1e3)} kB`;
 }
 
+/**
+ * Duration as seconds, minutes and seconds, or hours and minutes.
+ * @param {number} ms Duration in milliseconds.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatDuration(ms) {
   const seconds = Math.max(0, Math.round(ms / 1000));
   if (seconds < 60) return `${seconds} s`;
@@ -2079,7 +2530,14 @@ function formatDuration(ms) {
   return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
 }
 
+/**
+ * Stores archive status from an SSE archive event, a snapshot, or an archive POST.
+ * @param {object} status Status object. state must be a string.
+ * @returns {void}
+ * Side effects: throws when state is not a string. idle clears loaded samples. idle or a generation mismatch aborts the data fetch. May show the whole archive. Redraws archive status and marks the timeline dirty. events: none.
+ */
 function applyArchiveStatus(status) {
+  // Status with a non-string state is rejected. Callers are the archive SSE event, snapshots, and archive POST responses.
   if (typeof status.state !== 'string') throw new Error('Invalid archive status');
   const previous = state.archive.status;
   if (!previous || previous.generation !== status.generation) archiveFetch.startedAt = Date.now();
@@ -2095,6 +2553,11 @@ function applyArchiveStatus(status) {
   timelineDirty = true;
 }
 
+/**
+ * Fills the archive badge, progress, buttons, and status text from state.archive.
+ * @returns {void}
+ * Side effects: DOM in the archive panel. events: none.
+ */
 function renderArchiveStatus() {
   const status = state.archive.status;
   const known = Boolean(status);
@@ -2136,6 +2599,7 @@ function renderArchiveStatus() {
   } else if (status.state === 'idle') {
     parts.push(status.message || 'No archive loaded. Choose a folder and how many days to load, then select Load history.');
   } else {
+    /** @param {number} time @returns {string} Day, month, and clock time in the selected zone. Side effects: none. Events: none. */
     const dateLabel = (time) => dateFormatter({
       timeZone: state.timeZone, hourCycle: 'h23', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
     }).format(new Date(time));
@@ -2173,6 +2637,7 @@ function renderArchiveStatus() {
   }
   const auto = status?.auto;
   if (auto?.enabled) {
+    /** @param {number} time @returns {string} Hours and minutes in the selected zone. Side effects: none. Events: none. */
     const clock = (time) => dateFormatter({ timeZone: state.timeZone, hourCycle: 'h23', hour: '2-digit', minute: '2-digit' })
       .format(new Date(time));
     parts.push(`Keep loaded: on, every ${formatSpan(auto.refreshMs || 900000)}`
@@ -2188,6 +2653,7 @@ function renderArchiveStatus() {
 function archiveSummary(status, known, busy) {
   if (!known) return '';
   if (status.state === 'idle') return 'Expand to choose days and load history';
+  /** @param {number} time @returns {string} Short date and time in the selected zone. Side effects: none. Events: none. */
   const clock = (time) => dateFormatter({
     timeZone: state.timeZone, hourCycle: 'h23', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
   }).format(new Date(time));
@@ -2225,6 +2691,11 @@ function ensureArchiveData(start, end, plotWidth) {
   archiveFetch.timer = setTimeout(fetchArchiveData, delay);
 }
 
+/**
+ * GET /api/archive/interference for the wanted range and stores it when the generation still matches.
+ * @returns {Promise<void>}
+ * Side effects: aborts the previous archive fetch. An invalid body throws into the catch. Aborted or stale responses are ignored. Other failures call reportClientError. events: none.
+ */
 async function fetchArchiveData() {
   archiveFetch.timer = null;
   const status = state.archive.status;
@@ -2240,6 +2711,7 @@ async function fetchArchiveData() {
   archiveFetch.controller = controller;
   const generation = status.generation;
   try {
+    // GET /api/archive/interference. Aborted and stale-generation responses are ignored; other failures are reported.
     const data = await request(`/api/archive/interference?from=${Math.floor(from)}&to=${Math.ceil(to)}&buckets=${buckets}`,
       { signal: controller.signal }, true);
     if (controller.signal.aborted || state.archive.status?.generation !== generation) return;
@@ -2264,6 +2736,13 @@ async function fetchArchiveData() {
   }
 }
 
+/**
+ * POST JSON to an archive URL and applies the status body.
+ * @param {string} url Archive path.
+ * @param {object} [body] JSON body. Defaults to an empty object.
+ * @returns {Promise<object>}
+ * Side effects: network, requestPending, and archive status DOM. Throws data.error or the HTTP status. events: none.
+ */
 async function archiveRequest(url, body) {
   state.archive.requestPending = true;
   renderArchiveStatus();
@@ -2291,8 +2770,14 @@ function showWholeArchive() {
   timelineDirty = true;
 }
 
+/**
+ * GET /api/archive and fills defaults, the day limit, the form, and current status.
+ * @returns {Promise<void>}
+ * Side effects: network, state.archive.defaults, and DOM. On failure writes the error into #archive-status. events: none.
+ */
 async function loadArchiveSettings() {
   try {
+    // GET /api/archive. A failure is caught below and written to #archive-status.
     const info = await request('/api/archive', {}, true);
     state.archive.defaults = info.defaults;
     const maxDays = info.limits?.maxDays || 31;
@@ -2315,6 +2800,7 @@ async function loadArchiveSettings() {
 $('archive-form').addEventListener('submit', async (event) => {
   event.preventDefault();
   try {
+    // POST /api/archive/load. The catch writes #archive-status and sets the Failed badge.
     await archiveRequest('/api/archive/load', { root: $('archive-root').value.trim(), days: Number($('archive-days').value) });
     state.archive.data = null;
     if (!state.archive.shown) {
@@ -2331,10 +2817,12 @@ $('archive-form').addEventListener('submit', async (event) => {
 });
 
 $('archive-cancel').addEventListener('click', () => {
+  // POST /api/archive/cancel. The catch writes error.message into #archive-status.
   archiveRequest('/api/archive/cancel').catch((error) => { $('archive-status').textContent = error.message; });
 });
 
 $('archive-clear').addEventListener('click', () => {
+  // POST /api/archive/clear. On success the timeline returns to live; the catch writes #archive-status.
   archiveRequest('/api/archive/clear').then(() => {
     state.timelineView = null;
     flushUpdates(true);
@@ -2357,6 +2845,7 @@ $('archive-show').addEventListener('change', (event) => {
 
 $('archive-auto').addEventListener('change', (event) => {
   const enabled = event.target.checked;
+  // POST /api/archive/auto. On failure the checkbox is restored and #archive-status explains it.
   archiveRequest('/api/archive/auto', { enabled }).then(() => {
     if (enabled && !state.archive.shown) {
       state.archive.shown = true;
@@ -2380,6 +2869,11 @@ setInterval(() => {
   if (ARCHIVE_BUSY.has(state.archive.status?.state)) renderArchiveStatus();
 }, 1000);
 
+/**
+ * Redraws the skyplot, satellite counts, legends, and the satellite table.
+ * @returns {void}
+ * Side effects: DOM skyplot and satellite readouts. events: none.
+ */
 function renderSkyplot() {
   const satellites = buildSatelliteList();
   const usageAvailable = satelliteUsageAvailable();
@@ -2487,6 +2981,11 @@ function tracePaths(sat) {
   const paths = [];
   let points = [];
 
+  /**
+   * Emits the current skyplot trace when it has more than one point, then clears it.
+   * @returns {void}
+   * Side effects: appends a polyline to `paths` and empties `points`. Events: none.
+   */
   const flush = () => {
     if (points.length > 1) {
       paths.push(svg('polyline', {
@@ -2508,6 +3007,12 @@ function tracePaths(sat) {
   return paths;
 }
 
+/**
+ * SVG group for one satellite marker and its title.
+ * @param {object} sat Satellite with system, prn, angles, and state.
+ * @returns {SVGGElement}
+ * Side effects: none until the caller inserts the group. events: none.
+ */
 function buildSatMarker(sat) {
   const { x, y } = skyPosition(sat.elevation, sat.azimuth);
   const colour = constellationColor(sat.system);
@@ -2540,6 +3045,7 @@ function buildSatMarker(sat) {
 /** Merges geometry, measured satellites, assigned channels and solution usage. */
 function buildSatelliteList() {
   const byKey = new Map();
+  /** @param {string} system @param {*} prn @returns {string} Map key after PRN normalisation. Side effects: none. Events: none. */
   const key = (system, prn) => `${system}:${normalisePrn(system, prn)}`;
 
   for (const [system, record] of Object.entries(state.satvis)) {
@@ -2613,6 +3119,13 @@ function buildSatelliteList() {
   return [...byKey.values()].sort((a, b) => a.system.localeCompare(b.system) || Number(a.prn) - Number(b.prn));
 }
 
+/**
+ * Skyplot state from a BESTSATS status and whether RANGE is tracking the satellite.
+ * @param {string} status BESTSATS status.
+ * @param {boolean} tracked Whether RANGE has the satellite.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function bestSatState(status, tracked) {
   if (status === 'GOOD') return 'used';
   if (status === 'BADHEALTH') return 'unhealthy';
@@ -2620,11 +3133,21 @@ function bestSatState(status, tracked) {
   return tracked ? 'tracked' : 'visible';
 }
 
+/**
+ * True when BESTSATS has a CRC-accepted satellite list.
+ * @returns {boolean}
+ * Side effects: none. events: none.
+ */
 function satelliteUsageAvailable() {
   const best = latestByName.BESTSATS;
   return best?.crcValid !== false && Array.isArray(best?.data?.satellites);
 }
 
+/**
+ * True when TRACKSTAT has a CRC-accepted observation list.
+ * @returns {boolean}
+ * Side effects: none. events: none.
+ */
 function satelliteTrackingAvailable() {
   const trackstat = latestByName.TRACKSTAT;
   return trackstat?.crcValid !== false && Array.isArray(trackstat?.data?.observations);
@@ -2641,6 +3164,12 @@ function normalisePrn(system, prn) {
   return value;
 }
 
+/**
+ * Rebuilds the constellation legend and binds each button to toggleSystem.
+ * @param {object} perSystem Per-constellation counts.
+ * @returns {void}
+ * Side effects: DOM legend and click listeners. events: none.
+ */
 function renderSkyLegend(perSystem) {
   const list = $('sky-legend');
   list.replaceChildren();
@@ -2674,6 +3203,12 @@ function renderSkyLegend(perSystem) {
   }
 }
 
+/**
+ * Hides or shows one constellation and redraws the skyplot.
+ * @param {string} system Constellation name.
+ * @returns {void}
+ * Side effects: state.hiddenSystems, localStorage via writePreference, and the skyplot DOM. events: none.
+ */
 function toggleSystem(system) {
   if (state.hiddenSystems.has(system)) state.hiddenSystems.delete(system);
   else state.hiddenSystems.add(system);
@@ -2689,6 +3224,12 @@ $('sky-all').addEventListener('click', () => {
 
 const SIGNAL_BANDS = ['L1', 'L2', 'L5', 'Other'];
 
+/**
+ * Counts used satellites per band from BESTSATS signal masks.
+ * @param {Array} satellites Satellites from buildSatelliteList.
+ * @returns {object}
+ * Side effects: none. events: none.
+ */
 function signalBreakdown(satellites) {
   const used = new Set(satellites
     .filter((sat) => sat.state === 'used' && !state.hiddenSystems.has(sat.system))
@@ -2718,6 +3259,12 @@ function signalBreakdown(satellites) {
   return Object.fromEntries(SIGNAL_BANDS.map((band) => [band, counts[band].size]));
 }
 
+/**
+ * Fills the used-signal band legend.
+ * @param {object} counts Band name to used-satellite count.
+ * @returns {void}
+ * Side effects: DOM #signal-legend. events: none.
+ */
 function renderSignalLegend(counts) {
   const list = $('signal-legend');
   list.replaceChildren();
@@ -2741,6 +3288,13 @@ function renderSignalLegend(counts) {
   }
 }
 
+/**
+ * Maps a tracking-status signal code to L1, L2, L5, or Other.
+ * @param {string} system Constellation name.
+ * @param {number|string} trackingStatus Numeric or hex tracking status.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function signalBand(system, trackingStatus) {
   const value = typeof trackingStatus === 'number' ? trackingStatus : parseInt(trackingStatus, 16);
   if (!Number.isFinite(value)) return 'Other';
@@ -2757,6 +3311,12 @@ function signalBand(system, trackingStatus) {
   return (bandsBySystem[system] && bandsBySystem[system][code]) || 'Other';
 }
 
+/**
+ * Fills the satellite table, hiding constellations in hiddenSystems.
+ * @param {Array} satellites Satellite rows.
+ * @returns {void}
+ * Side effects: DOM #sv-table. events: none.
+ */
 function renderSatelliteTable(satellites) {
   const body = document.querySelector('#sv-table tbody');
   body.replaceChildren();
@@ -2781,12 +3341,24 @@ function renderSatelliteTable(satellites) {
   }
 }
 
+/**
+ * Stores one SATVIS2 report by system and redraws the skyplot.
+ * @param {object} record SATVIS2 report.
+ * @returns {void}
+ * Side effects: state.satvis and the skyplot DOM. Returns when system is missing. events: none.
+ */
 function renderSatVis(record) {
   if (!record.data || !record.data.system) return;
   state.satvis[record.data.system] = record;
   renderSkyplot();
 }
 
+/**
+ * Redraws the skyplot and the first RANGE observation rows.
+ * @param {object} record RANGE report.
+ * @returns {void}
+ * Side effects: DOM range table and skyplot. Returns when data is missing. events: none.
+ */
 function renderRange(record) {
   const d = record.data;
   if (!d) return;
@@ -2809,6 +3381,12 @@ function renderRange(record) {
   }
 }
 
+/**
+ * Fills receiver error, status word, and active flag list.
+ * @param {object} record RXSTATUS report.
+ * @returns {void}
+ * Side effects: DOM health fields. Returns when data is missing. events: none.
+ */
 function renderRxStatus(record) {
   const d = record.data;
   if (!d) return;
@@ -2833,6 +3411,12 @@ function renderRxStatus(record) {
   }
 }
 
+/**
+ * Fills the version table and the one-line version summary.
+ * @param {object} record VERSION report.
+ * @returns {void}
+ * Side effects: DOM version table and summary. Returns when components are missing. events: none.
+ */
 function renderVersion(record) {
   const d = record.data;
   if (!d || !d.components) return;
@@ -2851,11 +3435,23 @@ function renderVersion(record) {
   renderVersionSummary(record);
 }
 
+/**
+ * Sets the overview version line from the first component.
+ * @param {object} record VERSION report.
+ * @returns {void}
+ * Side effects: DOM #version-line when a component exists. events: none.
+ */
 function renderVersionSummary(record) {
   const main = record.data?.components?.[0];
   if (main) $('version-line').textContent = `${main.model} · SW ${main.softwareVersion} · S/N ${main.serialNumber}`;
 }
 
+/**
+ * Sets the interference time and message count and redraws the band cards.
+ * @param {object} record ITDETECTSTATUS report.
+ * @returns {void}
+ * Side effects: DOM and renderBands. Returns when data is missing. events: none.
+ */
 function renderItDetect(record) {
   const d = record.data;
   if (!d) return;
@@ -2902,6 +3498,11 @@ function classifyBand(signalType, detections) {
   return 'OTHER';
 }
 
+/**
+ * Rebuilds band cards from the latest ITDETECTSTATUS report and window stats.
+ * @returns {void}
+ * Side effects: DOM #bands and the verdict banner. events: none.
+ */
 function renderBands() {
   const now = Date.now();
   const groups = {};
@@ -2955,6 +3556,16 @@ function bandStats(now) {
   return stats;
 }
 
+/**
+ * Builds one interference band card, including stats and detection rows when present.
+ * @param {object} band Band descriptor.
+ * @param {object|undefined} group Signals and detections for the band.
+ * @param {Array} detections Detections in the band.
+ * @param {string} status jammed, clear, or unmonitored.
+ * @param {object|undefined} stats Window stats for the band.
+ * @returns {HTMLElement}
+ * Side effects: none until the caller inserts the card. events: none.
+ */
 function buildBandCard(band, group, detections, status, stats) {
   const card = document.createElement('article');
   card.className = `band ${status}`;
@@ -3035,10 +3646,22 @@ const DETECTION_TYPE_TEXT = {
   STATISTICANALYSIS: 'Statistical analysis',
 };
 
+/**
+ * Display name for a detector type, or the raw type, or Unknown detector.
+ * @param {string} type Detector type.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function detectionTypeLabel(type) {
   return DETECTION_TYPE_TEXT[type] || type || 'Unknown detector';
 }
 
+/**
+ * Sentence describing a spectrum or statistical detection, including affected-signal masks.
+ * @param {object} detection One ITDETECTSTATUS detection.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function describeDetection(detection) {
   const masks = (detection.affectedSignals || []).filter((mask) => mask && mask !== '00000000');
   const maskText = masks.length ? ` Affected-signal masks: ${masks.join(', ')}.` : '';
@@ -3082,17 +3705,36 @@ function buildPowerMeter(powerDbm) {
   return wrap;
 }
 
+/**
+ * True when the server is online, the receiver is connected, and the interference report is fresh.
+ * @param {object} record Latest ITDETECTSTATUS report.
+ * @param {number} [now] Clock in milliseconds.
+ * @returns {boolean}
+ * Side effects: none. events: none.
+ */
 function interferenceIsLive(record, now = Date.now()) {
   return !connection.offline && connection.status?.connected === true
     && hasFreshInterferenceReport(record, now);
 }
 
+/**
+ * True when the report is CRC-valid, has data, and receivedAt is under the stale limit.
+ * @param {object} record ITDETECTSTATUS report.
+ * @param {number} [now] Clock in milliseconds.
+ * @returns {boolean}
+ * Side effects: none. events: none.
+ */
 function hasFreshInterferenceReport(record, now = Date.now()) {
   const receivedAt = Date.parse(record?.receivedAt);
   return record?.crcValid === true && Boolean(record?.data)
     && Number.isFinite(receivedAt) && now - receivedAt < INTERFERENCE_STALE_MS;
 }
 
+/**
+ * Updates the interference banner, freshness line, clock, last detection, and device summary.
+ * @returns {void}
+ * Side effects: DOM banner and related interference readouts. events: none.
+ */
 function renderVerdict() {
   const now = Date.now();
   const record = latestByName.ITDETECTSTATUS;
@@ -3149,6 +3791,12 @@ function renderVerdict() {
   detail.textContent = 'Latest receiver status reports no active detections.';
 }
 
+/**
+ * Keeps the strongest detection when this CRC-valid ITDETECTSTATUS report is the newest.
+ * @param {object} record ITDETECTSTATUS report.
+ * @returns {void}
+ * Side effects: state.lastDetection. Ignores other names, failed CRC, empty detections, and older times. events: none.
+ */
 function rememberLastDetection(record) {
   if (record?.name !== 'ITDETECTSTATUS' || record.crcValid !== true) return;
   const detections = record.data?.detections;
@@ -3171,6 +3819,7 @@ function rememberHistoryDetection(samples) {
     if (sample?.count > 0 && Number.isFinite(sample.t) && (!latest || sample.t >= latest.t)) latest = sample;
   }
   if (!latest || (state.lastDetection && latest.t <= state.lastDetection.at)) return;
+  /** @param {object|undefined} item @returns {number} Measured power, or -Infinity when it is not finite. Side effects: none. Events: none. */
   const power = (item) => (Number.isFinite(item?.power) ? item.power : -Infinity);
   const strongest = (latest.detections || []).reduce((best, item) => (
     !best || power(item) > power(best) ? item : best), null);
@@ -3186,6 +3835,12 @@ function rememberHistoryDetection(samples) {
   };
 }
 
+/**
+ * One-line text for the remembered detection, or None yet.
+ * @param {object|null} last Last-detection record.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function lastDetectionSummary(last) {
   if (!last) return 'None yet';
   const detection = last.detection;
@@ -3205,6 +3860,11 @@ function lastDetectionSummary(last) {
   return details.join(' \u00b7 ');
 }
 
+/**
+ * Writes the last-detection summary and its time into the interference banner.
+ * @returns {void}
+ * Side effects: DOM #it-last-detection and #it-last-detection-detail. events: none.
+ */
 function renderLastDetection() {
   const last = state.lastDetection;
   $('it-last-detection').textContent = lastDetectionSummary(last);
@@ -3212,6 +3872,12 @@ function renderLastDetection() {
     ? `${formatTimestamp(last.at)} \u00b7 ${timeAgo(last.at)}` : 'No interference reported since startup';
 }
 
+/**
+ * Writes the clock time and date in the selected time zone.
+ * @param {number} [now] Clock in milliseconds. Defaults to Date.now().
+ * @returns {void}
+ * Side effects: DOM #it-clock and #it-clock-date. events: none.
+ */
 function renderClock(now = Date.now()) {
   const date = new Date(now);
   $('it-clock').textContent = dateFormatter({
@@ -3241,11 +3907,24 @@ function observationSystem(observation) {
   return observation?.system === 'RESERVED' ? 'NAVIC' : observation?.system;
 }
 
+/**
+ * Tracking-status signal code in bits 21-25, or null when the status is not numeric.
+ * @param {number|string} trackingStatus Numeric or hex tracking status.
+ * @returns {number|null}
+ * Side effects: none. events: none.
+ */
 function signalCode(trackingStatus) {
   const value = typeof trackingStatus === 'number' ? trackingStatus : parseInt(trackingStatus, 16);
   return Number.isFinite(value) ? (value >>> 21) & 0x1f : null;
 }
 
+/**
+ * Signal name for a system and tracking status, or Signal plus the code.
+ * @param {string} system Constellation name.
+ * @param {number|string} trackingStatus Tracking status.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function signalName(system, trackingStatus) {
   const code = signalCode(trackingStatus);
   if (code === null) return 'Unknown';
@@ -3253,6 +3932,13 @@ function signalName(system, trackingStatus) {
   return entry ? entry[1] : `Signal ${code}`;
 }
 
+/**
+ * Display order of a signal name within a system, or Infinity when unknown.
+ * @param {string} system Constellation name.
+ * @param {string} name Signal name.
+ * @returns {number}
+ * Side effects: none. events: none.
+ */
 function signalOrder(system, name) {
   const index = (SIGNAL_NAMES[system] || []).findIndex(([, value]) => value === name);
   return index < 0 ? Infinity : index;
@@ -3276,6 +3962,11 @@ function trackedSatelliteSummary(range = latestByName.RANGE) {
   return systems;
 }
 
+/**
+ * Counts satellites marked in view, by constellation.
+ * @returns {object}
+ * Side effects: none. events: none.
+ */
 function satellitesInViewBySystem() {
   const counts = {};
   for (const satellite of buildSatelliteList()) {
@@ -3285,10 +3976,21 @@ function satellitesInViewBySystem() {
   return counts;
 }
 
+/**
+ * Adds the numbers in a count map.
+ * @param {object} [counts] Map of counts.
+ * @returns {number}
+ * Side effects: none. events: none.
+ */
 function sumCounts(counts) {
   return Object.values(counts || {}).reduce((sum, count) => sum + count, 0);
 }
 
+/**
+ * Fills the per-constellation tracked and in-view table and the satellite-view plot.
+ * @returns {void}
+ * Side effects: DOM satellite summary and the view plot. events: none.
+ */
 function renderDeviceSummary() {
   const tracked = trackedSatelliteSummary();
   const inView = satellitesInViewBySystem();
@@ -3326,6 +4028,12 @@ function renderDeviceSummary() {
   renderSatelliteViewPlot();
 }
 
+/**
+ * Appends a tracked and in-view sample for a CRC-valid RANGE, SATVIS2, BESTSATS, or TRACKSTAT report.
+ * @param {object} record Satellite report.
+ * @returns {void}
+ * Side effects: state.satelliteViewHistory. Skips a bad CRC, an unparsed time, an older time, and an unchanged sample inside the heartbeat. events: none.
+ */
 function recordSatelliteView(record) {
   if (!['RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT'].includes(record?.name) || record.crcValid !== true) return;
   const t = Date.parse(record.receivedAt);
@@ -3345,6 +4053,11 @@ function recordSatelliteView(record) {
 
 const SATELLITE_VIEW = { width: 900, height: 180, left: 44, right: 16, top: 22, bottom: 34 };
 
+/**
+ * Draws tracked and in-view counts on the same time axis as the interference timeline.
+ * @returns {void}
+ * Side effects: DOM #satellite-view-chart. Samples after axis.dataEnd are omitted. events: none.
+ */
 function renderSatelliteViewPlot() {
   const chart = $('satellite-view-chart');
   chart.replaceChildren();
@@ -3359,6 +4072,7 @@ function renderSatelliteViewPlot() {
     .sort((a, b) => a.localeCompare(b));
   const peak = Math.max(0, ...samples.map((sample) => Math.max(sumCounts(sample.tracked), sumCounts(sample.inView))));
   const maxCount = Math.max(8, Math.ceil(peak / 10) * 10);
+  /** @param {number} count @returns {number} Y in the satellite-view plot. Side effects: none. Events: none. */
   const y = (count) => bottom - count / maxCount * (bottom - SATELLITE_VIEW.top);
 
   for (const count of [0, maxCount / 2, maxCount]) {
@@ -3370,9 +4084,21 @@ function renderSatelliteViewPlot() {
     chart.append(svg('text', { x: SATELLITE_VIEW.left - 8, y: gridY + 4, class: 'tl-axis', style: 'text-anchor:end' }, String(count)));
   }
 
+  /**
+   * Draws one satellite-view series, breaking the line when samples are more than 30 seconds apart.
+   * @param {(sample: object) => number} value
+   * @param {object} attributes SVG attributes for the polyline.
+   * @returns {void}
+   * Side effects: appends polylines to `chart`. Events: none.
+   */
   const drawSeries = (value, attributes) => {
     let segment = [];
     let previousTime = null;
+    /**
+     * Appends the current segment when it has more than one point, then clears it.
+     * @returns {void}
+     * Side effects: appends a polyline to `chart`. Events: none.
+     */
     const flush = () => {
       if (segment.length > 1) {
         chart.append(svg('polyline', { points: segment.join(' '), fill: 'none', ...attributes }));
@@ -3411,11 +4137,22 @@ function renderSatelliteViewPlot() {
   });
 }
 
+/**
+ * Display name for a constellation code.
+ * @param {string} system Constellation code.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function constellationLabel(system) {
   return ({ GALILEO: 'Galileo', BEIDOU: 'BeiDou', GLONASS: 'GLONASS', NAVIC: 'NavIC', QZSS: 'QZSS', SBAS: 'SBAS' })[system]
     || system;
 }
 
+/**
+ * Fills the message-count table from state.counts and latestByName.
+ * @returns {void}
+ * Side effects: DOM #counts. events: none.
+ */
 function renderCounts() {
   const body = document.querySelector('#counts tbody');
   body.replaceChildren();
@@ -3436,6 +4173,11 @@ function renderCounts() {
   }
 }
 
+/**
+ * Rebuilds the ephemeris summary and the table for the selected constellation.
+ * @returns {void}
+ * Side effects: DOM #ephemeris. May write the ephemerisConstellation preference when the saved choice is absent. events: none.
+ */
 function renderEphemeris() {
   const container = $('ephemeris');
   container.replaceChildren();
@@ -3494,6 +4236,12 @@ function renderEphemeris() {
   }
 }
 
+/**
+ * Builds constellation tabs that store the choice and redraw the ephemeris.
+ * @param {Array} groups Pairs of constellation name and records.
+ * @returns {HTMLElement}
+ * Side effects: click listeners on the returned element. events: none.
+ */
 function buildEphemerisSubTabs(groups) {
   const nav = document.createElement('div');
   nav.className = 'ephemeris-subtabs';
@@ -3529,15 +4277,33 @@ const EPHEMERIS_SYSTEMS = {
   NAVICEPHEMERIS: 'NavIC',
 };
 
+/**
+ * Short system label for an ephemeris message name.
+ * @param {string} name Message name.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function ephemerisSystem(name) {
   return EPHEMERIS_SYSTEMS[name] || name;
 }
 
+/**
+ * Constellation bucket for an ephemeris message. Galileo I/NAV and F/NAV share GALILEO.
+ * @param {string} name Message name.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function ephemerisConstellation(name) {
   if (name.startsWith('GAL')) return 'GALILEO';
   return ephemerisSystem(name);
 }
 
+/**
+ * Source tag for a merged cell, such as I/NAV or F/NAV.
+ * @param {string} name Message name.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function ephemerisSourceLabel(name) {
   const labels = {
     GALINAVEPHEMERIS: 'I/NAV',
@@ -3546,12 +4312,26 @@ function ephemerisSourceLabel(name) {
   return labels[name] || ephemerisSystem(name);
 }
 
+/**
+ * Map of ephemeris parameter name to value.
+ * @param {object} data Decoded ephemeris data.
+ * @returns {object}
+ * Side effects: none. events: none.
+ */
 function ephemerisParameters(data) {
   return Object.fromEntries((data.parameters || []).map((parameter) => [parameter.name, parameter.value]));
 }
 
+/**
+ * Health flag for one ephemeris record: true, false, or null when required fields are missing.
+ * @param {string} name Message name.
+ * @param {object} data Decoded ephemeris data.
+ * @returns {boolean|null}
+ * Side effects: none. events: none.
+ */
 function ephemerisHealth(name, data) {
   const values = ephemerisParameters(data);
+  /** @param {...string} keys @returns {boolean} True when any named parameter is null or undefined. Side effects: none. Events: none. */
   const missing = (...keys) => keys.some((key) => values[key] === null || values[key] === undefined);
   if (name === 'GLOEPHEMERIS') {
     if (missing('health')) return null;
@@ -3572,6 +4352,12 @@ function ephemerisHealth(name, data) {
   return values.health === null || values.health === undefined ? null : values.health === 0;
 }
 
+/**
+ * Builds the ephemeris table, column group, and synced scrollbar for one constellation.
+ * @param {Array} records Ephemeris records.
+ * @returns {HTMLElement}
+ * Side effects: DOM nodes and scroll listeners on the returned shell. events: none.
+ */
 function buildEphemerisTable(records) {
   const container = document.createElement('div');
   container.className = 'ephemeris-table-shell';
@@ -3611,6 +4397,13 @@ function buildEphemerisTable(records) {
   return container;
 }
 
+/**
+ * Scrollbar that mirrors the ephemeris table wrapper scroll position.
+ * @param {HTMLElement} wrapper Table scroller.
+ * @param {string} width CSS width of the inner spacer.
+ * @returns {HTMLElement}
+ * Side effects: scroll listeners on the scrollbar and wrapper. events: none.
+ */
 function buildEphemerisScrollbar(wrapper, width) {
   const scrollbar = document.createElement('div');
   scrollbar.className = 'ephemeris-scrollbar';
@@ -3635,6 +4428,12 @@ function buildEphemerisScrollbar(wrapper, width) {
   return scrollbar;
 }
 
+/**
+ * colgroup for the PRN, parameter, health, and updated columns.
+ * @param {number} parameterCount Number of parameter columns.
+ * @returns {HTMLElement}
+ * Side effects: none until the caller inserts the group. events: none.
+ */
 function buildEphemerisColumnGroup(parameterCount) {
   const group = document.createElement('colgroup');
   group.append(tableColumn('prn-col'));
@@ -3644,16 +4443,36 @@ function buildEphemerisColumnGroup(parameterCount) {
   return group;
 }
 
+/**
+ * CSS width for an ephemeris table with the given parameter count.
+ * @param {number} parameterCount Number of parameter columns.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function ephemerisTableWidth(parameterCount) {
   return `${5.5 + (parameterCount * 5.75) + 6.5 + 8}rem`;
 }
 
+/**
+ * A col element with the given class.
+ * @param {string} className Column class.
+ * @returns {HTMLElement}
+ * Side effects: none until the caller inserts the column. events: none.
+ */
 function tableColumn(className) {
   const column = document.createElement('col');
   column.className = className;
   return column;
 }
 
+/**
+ * Table cell that can expand when the text is long or has more than one line.
+ * @param {HTMLTableRowElement} row Row to extend.
+ * @param {string} text Cell text.
+ * @param {string} className Cell class.
+ * @returns {HTMLTableCellElement}
+ * Side effects: DOM cell. Adds click and keydown listeners when the text is expandable. events: none.
+ */
 function parameterCell(row, text, className) {
   const td = cell(row, text, className);
   td.title = td.textContent;
@@ -3672,11 +4491,23 @@ function parameterCell(row, text, className) {
   return td;
 }
 
+/**
+ * Toggles the expanded class and aria-expanded on a parameter cell.
+ * @param {HTMLElement} cellElement Cell to toggle.
+ * @returns {void}
+ * Side effects: DOM class and aria-expanded. events: none.
+ */
 function toggleParameterCell(cellElement) {
   const expanded = cellElement.classList.toggle('expanded');
   cellElement.setAttribute('aria-expanded', expanded ? 'true' : 'false');
 }
 
+/**
+ * Groups ephemeris records by satellite id, keeping the newest record on each row.
+ * @param {Array} records Ephemeris records.
+ * @returns {Array}
+ * Side effects: none. events: none.
+ */
 function ephemerisRows(records) {
   const rows = new Map();
   for (const record of records) {
@@ -3689,6 +4520,14 @@ function ephemerisRows(records) {
   return Array.from(rows.values()).sort((a, b) => Number(a.satelliteId) - Number(b.satelliteId));
 }
 
+/**
+ * A th with text and optional title and class.
+ * @param {string} text Header text.
+ * @param {string} [title] Tooltip.
+ * @param {string} [className] Header class.
+ * @returns {HTMLElement}
+ * Side effects: none until the caller inserts the header. events: none.
+ */
 function tableHeader(text, title, className) {
   const th = document.createElement('th');
   th.textContent = text;
@@ -3697,6 +4536,13 @@ function tableHeader(text, title, className) {
   return th;
 }
 
+/**
+ * Parameter names to show, either ionospheric columns or the other columns.
+ * @param {Array} rows Grouped ephemeris rows.
+ * @param {boolean} ionoOnly When true, keep only iono-style names.
+ * @returns {Array<string>}
+ * Side effects: none. events: none.
+ */
 function ephemerisParameterColumns(rows, ionoOnly) {
   const columns = [];
   const seen = new Set();
@@ -3712,6 +4558,13 @@ function ephemerisParameterColumns(rows, ionoOnly) {
   return columns;
 }
 
+/**
+ * One formatted value, or one source-prefixed line per differing record.
+ * @param {Array} records Records for one satellite.
+ * @param {string} name Parameter name.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatMergedEphemerisValue(records, name) {
   const values = records
     .map((record) => ({ record, parameter: (record.data.parameters || []).find((parameter) => parameter.name === name) }))
@@ -3727,24 +4580,54 @@ function formatMergedEphemerisValue(records, name) {
   return formatted.map((entry) => `${entry.source}: ${entry.value}`).join('\n');
 }
 
+/**
+ * False for satelliteId and names that start with reserved.
+ * @param {object} parameter Parameter with a name.
+ * @returns {boolean}
+ * Side effects: none. events: none.
+ */
 function shouldShowEphemerisParameter(parameter) {
   return parameter.name !== 'satelliteId' && !parameter.name.startsWith('reserved');
 }
 
+/**
+ * True when the name ends in iono, groupDelay, timeOffset, or frequencyCorrection.
+ * @param {string} name Parameter name.
+ * @returns {boolean}
+ * Side effects: none. events: none.
+ */
 function isIonoParameter(name) {
   return /(?:iono|groupDelay|timeOffset|frequencyCorrection)$/i.test(name);
 }
 
+/**
+ * Unhealthy, Healthy, or Unknown for a merged satellite row.
+ * @param {Array} records Records for one satellite.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function ephemerisHealthLabel(records) {
   const health = ephemerisMergedHealth(records);
   return health === false ? 'Unhealthy' : health === true ? 'Healthy' : 'Unknown';
 }
 
+/**
+ * CSS class bad, good, or unknown for a merged health value.
+ * @param {Array} records Records for one satellite.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function ephemerisHealthClass(records) {
   const health = ephemerisMergedHealth(records);
   return health === false ? 'bad' : health === true ? 'good' : 'unknown';
 }
 
+/**
+ * False if any record is unhealthy, otherwise true if any is healthy, otherwise null.
+ * @param {Array} records Records for one satellite.
+ * @returns {boolean|null}
+ * Side effects: none. events: none.
+ */
 function ephemerisMergedHealth(records) {
   const values = records.map((record) => ephemerisHealth(record.name, record.data));
   if (values.includes(false)) return false;
@@ -3752,6 +4635,12 @@ function ephemerisMergedHealth(records) {
   return null;
 }
 
+/**
+ * Short column label for an ephemeris parameter name.
+ * @param {string} name Parameter name.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function ephemerisParameterLabel(name) {
   const labels = {
     tow: 'Subframe time', toe: 'Orbit ref time', toc: 'Clock ref time',
@@ -3785,6 +4674,12 @@ function ephemerisParameterLabel(name) {
   return labels[name] || name.replace(/([A-Z])/g, ' $1').replace(/^./, (letter) => letter.toUpperCase());
 }
 
+/**
+ * Tooltip text for an ephemeris parameter name.
+ * @param {string} name Parameter name.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function ephemerisParameterTitle(name) {
   const descriptors = {
     cuc: 'Cuc - argument of latitude cosine harmonic correction',
@@ -3824,6 +4719,13 @@ function ephemerisParameterTitle(name) {
   return descriptors[name] || `${ephemerisParameterLabel(name)} (${name})`;
 }
 
+/**
+ * Formats a number with its unit, or an em dash when the value is null.
+ * @param {*} value Parameter value.
+ * @param {string} [unit] Unit suffix.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatEphemerisValue(value, unit) {
   if (value === null || value === undefined) return '—';
   if (typeof value !== 'number') return String(value);
@@ -3838,6 +4740,12 @@ const latestByName = {};
 
 let lastItReportHadDetections = false;
 
+/**
+ * Prepends one interference event. A clear report is skipped when CRC failed or the previous report had no detections.
+ * @param {object} record ITDETECTSTATUS report.
+ * @returns {void}
+ * Side effects: DOM #it-log, trimmed to MAX_IT_ROWS, and lastItReportHadDetections. Returns when data is missing. events: none.
+ */
 function appendItRow(record) {
   const d = record.data;
   if (!d) return;
@@ -3884,6 +4792,12 @@ function appendItRow(record) {
   while ($('it-log').children.length > MAX_IT_ROWS) $('it-log').lastElementChild.remove();
 }
 
+/**
+ * Prepends one raw log row unless the log is paused, and trims the list to MAX_RAW_ROWS.
+ * @param {object} record Raw display record.
+ * @returns {void}
+ * Side effects: DOM #raw-log. registerFilterOption may throw. events: none.
+ */
 function appendRawRow(record) {
   registerFilterOption(record.name);
   if (state.paused) return;
@@ -3911,12 +4825,23 @@ function appendRawRow(record) {
   while ($('raw-log').children.length > MAX_RAW_ROWS) $('raw-log').lastElementChild.remove();
 }
 
+/**
+ * Hides raw-log rows whose name is not the selected filter.
+ * @returns {void}
+ * Side effects: DOM hidden on raw-log children. events: none.
+ */
 function applyRawFilter() {
   for (const item of $('raw-log').children) {
     item.hidden = Boolean(state.filter) && item.dataset.name !== state.filter;
   }
 }
 
+/**
+ * Adds a raw-log filter option once. Throws when the select would grow past 256 names.
+ * @param {string} name Message name.
+ * @returns {void}
+ * Side effects: DOM option on #raw-filter. events: none.
+ */
 function registerFilterOption(name) {
   const select = $('raw-filter');
   if ([...select.options].some((o) => o.value === name)) return;
@@ -3929,6 +4854,14 @@ function registerFilterOption(name) {
 
 // --- helpers ----------------------------------------------------------------
 
+/**
+ * Appends a td, using an em dash for null or undefined.
+ * @param {HTMLTableRowElement} row Row to extend.
+ * @param {*} text Cell text.
+ * @param {string} [className] Cell class.
+ * @returns {HTMLTableCellElement}
+ * Side effects: DOM cell. events: none.
+ */
 function cell(row, text, className) {
   const td = row.insertCell();
   td.textContent = text === null || text === undefined ? '—' : String(text);
@@ -3936,6 +4869,14 @@ function cell(row, text, className) {
   return td;
 }
 
+/**
+ * Inserts a single spanning cell with the empty-state text.
+ * @param {HTMLTableSectionElement} body Table body.
+ * @param {number} span Column span.
+ * @param {string} text Empty-state text.
+ * @returns {void}
+ * Side effects: DOM row. events: none.
+ */
 function emptyRow(body, span, text) {
   const row = body.insertRow();
   row.className = 'empty';
@@ -3944,17 +4885,37 @@ function emptyRow(body, span, text) {
   td.textContent = text;
 }
 
+/**
+ * OK, FAIL, or an em dash for a CRC flag.
+ * @param {boolean|null} valid crcValid flag.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function crcLabel(valid) {
   if (valid === true) return 'OK';
   if (valid === false) return 'FAIL';
   return '—';
 }
 
+/**
+ * Fixed-digit number plus suffix, or an em dash when the value is empty or NaN.
+ * @param {*} value Number to format.
+ * @param {number} digits Digits after the decimal.
+ * @param {string} [suffix] Text appended after the number.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function fmt(value, digits, suffix = '') {
   if (value === null || value === undefined || Number.isNaN(value)) return '—';
   return `${Number(value).toFixed(digits)}${suffix}`;
 }
 
+/**
+ * Hertz as MHz, kHz, or Hz, or an em dash when null.
+ * @param {number|null} hz Frequency in hertz.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatFrequency(hz) {
   if (hz === null || hz === undefined) return '—';
   if (hz >= 1e6) return `${(hz / 1e6).toFixed(4)} MHz`;
@@ -3962,11 +4923,24 @@ function formatFrequency(hz) {
   return `${hz} Hz`;
 }
 
+/**
+ * Formats header UTC when present, otherwise receivedAt.
+ * @param {object} record Report with header and receivedAt.
+ * @returns {string}
+ * Side effects: none. events: none.
+ */
 function formatTime(record) {
   const iso = (record.header && record.header.utc) || record.receivedAt;
   return formatTimestamp(iso);
 }
 
+/**
+ * Formats an instant in the selected time zone, or an em dash when it is empty or invalid.
+ * @param {*} timestamp Date, epoch, or ISO string.
+ * @param {boolean} [detailed] Include the date and milliseconds.
+ * @returns {string}
+ * Side effects: may cache an Intl formatter. events: none.
+ */
 function formatTimestamp(timestamp, detailed = false) {
   if (timestamp === null || timestamp === undefined || timestamp === '') return '—';
   const date = new Date(timestamp);
@@ -3979,6 +4953,12 @@ function formatTimestamp(timestamp, detailed = false) {
 }
 
 const dateFormatters = new Map();
+/**
+ * Returns a cached en-GB DateTimeFormat, clearing the cache once it holds 12 entries.
+ * @param {object} options Intl options.
+ * @returns {Intl.DateTimeFormat}
+ * Side effects: mutates the dateFormatters map. events: none.
+ */
 function dateFormatter(options) {
   const key = JSON.stringify(options);
   if (!dateFormatters.has(key)) {
@@ -3989,6 +4969,11 @@ function dateFormatter(options) {
   return dateFormatters.get(key);
 }
 
+/**
+ * Fills the time-zone select and re-renders timestamps when it changes.
+ * @returns {void}
+ * Side effects: DOM select and a change listener that writes the timeZone preference and redraws several views. events: none.
+ */
 function initTimeZone() {
   const select = $('time-zone');
   const zones = typeof Intl.supportedValuesOf === 'function' ? Intl.supportedValuesOf('timeZone') : [];
@@ -4032,6 +5017,7 @@ setInterval(() => {
 }, 15000);
 window.addEventListener('resize', () => { timelineDirty = true; });
 document.addEventListener('visibilitychange', () => {
+  // Hidden: close /events and abort the history request. Visible: open /events again and reload history. No backoff timer.
   if (document.hidden) {
     source?.close();
     source = null;
@@ -4042,9 +5028,11 @@ document.addEventListener('visibilitychange', () => {
     loadHistory();
   }
 });
+// error and unhandledrejection are shown by the client error reporter. These listeners do not dispatch another event.
 window.addEventListener('error', (event) => reportClientError('Display error', event.error || event.message));
 window.addEventListener('unhandledrejection', (event) => reportClientError('Asynchronous display error', event.reason));
 $('retry-display').addEventListener('click', () => {
+  // Clears the notice, closes /events, opens it again, and reloads history.
   $('client-error').hidden = true;
   lastErrorNotice = '';
   source?.close();
