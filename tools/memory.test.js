@@ -216,7 +216,7 @@ test('browser history stays bounded under sustained input and expires old sample
   assert.equal(context.state.interferenceHistory.length, 10000);
   assert.equal(context.state.interferenceHistory[0].index, 90000);
   for (let index = 0; index < 25000; index++) {
-    context.recordLiveHistory({ name: 'ITDETECTSTATUS', data: { detections: [] } });
+    context.recordLiveHistory({ name: 'ITDETECTSTATUS', crcValid: true, data: { detections: [] } });
   }
   assert.equal(context.state.interferenceHistory.length, 10000);
   context.state.interferenceHistory[0].t = now - 7200000;
@@ -226,7 +226,7 @@ test('browser history stays bounded under sustained input and expires old sample
 
 test('satellite history retains its seed and limits loaded tracks', () => {
   const context = historyContext();
-  const record = { name: 'SATVIS2', data: { system: 'GPS', satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } };
+  const record = { name: 'SATVIS2', crcValid: true, data: { system: 'GPS', satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } };
   context.recordLiveHistory(record);
   context.pruneClientHistory();
   context.recordLiveHistory(record);
@@ -253,7 +253,7 @@ test('rendering coalesces input, bounds queues and skips inactive panels', () =>
   loadFunctions(browserCode, 'function queueRecord(', 'function renderStatus(', context);
   loadFunctions(browserCode, 'function applyRecord(', '// --- renderers', context);
   for (let index = 0; index < 100000; index++) {
-    context.applyRecord({ name: 'BESTPOS', data: { index } });
+    context.applyRecord({ name: 'BESTPOS', crcValid: true, data: { index } });
     context.queueRecord(context.pendingRaw, { name: 'BESTPOS' }, 300);
     context.queueRecord(context.pendingInterference, { name: 'ITDETECTSTATUS' }, 50);
   }
@@ -290,7 +290,7 @@ test('receiver identity updates without rendering the hidden health table', () =
   });
   loadFunctions(browserCode, 'function applyRecord(', '// --- renderers', context);
   loadFunctions(browserCode, 'function renderVersionSummary(', '// --- interference bands', context);
-  context.applyRecord({ name: 'VERSION', data: { components: [{ model: 'PwrPak', softwareVersion: '1', serialNumber: '123' }] } });
+  context.applyRecord({ name: 'VERSION', crcValid: true, data: { components: [{ model: 'PwrPak', softwareVersion: '1', serialNumber: '123' }] } });
   assert(header.textContent.includes('PwrPak'));
   assert(header.textContent.includes('123'));
 });
@@ -848,8 +848,10 @@ test('wall display does not treat stale or disconnected interference data as liv
   });
   loadFunctions(browserCode, 'function interferenceIsLive(', 'function renderVerdict(', context);
   const now = Date.now();
-  const record = { receivedAt: new Date(now).toISOString(), data: { detections: [] } };
+  const record = { crcValid: true, receivedAt: new Date(now).toISOString(), data: { detections: [] } };
   assert.equal(context.interferenceIsLive(record, now), true);
+  assert.equal(context.interferenceIsLive({ ...record, crcValid: false }, now), false);
+  assert.equal(context.interferenceIsLive({ ...record, crcValid: null }, now), false);
   assert.equal(context.interferenceIsLive(record, now + 4999), true);
   assert.equal(context.interferenceIsLive(record, now + 5000), false);
   assert.equal(context.interferenceIsLive(null, now), false);

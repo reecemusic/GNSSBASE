@@ -39,6 +39,8 @@ const TIME_STATUS_NAMES = new Set([
 ]);
 
 const GPS_EPOCH_MS = Date.UTC(1980, 0, 6);
+// GPS-UTC offset. 18 seconds since 2017-01-01. Update when the IERS announces a
+// leap second; until then, archive GPS timestamps shift by 1 s against live reception time.
 const LEAP_SECONDS = 18;
 
 function gpsToMs(week, seconds) {
@@ -188,18 +190,32 @@ function interpretItDetectStatus(message) {
   };
 }
 
+/**
+ * Converts a receiver frequency field to Hz.
+ * Center: values in [1100, 2700] are MHz (L1/L2/L5 and S-band near 2492); values at or above 1e6 are already Hz.
+ * Bandwidth: values below 1000 are MHz; values at or above 1000 are already Hz (kHz-scale and multi-MHz widths).
+ * Anything else is rejected rather than scaled blindly.
+ */
+function scaleFrequencyHz(value, role) {
+  if (!Number.isFinite(value)) return null;
+  const abs = Math.abs(value);
+  if (role === 'bandwidth') return abs < 1000 ? value * 1e6 : value;
+  if (abs >= 1100 && abs <= 2700) return value * 1e6;
+  if (abs >= 1e6) return value;
+  return null;
+}
+
 function describeSignalDetection(signalType, block) {
   const centerFrequency = Number(block[1]);
   const bandwidth = Number(block[2]);
   const spectrum = block[0] === 'SPECTRUMANALYSIS';
-  const toHz = (value) => Number.isFinite(value) ? value * (Math.abs(value) < 100000 ? 1e6 : 1) : null;
 
   return {
     fields: [signalType, ...block],
     signalType,
     type: block[0] || '',
-    centerFrequencyHz: toHz(centerFrequency),
-    bandwidthHz: toHz(bandwidth),
+    centerFrequencyHz: scaleFrequencyHz(centerFrequency, 'center'),
+    bandwidthHz: scaleFrequencyHz(bandwidth, 'bandwidth'),
     powerDbm: Number.isFinite(Number(block[3])) ? Number(block[3]) : null,
     noiseFloorDbm: spectrum && Number.isFinite(Number(block[4])) ? Number(block[4]) : null,
     metrics: [],
@@ -213,8 +229,8 @@ function describeDetection(block) {
     fields: block,
     signalType: block[0] || '',
     type: block[1] || '',
-    centerFrequencyHz: spectrum && Number.isFinite(Number(block[2])) ? Number(block[2]) * 1e6 : null,
-    bandwidthHz: spectrum && Number.isFinite(Number(block[3])) ? Number(block[3]) * 1e6 : null,
+    centerFrequencyHz: spectrum ? scaleFrequencyHz(Number(block[2]), 'center') : null,
+    bandwidthHz: spectrum ? scaleFrequencyHz(Number(block[3]), 'bandwidth') : null,
     powerDbm: spectrum && Number.isFinite(Number(block[4])) ? Number(block[4]) : null,
     noiseFloorDbm: spectrum && Number.isFinite(Number(block[5])) ? Number(block[5]) : null,
     metrics: spectrum ? [] : block.slice(2, 6).map(Number),
@@ -359,6 +375,7 @@ module.exports = {
   novatelCrc32Buffer,
   parseAsciiLog,
   interpretItDetectStatus,
+  scaleFrequencyHz,
   decodeItDetectStatusBinary,
   splitFields,
   readBinaryLog,

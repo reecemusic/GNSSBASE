@@ -11,6 +11,14 @@ const { decode } = require('./messages');
 const { History } = require('./history');
 const { InterferenceArchive } = require('./archive');
 
+process.on('unhandledRejection', (reason) => {
+  const message = reason instanceof Error ? (reason.stack || reason.message) : String(reason);
+  console.error(`[process] unhandledRejection: ${message}`);
+});
+process.on('uncaughtException', (error) => {
+  console.error(`[process] uncaughtException: ${error.stack || error.message}`);
+});
+
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const HTTP_HEADERS_TIMEOUT_MS = 15_000;
 const HTTP_REQUEST_TIMEOUT_MS = 30_000;
@@ -59,6 +67,9 @@ const archive = new InterferenceArchive({
 });
 archive.on('status', (status) => broadcast('archive', status));
 
+const savedConnection = config.loadConnectionOverrides(config.connectionSettingsFile);
+if (savedConnection) Object.assign(config, savedConnection);
+
 const receiver = new ReceiverClient(config);
 
 let lastStatusLog = '';
@@ -82,12 +93,47 @@ receiver.on('log', (message) => {
 });
 
 function processReceiverLog(message) {
-  const record = decode(message);
+  const reportTimestamp = (record) => {
+    const parsed = Date.parse(record && record.header && record.header.utc);
+    return Number.isFinite(parsed) ? parsed : Date.now();
+  };
+
+  let record;
+  try {
+    record = decode(message);
+  } catch (error) {
+    console.error(`[receiver] could not decode log: ${error.message}`);
+    if (typeof receiver !== 'undefined' && receiver && typeof receiver.setError === 'function') receiver.setError(error);
+    const name = (message && message.header && message.header.messageName) || 'UNKNOWN';
+    store.counts[name] = (store.counts[name] || 0) + 1;
+    const diagnostic = `${error.message}\n${message && message.raw ? message.raw : ''}`.trim();
+    const receivedAt = new Date().toISOString();
+    store.rawLog.push({
+      name, receivedAt, format: message && message.format, crcValid: message && message.crcValid, raw: diagnostic,
+    });
+    if (store.rawLog.length > config.rawLogSize) store.rawLog.shift();
+    broadcast('message', {
+      record: {
+        name,
+        format: message && message.format,
+        receivedAt,
+        header: message && message.header,
+        crcValid: message && message.crcValid,
+        raw: diagnostic,
+        data: null,
+        error: error.message,
+      },
+      counts: store.counts,
+    });
+    return;
+  }
+
   const name = record.name;
-  store.latest[name] = record;
+  const trusted = record.crcValid === true;
+  if (trusted) store.latest[name] = record;
   store.counts[name] = (store.counts[name] || 0) + 1;
 
-  if (record.kind === 'ephemeris') {
+  if (trusted && record.kind === 'ephemeris') {
     const entry = store.ephemeris[name] || { count: 0, records: {} };
     entry.count++;
     entry.lastSatellite = record.data ? record.data.satelliteId : '';
@@ -109,9 +155,9 @@ function processReceiverLog(message) {
       signalDetections.push(detection);
       bySignal.set(detection.signalType, signalDetections);
     }
-    const reportTime = Date.now();
-    if (record.crcValid === false) {
-      console.warn('[receiver] excluding CRC-failed ITDETECTSTATUS from history');
+    const reportTime = reportTimestamp(record);
+    if (!trusted) {
+      if (record.crcValid === false) console.warn('[receiver] excluding CRC-failed ITDETECTSTATUS from history');
     } else if (bySignal.size) {
       for (const [signal, signalDetections] of bySignal) {
         history.addInterference(signal, signalDetections, reportTime);
@@ -121,12 +167,12 @@ function processReceiverLog(message) {
     }
   }
 
-  if (name === 'BESTPOS' && record.data && record.crcValid !== false) history.addSolution(record.data);
+  if (name === 'BESTPOS' && trusted && record.data) history.addSolution(record.data, reportTimestamp(record));
 
   if (name === 'SATVIS2' && record.data && record.data.system) {
-    store.satvisBySystem[record.data.system] = record;
-    if (record.crcValid !== false && record.data.visibilityValid !== false) {
-      history.addSatellites(record.data.system, record.data.satellites || []);
+    if (trusted) store.satvisBySystem[record.data.system] = record;
+    if (trusted && record.data.visibilityValid !== false) {
+      history.addSatellites(record.data.system, record.data.satellites || [], reportTimestamp(record));
     }
   }
 
@@ -136,7 +182,7 @@ function processReceiverLog(message) {
   broadcast('message', {
     record,
     counts: store.counts,
-    ephemeris: record.kind === 'ephemeris' ? store.ephemeris : undefined,
+    ephemeris: trusted && record.kind === 'ephemeris' ? store.ephemeris : undefined,
   });
 }
 
@@ -355,6 +401,11 @@ function handleRequest(req, res) {
         return;
       }
 
+      try {
+        config.saveConnectionSettings(config.connectionSettingsFile, connectionSettings());
+      } catch (error) {
+        console.warn(`[config] could not save connection settings: ${error.message}`);
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(connectionSettings()));
     });
@@ -518,7 +569,7 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     receiver.stop();
     archive.stopAuto();
     archive.cancel();
-    history.save();
+    history.saveSync();
     const shutdownTimer = setTimeout(() => {
       console.error(`[shutdown] forcing exit after ${SHUTDOWN_TIMEOUT_MS} ms`);
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();

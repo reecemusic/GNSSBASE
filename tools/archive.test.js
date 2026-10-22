@@ -671,3 +671,62 @@ test('abbreviated ASCII BESTSATS and BESTPOS (as logged on the NAS) are decoded 
   assert.equal(truncated.toJSON().bestsatsReports, 0, 'a block with missing rows is rejected');
   assert.equal(truncated.toJSON().crcErrors, 1);
 });
+
+test('a non-target frame whose length does not land on the next sync is not skipped over', () => {
+  const start = NOW - 3600000;
+  const detection = binaryFrame(2065, start, itBody([{ rf: 5, center: 1176.45, bandwidth: 3, power: -90 }]));
+  const liar = Buffer.alloc(42, 0x11);
+  liar.set([0xaa, 0x44, 0x12, 28]);
+  liar.writeUInt16LE(43, 4);
+  liar.writeUInt16LE(15, 8);
+  const log = Buffer.concat([liar, detection]);
+  for (const size of [log.length, 1, 7, 64]) {
+    const summary = scan(log, size);
+    assert.equal(summary.reportCount, 1, `chunk size ${size}`);
+    assert.equal(summary.samples.length, 1);
+    assert.equal(summary.samples[0].signal, 'L5');
+  }
+});
+
+test('a cached summary with a null sample is discarded and the file is rescanned', async (t) => {
+  const zlib = require('node:zlib');
+  const { write, options } = makeArchive(t);
+  write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 3600000));
+  const archive = new InterferenceArchive(options);
+  archive.load({ days: 1 });
+  let status = await waitFor(archive, ['ready', 'error']);
+  assert.equal(status.state, 'ready', status.message);
+  const cacheFile = fs.readdirSync(options.cacheDir).find((name) => name.endsWith('.json.gz'));
+  const cachePath = path.join(options.cacheDir, cacheFile);
+  const parsed = JSON.parse(zlib.gunzipSync(fs.readFileSync(cachePath)));
+  parsed.solution.push(null);
+  fs.writeFileSync(cachePath, zlib.gzipSync(JSON.stringify(parsed)));
+  const again = new InterferenceArchive(options);
+  again.load({ days: 1 });
+  status = await waitFor(again, ['ready', 'error']);
+  assert.equal(status.state, 'ready', status.message);
+  assert.equal(status.filesCached, 0);
+  assert.ok(status.errors.some((error) => /unusable/i.test(error)));
+  assert.ok(status.reports > 0);
+});
+
+test('a network call that never settles stops blocking archive loads after hungResetMs', async () => {
+  const archive = new InterferenceArchive({
+    hungResetMs: 40, fsTimeoutMs: 20, cacheDir: null, settingsFile: null, defaultRoot: path.parse(process.cwd()).root,
+  });
+  let release;
+  const hung = new Promise((resolve) => { release = resolve; });
+  await assert.rejects(archive.withTimeout(hung, 'test share'), /did not respond/);
+  assert.equal(archive.pendingFs, 1);
+  assert.equal(archive.hung, 1);
+  assert.throws(() => archive.assertAvailable(), /outstanding request/);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(archive.pendingFs, 0);
+  assert.equal(archive.hung, 0);
+  assert.doesNotThrow(() => archive.assertAvailable());
+  assert.match(archive.autoState.lastError, /marked finished/);
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(archive.pendingFs, 0);
+  assert.equal(archive.hung, 0);
+});

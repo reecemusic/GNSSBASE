@@ -252,7 +252,8 @@ function renderConnectionBar() {
   } else if (phase === 'connected') {
     title = 'Connected';
     detail = `Receiver port open via ${connectionTarget(status)}`
-      + (auto && status.transport === 'tcp' ? ' · USB serial unavailable, using TCP fallback' : '');
+      + (auto && status.transport === 'tcp' ? ' · USB serial unavailable, using TCP fallback' : '')
+      + (status.lastError ? ` · ${status.lastError}` : '');
   } else if (phase === 'stopped') {
     title = 'Disconnected';
     detail = 'Receiver connection closed. Press Connect to start.';
@@ -392,12 +393,17 @@ function applySnapshot(snap) {
   state.counts = snap.counts || {};
   state.ephemeris = snap.ephemeris || {};
   state.itBySignal = snap.itdetectBySignal || {};
-  state.satvis = snap.satvisBySystem || {};
   state.itSeen = state.counts.ITDETECTSTATUS || 0;
+  for (const key of Object.keys(latestByName)) delete latestByName[key];
+  state.satvis = {};
 
   pendingRaw.length = 0;
   pendingInterference.length = 0;
   Object.values(snap.latest || {}).forEach(applyRecord);
+  state.satvis = {};
+  for (const record of Object.values(snap.satvisBySystem || {})) {
+    if (record?.crcValid === true && record.data?.system) state.satvis[record.data.system] = record;
+  }
   const latestSatelliteReport = Object.values(snap.latest || {})
     .filter((record) => ['RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT'].includes(record.name)
       && Number.isFinite(Date.parse(record.receivedAt)))
@@ -511,6 +517,10 @@ function renderStatus(status) {
 
 function applyRecord(record) {
   validateRecord(record);
+  if (record.error || record.crcValid !== true) {
+    registerFilterOption(record.name);
+    return;
+  }
   latestByName[record.name] = record;
   dirtyRecords.add(record.name);
   if (record.name === 'SATVIS2' && record.data) state.satvis[record.data.system] = record;
@@ -622,8 +632,10 @@ function renderBestPos(record) {
   $('pos-lat').textContent = fmt(d.latitude, 9, '°');
   $('pos-lon').textContent = fmt(d.longitude, 9, '°');
   $('pos-hgt').textContent = fmt(heightFor(d), 3, ' m');
+  const otherHeight = !Number.isFinite(d.undulation) || !Number.isFinite(d.heightMsl) ? null
+    : state.heightDatum === 'ellipsoidal' ? d.heightMsl : d.heightMsl + d.undulation;
   $('pos-undulation').textContent = Number.isFinite(d.undulation)
-    ? `geoid undulation ${d.undulation.toFixed(3)} m · ${state.heightDatum === 'ellipsoidal' ? `MSL ${d.heightMsl.toFixed(3)} m` : `ellipsoidal ${(d.heightMsl + d.undulation).toFixed(3)} m`}`
+    ? `geoid undulation ${d.undulation.toFixed(3)} m · ${state.heightDatum === 'ellipsoidal' ? 'MSL' : 'ellipsoidal'} ${otherHeight === null ? '—' : `${otherHeight.toFixed(3)} m`}`
     : '';
   $('pos-sigma').textContent = `${fmt(d.latitudeSigma, 3)} / ${fmt(d.longitudeSigma, 3)} / ${fmt(d.heightSigma, 3)} m`;
   $('pos-svs').textContent = `${d.satellitesUsed ?? '—'} / ${d.satellitesTracked ?? '—'}`;
@@ -638,10 +650,17 @@ let map = null;
 let marker = null;
 let accuracyCircle = null;
 
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[char]));
+}
+
 /** Plots the antenna position. Silently degrades to a message when offline. */
 function updateMap(d) {
   if (!Number.isFinite(d.latitude) || !Number.isFinite(d.longitude)) return;
   if (d.latitude === 0 && d.longitude === 0) return;
+  if (d.latitude < -90 || d.latitude > 90 || d.longitude < -180 || d.longitude > 180) return;
 
   const link = $('gmaps-link');
   link.href = `https://www.google.com/maps?q=${d.latitude},${d.longitude}`;
@@ -673,9 +692,9 @@ function updateMap(d) {
     accuracyCircle.setLatLng(position).setRadius(radius || 1);
   }
 
-  marker.bindPopup(`<b>${d.solutionStatus} / ${d.positionType}</b><br>`
+  marker.bindPopup(`<b>${escapeHtml(d.solutionStatus)} / ${escapeHtml(d.positionType)}</b><br>`
     + `${d.latitude.toFixed(9)}, ${d.longitude.toFixed(9)}<br>`
-    + `${fmt(heightFor(d), 3, ' m')} ${state.heightDatum === 'ellipsoidal' ? 'ellipsoidal' : 'MSL'} &middot; ${d.satellitesUsed ?? '?'} SVs`);
+    + `${escapeHtml(fmt(heightFor(d), 3, ' m'))} ${state.heightDatum === 'ellipsoidal' ? 'ellipsoidal' : 'MSL'} &middot; ${d.satellitesUsed ?? '?'} SVs`);
 }
 
 function renderBestGnssPos(record) {
@@ -829,8 +848,10 @@ function pruneClientHistory() {
 }
 
 function recordLiveHistory(record) {
-  if (record.crcValid === false) return;
-  const now = Date.now();
+  if (record.crcValid !== true) return;
+  const headerTime = Date.parse(record.header && record.header.utc);
+  const receivedTime = Date.parse(record.receivedAt);
+  const now = Number.isFinite(headerTime) ? headerTime : Number.isFinite(receivedTime) ? receivedTime : Date.now();
   if (record.name === 'SATVIS2' && record.data && record.data.visibilityValid !== false) {
     for (const sat of record.data.satellites || []) {
       if (!isValidSkyPosition(sat.elevation, sat.azimuth)) continue;
@@ -3064,7 +3085,7 @@ function interferenceIsLive(record, now = Date.now()) {
 
 function hasFreshInterferenceReport(record, now = Date.now()) {
   const receivedAt = Date.parse(record?.receivedAt);
-  return record?.crcValid !== false && Boolean(record?.data)
+  return record?.crcValid === true && Boolean(record?.data)
     && Number.isFinite(receivedAt) && now - receivedAt < INTERFERENCE_STALE_MS;
 }
 
@@ -3125,7 +3146,7 @@ function renderVerdict() {
 }
 
 function rememberLastDetection(record) {
-  if (record?.name !== 'ITDETECTSTATUS' || record.crcValid === false) return;
+  if (record?.name !== 'ITDETECTSTATUS' || record.crcValid !== true) return;
   const detections = record.data?.detections;
   if (!Array.isArray(detections) || detections.length === 0) return;
   const at = Date.parse(record.receivedAt);
@@ -3302,7 +3323,7 @@ function renderDeviceSummary() {
 }
 
 function recordSatelliteView(record) {
-  if (!['RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT'].includes(record?.name)) return;
+  if (!['RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT'].includes(record?.name) || record.crcValid !== true) return;
   const t = Date.parse(record.receivedAt);
   if (!Number.isFinite(t)) return;
   const tracked = {};
@@ -3527,12 +3548,23 @@ function ephemerisParameters(data) {
 
 function ephemerisHealth(name, data) {
   const values = ephemerisParameters(data);
-  if (name === 'GLOEPHEMERIS') return values.health >= 0 && values.health <= 3;
+  const missing = (...keys) => keys.some((key) => values[key] === null || values[key] === undefined);
+  if (name === 'GLOEPHEMERIS') {
+    if (missing('health')) return null;
+    return values.health >= 0 && values.health <= 3;
+  }
   if (name === 'GALINAVEPHEMERIS') {
+    if (missing('e1Health', 'e5Health')) return null;
     return values.e1Health === 0 && values.e5Health === 0;
   }
-  if (name === 'GALFNAVEPHEMERIS') return values.e5Health === 0;
-  if (name === 'NAVICEPHEMERIS') return values.l5Health === 0 && values.sHealth === 0 && values.alert === 0;
+  if (name === 'GALFNAVEPHEMERIS') {
+    if (missing('e5Health')) return null;
+    return values.e5Health === 0;
+  }
+  if (name === 'NAVICEPHEMERIS') {
+    if (missing('l5Health', 'sHealth', 'alert')) return null;
+    return values.l5Health === 0 && values.sHealth === 0 && values.alert === 0;
+  }
   return values.health === null || values.health === undefined ? null : values.health === 0;
 }
 

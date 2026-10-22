@@ -103,8 +103,11 @@ function decodeVersionAscii(fields) {
 }
 
 function decodeRxStatusAscii(fields) {
-  const errorWord = parseInt(fields[0], 16) || 0;
-  const statusWord = parseInt(fields[2], 16) || 0;
+  if (!/^[0-9a-fA-F]{8}$/.test(fields[0] || '') || !/^[0-9a-fA-F]{8}$/.test(fields[2] || '')) {
+    throw new Error('RXSTATUS error or status word is not an 8-digit hex value');
+  }
+  const errorWord = parseInt(fields[0], 16);
+  const statusWord = parseInt(fields[2], 16);
   return {
     errorWord: fields[0],
     receiverStatusWord: fields[2],
@@ -376,9 +379,9 @@ function decodeBestPosBinary(body) {
 }
 
 function decodeRxStatusBinary(body) {
-  if (body.length < 8) return null;
+  if (!body || body.length < 16) throw new Error('RXSTATUS binary body is incomplete');
   const errorWord = body.readUInt32LE(0);
-  const statusWord = body.length >= 16 ? body.readUInt32LE(8) : 0;
+  const statusWord = body.readUInt32LE(8);
   return {
     errorWord: errorWord.toString(16).padStart(8, '0'),
     receiverStatusWord: statusWord.toString(16).padStart(8, '0'),
@@ -397,14 +400,18 @@ function decodeRangeBinary(body) {
   for (let i = 0; i < count; i++) {
     const offset = 4 + i * 44;
     if (offset + 44 > body.length) break;
+    const trackingStatus = body.readUInt32LE(offset + 40);
+    const system = systemFromTrackingStatus(trackingStatus);
+    // OEM7 stores the GLONASS frequency channel plus 7 in an unsigned field.
+    const gloFrequency = body.readUInt16LE(offset + 2);
     observations.push({
       prn: body.readUInt16LE(offset),
-      gloFrequency: body.readUInt16LE(offset + 2),
+      gloFrequency: system === 'GLONASS' ? gloFrequency - 7 : gloFrequency,
       pseudorange: body.readDoubleLE(offset + 4),
       carrierToNoise: body.readFloatLE(offset + 32),
       lockTime: body.readFloatLE(offset + 36),
-      trackingStatus: body.readUInt32LE(offset + 40).toString(16).padStart(8, '0'),
-      system: systemFromTrackingStatus(body.readUInt32LE(offset + 40)),
+      trackingStatus: trackingStatus.toString(16).padStart(8, '0'),
+      system,
     });
   }
   observations.sort((a, b) => (b.carrierToNoise || 0) - (a.carrierToNoise || 0));

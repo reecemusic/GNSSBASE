@@ -7,6 +7,11 @@ const { parseAsciiLog, readBinaryLog, findSyncIndex } = require('./novatel');
 
 const MAX_BUFFER_BYTES = 1 << 20;
 const NEWLINE = 0x0a;
+const PROBE_LOGS = new Set([
+  'VERSION', 'RXSTATUS', 'BESTPOS', 'BESTGNSSPOS', 'RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT',
+  'ITDETECTSTATUS', 'GPSEPHEM', 'GLOEPHEMERIS', 'GALINAVEPHEMERIS', 'GALFNAVEPHEMERIS',
+  'BDSEPHEMERIS', 'QZSSEPHEMERIS', 'NAVICEPHEMERIS',
+]);
 
 /**
  * Maintains a TCP or serial connection to the receiver and splits its stream into logs.
@@ -21,6 +26,7 @@ class ReceiverClient extends EventEmitter {
     this.buffer = Buffer.alloc(0);
     this.reconnectTimer = null;
     this.probeTimer = null;
+    this.serialIdleTimer = null;
     this.stopped = true;
     // In 'auto' mode each connection cycle tries serial first, then falls back to TCP.
     this.autoTarget = 'serial';
@@ -88,6 +94,8 @@ class ReceiverClient extends EventEmitter {
   closeCurrentTransport() {
     clearTimeout(this.probeTimer);
     this.probeTimer = null;
+    clearTimeout(this.serialIdleTimer);
+    this.serialIdleTimer = null;
     const socket = this.socket;
     const port = this.port;
     this.socket = null;
@@ -186,7 +194,24 @@ class ReceiverClient extends EventEmitter {
       this.onConnected();
       this.sendConfiguredCommands(port);
       this.startSerialProbe(port);
+      this.armSerialIdle();
     });
+  }
+
+  /** Serial has no socket idle timeout, so recycle a silent open port on the same interval as TCP. */
+  armSerialIdle() {
+    const idleTimeoutMs = this.options.idleTimeoutMs;
+    if (!this.port || this.stopped || !(idleTimeoutMs > 0)) return;
+    clearTimeout(this.serialIdleTimer);
+    this.serialIdleTimer = setTimeout(() => {
+      this.serialIdleTimer = null;
+      if (!this.port || this.stopped) return;
+      this.setError(new Error(`No data received for ${idleTimeoutMs} ms`));
+      this.closeCurrentTransport();
+      this.autoTarget = 'serial';
+      this.updateState({ connected: false, phase: 'waiting', retryAt: null });
+      this.scheduleReconnect();
+    }, idleTimeoutMs);
   }
 
   /** In auto mode, an open serial port only counts once it yields a decodable log (e.g. wrong baud fails). */
@@ -205,10 +230,12 @@ class ReceiverClient extends EventEmitter {
   }
 
   emitLog(message) {
-    if (this.probeTimer) {
+    const name = message && message.header && message.header.messageName;
+    if (this.probeTimer && message && message.crcValid === true && PROBE_LOGS.has(name)) {
       clearTimeout(this.probeTimer);
       this.probeTimer = null;
     }
+    if (message && message.crcValid === true && this.state.lastError) this.updateState({ lastError: null });
     this.emit('log', message);
   }
 
@@ -251,6 +278,7 @@ class ReceiverClient extends EventEmitter {
 
   onData(chunk) {
     this.state.lastDataAt = Date.now();
+    if (this.port) this.armSerialIdle();
     this.ingest(chunk);
   }
 
@@ -298,9 +326,24 @@ class ReceiverClient extends EventEmitter {
           continue;
         }
 
+        if (findSyncIndex(this.buffer) === 0 && this.buffer.length >= 3) {
+          this.setError(new Error('Skipped an implausible NovAtel binary header'));
+          this.buffer = this.buffer.subarray(1);
+          continue;
+        }
+
         const newlineIndex = this.buffer.indexOf(NEWLINE);
         const syncIndex = findSyncIndex(this.buffer);
         if (newlineIndex !== -1 && (syncIndex === -1 || newlineIndex < syncIndex)) {
+          const hash = this.buffer.indexOf(0x23);
+          const percent = this.buffer.indexOf(0x25);
+          let marker = -1;
+          if (hash !== -1 && hash < newlineIndex) marker = hash;
+          if (percent !== -1 && percent < newlineIndex && (marker === -1 || percent < marker)) marker = percent;
+          if (marker > 0) {
+            this.buffer = this.buffer.subarray(marker);
+            continue;
+          }
           const line = this.buffer.toString('ascii', 0, newlineIndex);
           this.buffer = this.buffer.subarray(newlineIndex + 1);
           const message = parseAsciiLog(line);

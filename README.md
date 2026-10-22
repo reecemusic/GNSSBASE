@@ -31,9 +31,12 @@ changes only take effect when that button is pressed.
 
 Both ASCII (`#...*crc`) and binary (`0xAA 0x44 0x12`) framings are decoded, and the two
 may be interleaved on the same port. CRC is verified on every log.
-Malformed checksums are marked failed, rather than treated as unchecked. CRC-failed
-reports remain visible for diagnosis but do not enter live/saved interference,
-position or sky-track history. SATVIS2 with invalid visibility does not create tracks.
+Malformed checksums are marked failed, rather than treated as unchecked. Reports
+without a checksum stay unchecked. Only CRC-valid reports update the live position,
+health and sky displays, or enter live/saved interference, position or sky-track
+history. CRC-failed and unchecked reports remain visible in the raw log for diagnosis.
+Abbreviated archive logs without a checksum are still decoded. SATVIS2 with invalid
+visibility does not create tracks.
 Incomplete RANGE, SATVIS2 and ITDETECTSTATUS payloads are rejected explicitly instead
 of becoming partial counts or false clear interference reports. Archive scans count
 malformed reports in their error counter and continue with subsequent valid records.

@@ -22,7 +22,7 @@ const bestpos = (used, type = 'SINGLE', status = 'SOL_COMPUTED') => ({
   solutionStatus: status, positionType: type, satellitesUsed: used, satellitesTracked: 30,
 });
 
-test('server solution history keeps changes plus a heartbeat and survives save/load', (t) => {
+test('server solution history keeps changes plus a heartbeat and survives save/load', async (t) => {
   const file = path.join(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'solution-')), 'history.json');
   t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
   const history = new History({ retentionMs: 3600000, trackSampleMs: 20000, maxInterferenceSamples: 1000, filePath: file });
@@ -41,7 +41,7 @@ test('server solution history keeps changes plus a heartbeat and survives save/l
   });
   assert.equal(history.since(3600000).solution.length, 7);
 
-  history.save();
+  await history.save();
   const restored = new History({ retentionMs: 3600000, trackSampleMs: 20000, maxInterferenceSamples: 1000, filePath: file });
   restored.load();
   assert.deepEqual(restored.solution, history.solution);
@@ -103,7 +103,7 @@ test('browser records live BESTPOS with the same thinning and history merge as t
   context.recordSolution(bestpos(20, 'FIXEDPOS'), now + 11000);
   assert.deepEqual(plain(context.state.solutionHistory.map((s) => [s.t - now, s.used, s.type])),
     [[0, 20, 'SINGLE'], [10000, 20, 'SINGLE'], [11000, 20, 'FIXEDPOS']]);
-  context.recordLiveHistory({ name: 'BESTPOS', data: bestpos(7) });
+  context.recordLiveHistory({ name: 'BESTPOS', crcValid: true, data: bestpos(7) });
   assert.equal(context.state.solutionHistory.at(-1).used, 7);
   assert.equal(context.solutionSample({ t: 5, used: 300, type: 'SINGLE' }, 5).used, null, 'counts are bounded');
   assert.equal(context.solutionSample({ status: 'SOL_COMPUTED' }, 5), null, 'samples need a count or a type');

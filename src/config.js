@@ -1,5 +1,9 @@
 'use strict';
 
+const fs = require('node:fs');
+const path = require('node:path');
+const { replaceFileSync } = require('./history');
+
 function integerSetting(name, fallback, minimum, maximum = Number.MAX_SAFE_INTEGER) {
   const raw = process.env[name];
   if (raw === undefined || raw === '') return fallback;
@@ -8,6 +12,60 @@ function integerSetting(name, fallback, minimum, maximum = Number.MAX_SAFE_INTEG
     throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
   }
   return value;
+}
+
+const HISTORY_RETENTION_CEILING = 31 * 24 * 60;
+
+function historyRetentionMinutes() {
+  const name = 'HISTORY_RETENTION_MIN';
+  const raw = process.env[name];
+  if (raw === undefined || raw === '') return 1440;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`${name} must be an integer of at least 1`);
+  }
+  if (value > HISTORY_RETENTION_CEILING) {
+    console.warn(`[config] ${name} ${value} exceeds ${HISTORY_RETENTION_CEILING} minutes (31 days); clamping`);
+    return HISTORY_RETENTION_CEILING;
+  }
+  return value;
+}
+
+function validateConnectionSettings(saved) {
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) throw new Error('connection settings must be an object');
+  const transportMode = saved.transport;
+  if (!['auto', 'tcp', 'serial'].includes(transportMode)) throw new Error('transport must be auto, tcp or serial');
+  const receiverHost = String(saved.receiverHost || '').trim();
+  const receiverPort = Number(saved.receiverPort);
+  const serialPath = String(saved.serialPath || '').trim();
+  const serialBaudRate = Number(saved.serialBaudRate);
+  if (!receiverHost) throw new Error('receiver host is required');
+  if (!Number.isInteger(receiverPort) || receiverPort < 1 || receiverPort > 65535) {
+    throw new Error('receiver port must be an integer from 1 to 65535');
+  }
+  if (!serialPath) throw new Error('serial path is required');
+  if (!Number.isInteger(serialBaudRate) || serialBaudRate < 1) throw new Error('serial baud rate must be an integer of at least 1');
+  return { transport: transportMode, receiverHost, receiverPort, serialPath, serialBaudRate };
+}
+
+function loadConnectionOverrides(file) {
+  if (!file) return null;
+  try {
+    return validateConnectionSettings(JSON.parse(fs.readFileSync(file, 'utf8')));
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    console.warn(`[config] ignoring connection settings ${file}: ${error.message}`);
+    return null;
+  }
+}
+
+function saveConnectionSettings(file, settings) {
+  if (!file) return;
+  const validated = validateConnectionSettings(settings);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(validated));
+  replaceFileSync(file, temporary);
 }
 
 const transport = process.env.NOVATEL_TRANSPORT || 'auto';
@@ -70,12 +128,12 @@ const config = {
   // Long-term history for skyplot traces and the interference timeline.
   // This is the longest window a browser can ask for. 24 h so the newest hours, which reach the NAS
   // archive only hours later, are always covered by live data.
-  historyRetentionMinutes: integerSetting('HISTORY_RETENTION_MIN', 1440, 1),
+  historyRetentionMinutes: historyRetentionMinutes(),
   trackSampleSeconds: integerSetting('TRACK_SAMPLE_SEC', 20, 1),
   maxInterferenceSamples: integerSetting('MAX_IT_SAMPLES', 100000, 1),
   // Set HISTORY_FILE='' to keep history in memory only.
   historyFile: process.env.HISTORY_FILE === undefined
-    ? require('node:path').join(__dirname, '..', 'data', 'history.json')
+    ? path.join(__dirname, '..', 'data', 'history.json')
     : process.env.HISTORY_FILE || null,
   historySaveSeconds: integerSetting('HISTORY_SAVE_SEC', 60, 1),
 
@@ -93,12 +151,19 @@ const config = {
   archiveTimeoutSeconds: integerSetting('ARCHIVE_TIMEOUT_SEC', 20, 1, 600),
   // Per-file summaries so each NAS file is only read once. Set ARCHIVE_CACHE_DIR='' to disable.
   archiveCacheDir: process.env.ARCHIVE_CACHE_DIR === undefined
-    ? require('node:path').join(__dirname, '..', 'data', 'archive-cache')
+    ? path.join(__dirname, '..', 'data', 'archive-cache')
     : process.env.ARCHIVE_CACHE_DIR || null,
   archiveSettingsFile: process.env.ARCHIVE_SETTINGS_FILE === undefined
-    ? require('node:path').join(__dirname, '..', 'data', 'archive-settings.json')
+    ? path.join(__dirname, '..', 'data', 'archive-settings.json')
     : process.env.ARCHIVE_SETTINGS_FILE || null,
+  // Set CONNECTION_SETTINGS_FILE='' to ignore the saved Apply & reconnect choice.
+  connectionSettingsFile: process.env.CONNECTION_SETTINGS_FILE === undefined
+    ? path.join(__dirname, '..', 'data', 'connection-settings.json')
+    : process.env.CONNECTION_SETTINGS_FILE || null,
 };
+
+config.loadConnectionOverrides = loadConnectionOverrides;
+config.saveConnectionSettings = saveConnectionSettings;
 
 if (config.archiveDefaultDays > config.archiveMaxDays) {
   throw new Error('ARCHIVE_DAYS must not exceed ARCHIVE_MAX_DAYS');

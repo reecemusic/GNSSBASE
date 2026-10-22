@@ -8,8 +8,8 @@ const net = require('node:net');
 const { EventEmitter } = require('node:events');
 const { test } = require('node:test');
 const { ReceiverClient } = require('../src/receiver');
-const { History } = require('../src/history');
-const { parseAsciiLog, readBinaryLog, novatelCrc32, decodeItDetectStatusBinary } = require('../src/novatel');
+const { History, MAX_TRACKS, replaceFileSync } = require('../src/history');
+const { parseAsciiLog, readBinaryLog, novatelCrc32, decodeItDetectStatusBinary, scaleFrequencyHz, interpretItDetectStatus } = require('../src/novatel');
 const { decode } = require('../src/messages');
 const code = fs.readFileSync(path.join(__dirname, '..', 'public', 'app.js'), 'utf8');
 
@@ -62,6 +62,8 @@ test('CRC failures and invalid visibility never enter server or browser history'
     { name: 'SATVIS2', crcValid: false, data: { system: 'GPS', satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } },
     { name: 'SATVIS2', crcValid: true, data: { system: 'GPS', visibilityValid: false,
       satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } },
+    { name: 'ITDETECTSTATUS', crcValid: null, data: { detections: [{ signalType: 'L1', powerDbm: -80 }] } },
+    { name: 'BESTPOS', data: { satellitesUsed: 8 } },
   ];
   const calls = [];
   const browser = vm.createContext({
@@ -86,7 +88,7 @@ test('CRC failures and invalid visibility never enter server or browser history'
     serverCode.indexOf('function broadcast(')), context);
   records.forEach((record) => context.processReceiverLog(record));
   assert.deepEqual(calls, []);
-  assert.equal(context.store.rawLog.length, 4, 'bad reports remain available for diagnosis');
+  assert.equal(context.store.rawLog.length, 6, 'bad reports remain available for diagnosis');
   context.processReceiverLog({ name: 'ITDETECTSTATUS', crcValid: true, data: { detections: [] } });
   assert.deepEqual(calls, ['interference'], 'the next valid clear report is retained');
 });
@@ -146,7 +148,9 @@ test('interference banner ages clear reports, errors after five seconds, and rec
   now += 5001;
   context.renderVerdict();
   assert.equal(elements.get('it-verdict').textContent, 'Device status unavailable');
-  context.latestByName.ITDETECTSTATUS = { receivedAt: new Date(now).toISOString(), data: { detections: [] } };
+  context.latestByName.ITDETECTSTATUS = {
+    crcValid: true, receivedAt: new Date(now).toISOString(), data: { detections: [] },
+  };
   context.state.counts.ITDETECTSTATUS = 42;
   context.renderVerdict();
   assert.equal(elements.get('it-banner').className, 'banner clear');
@@ -190,7 +194,7 @@ test('interference banner ages clear reports, errors after five seconds, and rec
   context.renderVerdict();
   assert.equal(elements.get('it-verdict').textContent, 'Jamming detected on L2');
   context.rememberLastDetection({
-    name: 'ITDETECTSTATUS', receivedAt: new Date(now).toISOString(),
+    name: 'ITDETECTSTATUS', crcValid: true, receivedAt: new Date(now).toISOString(),
     data: { detections: [{
       signalType: 'GPSL2', powerDbm: -83.5, bandwidthHz: 2000000, centerFrequencyHz: 1575420000,
     }] },
@@ -623,11 +627,11 @@ test('satellite view history stores tracked and in-view counts and renders a hor
     satellitesInViewBySystem: () => ({ GPS: 2, GALILEO: 1 }),
   });
   load(context, 'function recordSatelliteView(', 'const SATELLITE_VIEW =');
-  context.recordSatelliteView({ name: 'RANGE', receivedAt: new Date(2000).toISOString() });
+  context.recordSatelliteView({ name: 'RANGE', crcValid: true, receivedAt: new Date(2000).toISOString() });
   assert.deepEqual(JSON.parse(JSON.stringify(context.state.satelliteViewHistory[1])), {
     t: 2000, tracked: { GPS: 2 }, inView: { GPS: 2, GALILEO: 1 },
   });
-  context.recordSatelliteView({ name: 'RANGE', receivedAt: new Date(3000).toISOString() });
+  context.recordSatelliteView({ name: 'RANGE', crcValid: true, receivedAt: new Date(3000).toISOString() });
   assert.equal(context.state.satelliteViewHistory.length, 2, 'unchanged counts are thinned');
 
   const chart = { children: [], replaceChildren() { this.children = []; }, append(child) { this.children.push(child); } };
@@ -895,6 +899,7 @@ test('auto transport tries serial first and falls back to TCP when serial does n
   ports[1].isOpen = true;
   ports[1].openCallback(null);
   assert.equal(receiver.state.connected, true);
+  assert.ok(timers.some((timer) => !timer.cleared && timer.ms === 30000), 'serial idle timer is armed after open');
   const probe = timers.filter((timer) => !timer.cleared && timer.ms === 5000).pop();
   probe.callback();
   assert.equal(sockets.length, 2, 'A silent serial port falls back to TCP');
@@ -906,8 +911,11 @@ test('auto transport tries serial first and falls back to TCP when serial does n
   ports[2].isOpen = true;
   ports[2].openCallback(null);
   const healthyProbe = timers.filter((timer) => !timer.cleared && timer.ms === 5000).pop();
-  ports[2].emit('data', Buffer.from('%ITDETECTSTATUSA,2200,1;0\n'));
-  assert(healthyProbe.cleared, 'A decodable log keeps the serial connection');
+  ports[2].emit('data', Buffer.from('%ITDETECTSTATUSA,2200,1;0*00000000\n'));
+  assert.ok(!healthyProbe.cleared, 'A CRC-failed log does not satisfy the serial probe');
+  const probeBody = 'ITDETECTSTATUSA,2200,1;0';
+  ports[2].emit('data', Buffer.from(`%${probeBody}*${novatelCrc32(probeBody).toString(16).padStart(8, '0')}\n`));
+  assert(healthyProbe.cleared, 'A CRC-valid log keeps the serial connection');
   assert.equal(sockets.length, 2);
   assert.equal(receiver.state.transport, 'serial');
   receiver.stop();
@@ -1058,4 +1066,240 @@ test('receiver isolates valid logs, reports connection state and disconnects cle
       for (const socket of sockets) socket.destroy();
     });
   }
+});
+
+test('an implausible binary header does not stall the following ASCII log', () => {
+  const receiver = new ReceiverClient({ idleTimeoutMs: 30000 });
+  const logs = [];
+  receiver.on('log', (message) => logs.push(message));
+  receiver.ingest(Buffer.from([0xaa, 0x44, 0x12, 0x00]));
+  assert.match(receiver.state.lastError, /implausible NovAtel binary header/);
+  assert.ok(receiver.buffer.length < 4);
+  const body = 'BESTPOSA,2200,1.0;SOL_COMPUTED';
+  receiver.ingest(Buffer.from(`#${body}*${novatelCrc32(body).toString(16).padStart(8, '0')}\n`));
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].header.messageName, 'BESTPOS');
+  assert.equal(logs[0].crcValid, true);
+  assert.equal(receiver.state.lastError, null);
+  assert.equal(receiver.buffer.length, 0);
+});
+
+test('frequency scaling keeps MHz centers and does not treat kHz bandwidth as MHz', () => {
+  assert.equal(scaleFrequencyHz(1176.45, 'center'), 1176.45e6);
+  assert.equal(scaleFrequencyHz(1.57542e9, 'center'), 1.57542e9);
+  assert.equal(scaleFrequencyHz(500, 'center'), null);
+  assert.equal(scaleFrequencyHz(3, 'bandwidth'), 3e6);
+  assert.equal(scaleFrequencyHz(20000, 'bandwidth'), 20000);
+  const countFirst = interpretItDetectStatus(parseAsciiLog('#ITDETECTSTATUSA,2200,1.0;1,L5,SPECTRUMANALYSIS,1176.450,3.000,-95.5'));
+  assert.equal(countFirst.detections[0].centerFrequencyHz, 1176.45e6);
+  assert.equal(countFirst.detections[0].bandwidthHz, 3e6);
+  const narrow = interpretItDetectStatus(parseAsciiLog('#ITDETECTSTATUSA,2200,1.0;L1,1,SPECTRUMANALYSIS,1575420000,20000,-90'));
+  assert.equal(narrow.detections[0].bandwidthHz, 20000);
+  assert.equal(narrow.detections[0].centerFrequencyHz, 1575420000);
+});
+
+test('RXSTATUS rejects incomplete words and binary GLONASS channels are signed', () => {
+  assert.throws(() => decode({ format: 'ascii', header: { messageName: 'RXSTATUS' }, fields: ['zz', '0', '00000000'] }), /RXSTATUS/);
+  assert.throws(() => decode({ format: 'ascii', header: { messageName: 'RXSTATUS' }, fields: ['00000000', '0', '12'] }), /RXSTATUS/);
+  assert.throws(() => decode({ format: 'binary', header: { messageName: 'RXSTATUS' }, body: Buffer.alloc(8) }), /incomplete/);
+  const body = Buffer.alloc(4 + 44);
+  body.writeUInt32LE(1, 0);
+  body.writeUInt16LE(12, 4);
+  body.writeUInt16LE(9, 6);
+  body.writeUInt32LE(1 << 16, 4 + 40);
+  const glonass = decode({ format: 'binary', header: { messageName: 'RANGE' }, body });
+  assert.equal(glonass.data.observations[0].system, 'GLONASS');
+  assert.equal(glonass.data.observations[0].gloFrequency, 2);
+  body.writeUInt32LE(0, 4 + 40);
+  const gps = decode({ format: 'binary', header: { messageName: 'RANGE' }, body });
+  assert.equal(gps.data.observations[0].system, 'GPS');
+  assert.equal(gps.data.observations[0].gloFrequency, 9);
+});
+
+test('a decode failure is logged and does not replace the last good record', () => {
+  const warnings = [];
+  const errors = [];
+  const serverCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  const context = vm.createContext({
+    decode(message) {
+      if (message.fail) throw new Error('BESTSATS has an invalid observation count');
+      return message;
+    },
+    store: { latest: { BESTSATS: { name: 'BESTSATS', crcValid: true, data: { kept: true } } }, counts: {}, itdetectHistory: [], satvisBySystem: {}, ephemeris: {}, rawLog: [] },
+    config: { historySize: 50, rawLogSize: 200 },
+    history: { addSolution() {}, addSatellites() {}, addInterference() {} },
+    broadcast() {},
+    console: { warn(message) { warnings.push(message); }, error(message) { errors.push(message); } },
+    receiver: { setError(error) { this.lastError = error.message; } },
+  });
+  vm.runInContext(serverCode.slice(serverCode.indexOf('function processReceiverLog('), serverCode.indexOf('function broadcast(')), context);
+  context.processReceiverLog({ fail: true, header: { messageName: 'BESTSATS' }, raw: '%BESTSATSA;bad', crcValid: true, format: 'ascii' });
+  assert.match(errors[0], /invalid observation count/);
+  assert.equal(context.receiver.lastError, 'BESTSATS has an invalid observation count');
+  assert.equal(context.store.latest.BESTSATS.data.kept, true);
+  assert.match(context.store.rawLog[0].raw, /invalid observation count/);
+  assert.equal(context.store.counts.BESTSATS, 1);
+});
+
+test('history keeps at most 512 satellite tracks and replaces a file after EPERM', () => {
+  assert.equal(MAX_TRACKS, 512);
+  const history = new History({ retentionMs: 3600000, trackSampleMs: 1, maxInterferenceSamples: 10 });
+  const warnings = [];
+  const original = console.warn;
+  console.warn = (message) => warnings.push(message);
+  try {
+    for (let prn = 0; prn < 520; prn++) history.addSatellites('GPS', [{ prn, elevation: 10, azimuth: 10 }], prn);
+  } finally {
+    console.warn = original;
+  }
+  assert.equal(history.tracks.size, 512);
+  assert.equal(warnings.length, 1);
+
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'replace-'));
+  const destination = path.join(dir, 'history.json');
+  const temporary = path.join(dir, 'history.json.tmp');
+  fs.writeFileSync(destination, 'old');
+  fs.writeFileSync(temporary, 'new');
+  const rename = fs.renameSync;
+  let denied = false;
+  fs.renameSync = (from, to) => {
+    if (!denied) {
+      denied = true;
+      const error = new Error('operation not permitted');
+      error.code = 'EPERM';
+      throw error;
+    }
+    return rename(from, to);
+  };
+  try {
+    replaceFileSync(destination, temporary);
+    assert.equal(fs.readFileSync(destination, 'utf8'), 'new');
+  } finally {
+    fs.renameSync = rename;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(denied, true);
+});
+
+test('connection settings round-trip and retention above 31 days is clamped', () => {
+  const config = require('../src/config');
+  const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'connection-'));
+  const file = path.join(dir, 'connection-settings.json');
+  try {
+    const settings = { transport: 'serial', receiverHost: '10.1.1.5', receiverPort: 3001, serialPath: 'COM9', serialBaudRate: 115200 };
+    config.saveConnectionSettings(file, settings);
+    assert.deepEqual(config.loadConnectionOverrides(file), settings);
+    fs.writeFileSync(file, '{');
+    assert.equal(config.loadConnectionOverrides(file), null);
+    assert.equal(config.loadConnectionOverrides(''), null);
+    assert.throws(() => config.saveConnectionSettings(file, { transport: 'nope' }), /transport/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  const { spawnSync } = require('node:child_process');
+  const root = path.join(__dirname, '..');
+  const clamped = spawnSync(process.execPath, ['-e', "process.env.HISTORY_RETENTION_MIN='99999999'; const config = require('./src/config'); if (config.historyRetentionMinutes !== 44640) process.exit(1);"], { cwd: root, encoding: 'utf8' });
+  assert.equal(clamped.status, 0, clamped.stderr);
+  assert.match(clamped.stderr, /clamping/);
+  const invalidPort = spawnSync(process.execPath, ['-e', "process.env.WEB_PORT='999999'; require('./src/config');"], { cwd: root, encoding: 'utf8' });
+  assert.notEqual(invalidPort.status, 0);
+  assert.match(invalidPort.stderr, /WEB_PORT/);
+});
+
+test('missing ephemeris health is unknown, blank height does not throw, and map text is escaped', () => {
+  const health = vm.createContext({});
+  load(health, 'function ephemerisParameters(', 'function buildEphemerisTable(');
+  const data = (pairs) => ({ parameters: pairs.map(([name, value]) => ({ name, value })) });
+  assert.equal(health.ephemerisHealth('GLOEPHEMERIS', data([])), null);
+  assert.equal(health.ephemerisHealth('GLOEPHEMERIS', data([['health', 1]])), true);
+  assert.equal(health.ephemerisHealth('GLOEPHEMERIS', data([['health', 4]])), false);
+  assert.equal(health.ephemerisHealth('GALINAVEPHEMERIS', data([['e1Health', 0]])), null);
+  assert.equal(health.ephemerisHealth('GALFNAVEPHEMERIS', data([])), null);
+  assert.equal(health.ephemerisHealth('NAVICEPHEMERIS', data([['l5Health', 0], ['sHealth', 0]])), null);
+  assert.equal(health.ephemerisHealth('GPSEPHEM', data([])), null);
+  assert.equal(health.ephemerisHealth('GPSEPHEM', data([['health', 0]])), true);
+
+  const elements = new Map();
+  const position = vm.createContext({
+    state: { heightDatum: 'ellipsoidal' },
+    fmt: (value) => (value === null || value === undefined ? '—' : String(value)),
+    heightFor: () => null,
+    explainSolution: () => ({ text: 'ok', quality: null }),
+    QUALITY_LABEL: {},
+    updateMap() {},
+    $: (id) => {
+      if (!elements.has(id)) elements.set(id, { textContent: '', hidden: false, className: '', classList: { toggle() {} } });
+      return elements.get(id);
+    },
+  });
+  load(position, 'function renderBestPos(', 'function escapeHtml(');
+  assert.doesNotThrow(() => position.renderBestPos({
+    data: { solutionStatus: 'SOL_COMPUTED', positionType: 'SINGLE', undulation: 1.5, heightMsl: null },
+  }));
+  assert.match(elements.get('pos-undulation').textContent, /MSL —/);
+
+  let popup = '';
+  let viewed = false;
+  const map = vm.createContext({
+    state: { heightDatum: 'msl' },
+    map: null, marker: null, accuracyCircle: null,
+    fmt: (value) => String(value),
+    heightFor: () => 12.5,
+    requestAnimationFrame(callback) { callback(); },
+    $: (id) => ({ textContent: '', hidden: false, classList: { add() {} }, href: id }),
+    L: {
+      map() { viewed = true; return { setView() { return this; }, invalidateSize() {} }; },
+      tileLayer() { return { addTo() {} }; },
+      marker() { return { addTo() { return this; }, bindPopup(html) { popup = html; } }; },
+      circle() { return { addTo() {} }; },
+    },
+  });
+  load(map, 'function escapeHtml(', 'function renderBestGnssPos(');
+  assert.doesNotThrow(() => map.updateMap({ latitude: 91, longitude: 0, solutionStatus: 'SOL_COMPUTED', positionType: 'SINGLE' }));
+  assert.equal(viewed, false);
+  map.updateMap({ latitude: 51.5, longitude: -0.1, solutionStatus: '<img>', positionType: 'A&B', satellitesUsed: 8 });
+  assert.equal(viewed, true);
+  assert.match(popup, /&lt;img&gt;/);
+  assert.match(popup, /A&amp;B/);
+  assert.doesNotMatch(popup, /<img>/);
+});
+
+test('a silent serial port is recycled without falling straight through to TCP', () => {
+  const ports = [];
+  const timers = [];
+  class FakePort extends EventEmitter {
+    constructor(options) {
+      super();
+      this.options = options;
+      ports.push(this);
+    }
+    open(callback) { this.openCallback = callback; }
+    write() {}
+    close(callback) { this.isOpen = false; if (callback) callback(); }
+  }
+  const context = vm.createContext({
+    Buffer, module: { exports: {} },
+    console: { warn() {}, log() {}, error() {} },
+    setTimeout(callback, ms) { timers.push({ callback, ms, cleared: false }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
+    require: (name) => name === 'serialport' ? { SerialPort: FakePort }
+      : name === 'node:net' ? { createConnection() { throw new Error('TCP should not be opened'); } }
+        : name === './novatel' ? require('../src/novatel') : require(name),
+  });
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
+  const receiver = new context.module.exports.ReceiverClient({
+    transport: 'serial', serialPath: 'COM11', serialBaudRate: 9600, serialProbeMs: 5000,
+    receiverHost: '20.20.20.50', receiverPort: 3001, reconnectDelayMs: 3000, idleTimeoutMs: 30000,
+  });
+  receiver.start();
+  ports[0].isOpen = true;
+  ports[0].openCallback(null);
+  const idle = timers.filter((timer) => !timer.cleared && timer.ms === 30000).pop();
+  idle.callback();
+  assert.match(receiver.state.lastError, /No data received for 30000 ms/);
+  assert.equal(receiver.state.connected, false);
+  assert.equal(receiver.port, null);
+  assert.ok(timers.some((timer) => !timer.cleared && timer.ms === 3000));
+  assert.equal(ports.length, 1);
+  receiver.stop();
 });

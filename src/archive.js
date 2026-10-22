@@ -10,7 +10,7 @@ const {
   parseAsciiLog, interpretItDetectStatus, decodeItDetectStatusBinary, novatelCrc32Buffer, gpsToMs,
 } = require('./novatel');
 const { decode } = require('./messages');
-const { solutionSample } = require('./history');
+const { solutionSample, replaceFile } = require('./history');
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -193,12 +193,33 @@ class FileSummary {
 
 /**
  * Incremental scanner for NovAtel log files. Only ITDETECTSTATUS, BESTPOS and BESTSATS are
- * decoded; every other binary frame is skipped by its length
- * without CRC work, so large RANGE/ephemeris traffic costs very little.
+ * decoded. Every other binary frame is skipped by its declared length only when the
+ * following byte is a log boundary, without CRC work, so large RANGE/ephemeris
+ * traffic costs very little.
  */
+/** True when `index` begins a log, false when it does not, null when more bytes are required to decide. */
+function frameBoundary(buf, index) {
+  if (index >= buf.length) return null;
+  const byte = buf[index];
+  if (byte === 0x23 || byte === 0x3c) return true;
+  if (byte !== 0xaa) return false;
+  if (index + 2 >= buf.length) return null;
+  return buf[index + 1] === 0x44 && (buf[index + 2] === 0x12 || buf[index + 2] === 0x13);
+}
+
+function summaryUsable(summary) {
+  if (!summary) return false;
+  const finiteEnds = (samples) => Array.isArray(samples)
+    && samples.every((sample) => sample && Number.isFinite(sample.t) && Number.isFinite(sample.end));
+  return Array.isArray(summary.coverage)
+    && Array.isArray(summary.samples)
+    && summary.samples.every((sample) => sample && Number.isFinite(sample.t))
+    && finiteEnds(summary.solution)
+    && finiteEnds(summary.bestsats);
+}
+
 function createItDetectScanner(summary) {
   let carry = null;
-  let skip = 0;
 
   function handleBinary(buf, start, total) {
     if ((buf[start + 6] & 0x1f) !== 0) return; // secondary antenna (ITDETECTSTATUS_1)
@@ -284,15 +305,7 @@ function createItDetectScanner(summary) {
   }
 
   function push(input) {
-    let chunk = input;
-    if (skip) {
-      if (chunk.length <= skip) {
-        skip -= chunk.length;
-        return;
-      }
-      chunk = chunk.subarray(skip);
-      skip = 0;
-    }
+    const chunk = input;
     const buf = carry ? Buffer.concat([carry, chunk]) : chunk;
     carry = null;
     let i = 0;
@@ -356,11 +369,16 @@ function createItDetectScanner(summary) {
       }
       const messageId = buf.readUInt16LE(sync + 4);
       if (messageId !== IT_MESSAGE_ID && messageId !== BESTPOS_MESSAGE_ID && messageId !== BESTSATS_MESSAGE_ID) {
-        if (sync + total > buf.length) {
-          skip = sync + total - buf.length;
+        if (sync + total >= buf.length) {
+          carry = Buffer.from(buf.subarray(sync));
           return;
         }
-        i = sync + total;
+        const boundary = frameBoundary(buf, sync + total);
+        if (boundary === null) {
+          carry = Buffer.from(buf.subarray(sync));
+          return;
+        }
+        i = boundary ? sync + total : sync + 1;
         continue;
       }
       if (sync + total > buf.length) {
@@ -443,6 +461,8 @@ class InterferenceArchive extends EventEmitter {
       // A NAS that stops answering must never wedge loading: fs calls and stalled reads are abandoned.
       fsTimeoutMs: 20000,
       stallTimeoutMs: 120000,
+      // A call that never settles must not block later loads forever. The OS request is not cancelled.
+      hungResetMs: 10 * 60 * 1000,
       now: () => Date.now(),
       ...options,
     };
@@ -730,8 +750,8 @@ class InterferenceArchive extends EventEmitter {
   /** Bounds a NAS call; a call that times out is still counted until it finally settles. */
   async withTimeout(promise, label) {
     this.pendingFs++;
-    const settled = () => { this.pendingFs--; };
-    Promise.resolve(promise).then(settled, settled);
+    const release = this.armCounterReset('pendingFs', `${label} stayed open and was marked finished so archive loading can continue`);
+    Promise.resolve(promise).then(release, release);
     let timer;
     let timedOut = false;
     const timeout = new Promise((resolve, reject) => {
@@ -750,8 +770,29 @@ class InterferenceArchive extends EventEmitter {
 
   trackHung(promise) {
     this.hung++;
-    const done = () => { this.hung--; };
-    Promise.resolve(promise).then(done, done);
+    const release = this.armCounterReset('hung', 'A network folder request stayed open and was marked finished so archive loading can continue');
+    Promise.resolve(promise).then(release, release);
+  }
+
+  /** Decrements `counter` once, either when `release` runs or after hungResetMs if the call never settles. */
+  armCounterReset(counter, message) {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      this[counter]--;
+      console.warn(`[archive] ${message}; the original call may still be in flight`);
+      this.addError(message);
+      this.autoState.lastError = message;
+      this.update({}, true);
+    }, this.options.hungResetMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    return () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      this[counter]--;
+    };
   }
 
   stopStream() {
@@ -782,13 +823,27 @@ class InterferenceArchive extends EventEmitter {
       this.update({ currentFile: file.path, bytesDone: bytesBefore });
       let summary = await this.readCache(file);
       if (generation !== this.generation) return;
+      if (summary && !summaryUsable(summary)) {
+        console.warn(`[archive] discarding unusable cache for ${file.path}`);
+        await this.deleteCache(file);
+        if (generation !== this.generation) return;
+        this.addError(`${path.basename(file.path)}: cached summary was unusable and will be rescanned`);
+        summary = null;
+      }
       const cached = Boolean(summary);
       try {
         if (!summary) {
           summary = await this.scanFile(file, generation, bytesBefore);
           if (!summary || generation !== this.generation) return;
-          await this.writeCache(file, summary);
+          if (!summaryUsable(summary)) {
+            this.addError(`${path.basename(file.path)}: scan produced an unusable summary`);
+            summary = null;
+          } else {
+            await this.writeCache(file, summary);
+          }
         }
+        if (generation !== this.generation) return;
+        if (summary) this.addSummary(summary, from, to);
       } catch (error) {
         if (generation !== this.generation) return;
         if (error.fatal || NETWORK_ERRORS.has(error.code)) {
@@ -797,8 +852,6 @@ class InterferenceArchive extends EventEmitter {
         this.addError(`${path.basename(file.path)}: ${error.message}`);
         summary = null;
       }
-      if (generation !== this.generation) return;
-      if (summary) this.addSummary(summary, from, to);
       bytesBefore += file.size;
       this.update({
         filesDone: this.state.filesDone + 1,
@@ -918,7 +971,7 @@ class InterferenceArchive extends EventEmitter {
       abandon(fatalError(`no data received for ${Math.round(this.options.stallTimeoutMs / 1000)} s`));
       this.stopStream();
     }, Math.max(10, Math.min(5000, this.options.stallTimeoutMs / 4)));
-    const read = async () => {
+    const reading = (async () => {
       for await (const chunk of stream) {
         if (generation !== this.generation) return null;
         lastDataAt = Date.now();
@@ -929,9 +982,24 @@ class InterferenceArchive extends EventEmitter {
       if (generation !== this.generation) return null;
       scanner.end();
       return summary.toJSON();
-    };
+    })();
+    let winner = null;
+    reading.catch((error) => {
+      queueMicrotask(() => {
+        if (winner === 'read') return;
+        const code = error && error.code;
+        if (code === 'ERR_STREAM_PREMATURE_CLOSE' || code === 'ERR_STREAM_DESTROYED') return;
+        console.warn(`[archive] scan read settled after it was abandoned: ${error && error.message ? error.message : error}`);
+      });
+    });
     try {
-      return await Promise.race([read(), abandoned]);
+      const outcome = await Promise.race([
+        reading.then((value) => ({ source: 'read', value }), (error) => ({ source: 'read', error })),
+        abandoned.then((value) => ({ source: 'abandon', value }), (error) => ({ source: 'abandon', error })),
+      ]);
+      winner = outcome.source;
+      if (outcome.error) throw outcome.error;
+      return outcome.value;
     } catch (error) {
       if (generation !== this.generation) return null;
       throw error;
@@ -974,11 +1042,22 @@ class InterferenceArchive extends EventEmitter {
       const payload = await gzip(JSON.stringify({
         version: CACHE_VERSION, path: file.path, size: file.size, mtimeMs: file.mtimeMs, ...summary,
       }));
-      const temporary = `${cachePath}.${process.pid}.tmp`;
+      const temporary = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
       await fs.promises.writeFile(temporary, payload);
-      await fs.promises.rename(temporary, cachePath);
+      await replaceFile(cachePath, temporary);
     } catch (error) {
       console.warn(`[archive] could not cache ${file.path}: ${error.message}`);
+      this.addError(`${path.basename(file.path)}: could not write archive cache (${error.message})`);
+    }
+  }
+
+  async deleteCache(file) {
+    const cachePath = this.cachePath(file);
+    if (!cachePath) return;
+    try {
+      await fs.promises.unlink(cachePath);
+    } catch (error) {
+      if (error.code !== 'ENOENT') console.warn(`[archive] could not delete cache for ${file.path}: ${error.message}`);
     }
   }
 

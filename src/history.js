@@ -3,6 +3,35 @@
 const fs = require('node:fs');
 const path = require('node:path');
 
+const MAX_TRACKS = 512;
+let temporarySerial = 0;
+
+function temporaryPath(filePath) {
+  temporarySerial += 1;
+  return `${filePath}.${process.pid}.${Date.now()}.${temporarySerial}.tmp`;
+}
+
+/** Replaces `destination`. On Windows, rename over an existing file throws EPERM or EEXIST. */
+function replaceFileSync(destination, temporary) {
+  try {
+    fs.renameSync(temporary, destination);
+  } catch (error) {
+    if (error.code !== 'EPERM' && error.code !== 'EEXIST') throw error;
+    fs.rmSync(destination, { force: true });
+    fs.renameSync(temporary, destination);
+  }
+}
+
+async function replaceFile(destination, temporary) {
+  try {
+    await fs.promises.rename(temporary, destination);
+  } catch (error) {
+    if (error.code !== 'EPERM' && error.code !== 'EEXIST') throw error;
+    await fs.promises.rm(destination, { force: true });
+    await fs.promises.rename(temporary, destination);
+  }
+}
+
 /**
  * Time-bounded history of satellite positions and interference detections.
  *
@@ -19,6 +48,8 @@ class History {
     this.tracks = new Map();
     this.interference = [];
     this.solution = [];
+    this.trackCapWarned = false;
+    this._saveChain = Promise.resolve();
   }
 
   /**
@@ -42,6 +73,13 @@ class History {
       if (!isValidSkyPosition(sat.elevation, sat.azimuth)) continue;
 
       const key = `${system}:${sat.prn}`;
+      if (!this.tracks.has(key) && this.tracks.size >= MAX_TRACKS) {
+        if (!this.trackCapWarned) {
+          this.trackCapWarned = true;
+          console.warn(`[history] satellite track cap of ${MAX_TRACKS} reached; further satellites are not stored`);
+        }
+        continue;
+      }
       const samples = this.tracks.get(key) || [];
       const last = samples[samples.length - 1];
       if (last && timestamp - last.t < this.trackSampleMs) continue;
@@ -113,22 +151,51 @@ class History {
     };
   }
 
+  serialize() {
+    this.prune();
+    return JSON.stringify({
+      version: 1,
+      satvisFieldLayout: 2,
+      savedAt: Date.now(),
+      tracks: Object.fromEntries(this.tracks),
+      interference: this.interference,
+      solution: this.solution,
+    });
+  }
+
+  /** Periodic save. Stringify failures are reported before the first await so a timer cannot reject. */
   save() {
+    if (!this.filePath) return Promise.resolve();
+    let payload;
+    try {
+      payload = this.serialize();
+    } catch (err) {
+      console.warn(`[history] could not save: ${err.message}`);
+      return Promise.resolve();
+    }
+    const write = this._saveChain.then(() => this.writePayload(payload)).catch((err) => {
+      console.warn(`[history] could not save: ${err.message}`);
+    });
+    this._saveChain = write.then(() => {}, () => {});
+    return write;
+  }
+
+  async writePayload(payload) {
+    await fs.promises.mkdir(path.dirname(this.filePath), { recursive: true });
+    const temporary = temporaryPath(this.filePath);
+    await fs.promises.writeFile(temporary, payload);
+    await replaceFile(this.filePath, temporary);
+  }
+
+  /** Shutdown flush. Must finish before the process exits. */
+  saveSync() {
     if (!this.filePath) return;
     try {
-      this.prune();
-      const payload = JSON.stringify({
-        version: 1,
-        satvisFieldLayout: 2,
-        savedAt: Date.now(),
-        tracks: Object.fromEntries(this.tracks),
-        interference: this.interference,
-        solution: this.solution,
-      });
+      const payload = this.serialize();
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
-      const temporary = `${this.filePath}.tmp`;
+      const temporary = temporaryPath(this.filePath);
       fs.writeFileSync(temporary, payload);
-      fs.renameSync(temporary, this.filePath);
+      replaceFileSync(this.filePath, temporary);
     } catch (err) {
       console.warn(`[history] could not save: ${err.message}`);
     }
@@ -220,4 +287,6 @@ function isValidSkyPosition(elevation, azimuth) {
     && Number.isFinite(azimuth) && azimuth >= 0 && azimuth < 360;
 }
 
-module.exports = { History, SOLUTION_HEARTBEAT_MS, solutionSample };
+module.exports = {
+  History, SOLUTION_HEARTBEAT_MS, solutionSample, MAX_TRACKS, replaceFile, replaceFileSync,
+};
