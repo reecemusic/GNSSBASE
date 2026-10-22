@@ -41,7 +41,7 @@ test('profile-managed TCP connections request usage and interference reports eve
     Buffer, clearTimeout, setTimeout, module: { exports: {} },
     require: (name) => name === 'node:net'
       ? { createConnection: () => socket }
-      : name === './novatel' ? require('../src/novatel') : require(name),
+      : name === './novatel' ? require('../src/novatel') : name === './loglimit' ? require('../src/loglimit') : require(name),
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/receiver.js'), 'utf8'), context);
   const receiver = new context.module.exports.ReceiverClient({
@@ -93,7 +93,7 @@ test('receiver phases track connecting, connected, retrying and manual disconnec
         socket.destroy = () => { socket.destroyed = true; };
         return socket;
       },
-    } : name === './novatel' ? require('../src/novatel') : require(name),
+    } : name === './novatel' ? require('../src/novatel') : name === './loglimit' ? require('../src/loglimit') : require(name),
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/receiver.js'), 'utf8'), context);
   const receiver = new context.module.exports.ReceiverClient({

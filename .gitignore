@@ -2,3 +2,7 @@ node_modules/
 data/archive-cache/
 data/archive-settings.json
 data/*.tmp
+# Live history on the PC. A git pull must not replace it with the copy that used to be committed.
+data/history.json
+data/history.json.bak
+data/history.json.corrupt-*

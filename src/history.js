@@ -1,8 +1,11 @@
 /**
  * Bounded history of satellite tracks, interference reports, and solution heartbeats.
  * Samples older than the retention window are dropped. Saves write a temp file and
- * rename it into place, keeping the previous file as .bak. A file that fails the
- * size, JSON, or version check is never overwritten.
+ * rename it into place, keeping the previous file as .bak. The temp file is fsynced,
+ * and the directory is fsynced when the OS allows it, before that rename. A file
+ * that fails the size, JSON, or version check is not overwritten while it is the
+ * only copy. An empty or all-zero file is recoverable. A corrupt file with a
+ * readable .bak is moved aside and saving resumes from that backup.
  */
 'use strict';
 
@@ -11,6 +14,14 @@ const path = require('node:path');
 
 /** Upper bound on satellite track keys. New satellites past this are not stored. */
 const MAX_TRACKS = 512;
+/**
+ * Same cap as the archive (src/archive.js MAX_DETECTIONS_PER_SAMPLE). A live sample
+ * keeps the first 32 detections. count and maxPower still describe the full list,
+ * so a chart can show "40 detections" while the file cannot grow without bound.
+ */
+const MAX_DETECTIONS_PER_SAMPLE = 32;
+/** readStored rejects a larger file. payloadForSave downsamples until the JSON fits. */
+const HISTORY_LOAD_LIMIT = 64 * 1024 * 1024;
 /** Separates temp names created in the same process and millisecond. */
 let temporarySerial = 0;
 
@@ -170,18 +181,110 @@ async function restoreBackup(backup, destination) {
 }
 
 /**
+ * Flushes a temp file's bytes before it is renamed into place.
+ * A rename alone does not push the data to disk. A power cut can then leave
+ * history.json as a zero-length or all-zero file, which used to disable saves.
+ * @param {string} filePath Temp file that already holds the new bytes.
+ * @returns {Promise<void>}
+ * Side effects: opens, fsyncs, and closes the file. Throws when open or fsync throws.
+ * @emits none
+ */
+async function fsyncFile(filePath) {
+  const handle = await fs.promises.open(filePath, 'r+');
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Synchronous form of fsyncFile, used by saveSync.
+ * @param {string} filePath Temp file that already holds the new bytes.
+ * @returns {void}
+ * Side effects: openSync, fsyncSync, closeSync. Throws when those throw.
+ * @emits none
+ */
+function fsyncFileSync(filePath) {
+  const fd = fs.openSync(filePath, 'r+');
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Best-effort flush of the directory entry that names the history file.
+ * After the temp file is fsynced, the rename still has to be recorded in the
+ * directory. Windows and some filesystems throw on a directory fsync, so any
+ * error is ignored. The file fsync has already happened.
+ * @param {string} directory Parent directory of the history file.
+ * @returns {Promise<void>}
+ * Side effects: may open and fsync the directory. Swallows errors, including close errors.
+ * @emits none
+ */
+async function fsyncDirectory(directory) {
+  let handle;
+  try {
+    handle = await fs.promises.open(directory, 'r');
+    await handle.sync();
+  } catch {
+    // Directory fsync is not supported on every operating system.
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+/**
+ * Synchronous form of fsyncDirectory. Failures are ignored.
+ * @param {string} directory Parent directory of the history file.
+ * @returns {void}
+ * Side effects: may open and fsync the directory. Swallows errors.
+ * @emits none
+ */
+function fsyncDirectorySync(directory) {
+  let fd;
+  try {
+    fd = fs.openSync(directory, 'r');
+    fs.fsyncSync(fd);
+  } catch {
+    // Directory fsync is not supported on every operating system.
+  } finally {
+    if (fd !== undefined) {
+      try { fs.closeSync(fd); } catch { /* the data fsync already finished */ }
+    }
+  }
+}
+
+/**
+ * True when the file has no JSON in it: zero bytes, or only NULs and whitespace.
+ * A power cut during rename often leaves exactly that. It is not treated as a
+ * corrupt document that must be preserved.
+ * @param {string} text File body. An empty string is empty.
+ * @returns {boolean}
+ * Side effects: none.
+ * @emits none
+ */
+function isBlankHistory(text) {
+  return text.length === 0 || /^[\0\s]*$/.test(text);
+}
+
+/**
  * Time-bounded history of satellite positions, interference detections, and solution heartbeats.
  * prune() drops samples older than retentionMs. Tracks are also thinned to one sample
  * per trackSampleMs per satellite, and new track keys stop at MAX_TRACKS.
- * A file that fails the size, JSON, or version check disables saves so it is not overwritten.
+ * A file that fails the size, JSON, or version check disables saves when it is the
+ * only copy. An empty file, or a corrupt file with a good .bak, does not.
  */
 class History {
   /**
    * Stores the limits and starts with empty samples. Does not read the file; call load().
-   * @param {object} options retentionMs, trackSampleMs, maxInterferenceSamples, and filePath.
+   * @param {object} options retentionMs, trackSampleMs, maxInterferenceSamples, filePath,
+   *   and optional maxFileBytes (defaults to HISTORY_LOAD_LIMIT, 64 MiB).
    * @returns {void}
    * Side effects: none beyond own properties. readState starts 'unread', savesDisabled is
-   *   false, _saveGeneration is 0, and _saveChain is an already fulfilled promise.
+   *   false, dirty is false, _saveGeneration is 0, and _saveChain is an already fulfilled promise.
    * @emits none
    */
   constructor(options) {
@@ -189,17 +292,39 @@ class History {
     this.trackSampleMs = options.trackSampleMs;
     this.maxInterferenceSamples = options.maxInterferenceSamples;
     this.filePath = options.filePath;
+    // Anything this object writes must pass readStored. Tests pass a smaller budget.
+    this.maxFileBytes = Number.isInteger(options.maxFileBytes) && options.maxFileBytes > 0
+      ? options.maxFileBytes
+      : HISTORY_LOAD_LIMIT;
     this.tracks = new Map();
     this.interference = [];
     this.solution = [];
+    // Last kept interference sample per signal, so unchanged reports can be thinned.
+    this.lastInterference = new Map();
     this.trackCapWarned = false;
     this.savesDisabled = false;
     this.saveSkipLogged = false;
     this.readState = 'unread';
     this.recheckMissing = false;
     this.retrySkipLogged = false;
+    this.dirty = false;
+    this._dirtyStamp = 0;
+    this._saveQueued = false;
     this._saveGeneration = 0;
     this._saveChain = Promise.resolve();
+  }
+
+  /**
+   * Marks memory as needing a disk write.
+   * The stamp lets a save that is already encoding ignore mutations that happened
+   * before it snapshotted, and keep dirty set when a sample arrives during the write.
+   * @returns {void}
+   * Side effects: sets dirty and increments _dirtyStamp. No I/O.
+   * @emits none
+   */
+  markDirty() {
+    this.dirty = true;
+    this._dirtyStamp += 1;
   }
 
   /**
@@ -218,9 +343,12 @@ class History {
     if (!sample) return;
     const last = this.solution[this.solution.length - 1];
     // Same fix inside the 10 second heartbeat: keep the sample already stored.
-    if (last && timestamp - last.t < SOLUTION_HEARTBEAT_MS && last.used === sample.used
+    // A backwards clock step (timestamp < last.t) is stored. timestamp - last.t would
+    // stay negative and the comparison with SOLUTION_HEARTBEAT_MS would never pass.
+    if (last && timestamp >= last.t && timestamp - last.t < SOLUTION_HEARTBEAT_MS && last.used === sample.used
       && last.tracked === sample.tracked && last.status === sample.status && last.type === sample.type) return;
     this.solution.push(sample);
+    this.markDirty();
     if (this.solution.length > this.maxInterferenceSamples) {
       this.solution.splice(0, this.solution.length - this.maxInterferenceSamples);
     }
@@ -254,10 +382,13 @@ class History {
       const samples = this.tracks.get(key) || [];
       const last = samples[samples.length - 1];
       // This satellite already has a sample within trackSampleMs, so the new one is skipped.
-      if (last && timestamp - last.t < this.trackSampleMs) continue;
+      // A backwards clock step (timestamp < last.t) is kept. Otherwise t - last.t stays
+      // negative, the gap test stays true, and the track freezes until time catches up.
+      if (last && timestamp >= last.t && timestamp - last.t < this.trackSampleMs) continue;
 
       samples.push({ t: timestamp, el: round(sat.elevation, 2), az: round(sat.azimuth, 2) });
       this.tracks.set(key, samples);
+      this.markDirty();
     }
   }
 
@@ -267,31 +398,47 @@ class History {
    * @param {object[]} detections Items with powerDbm, centerFrequencyHz, bandwidthHz, and type.
    * @param {number} [timestamp=Date.now()] Sample time in milliseconds.
    * @returns {void}
-   * Side effects: pushes a sample and drops from the front past maxInterferenceSamples.
-   *   maxPower is the largest finite powerDbm, or null. The sample freq is the first
-   *   detection's finite center frequency, or null. Each detection is copied down to
-   *   freq, bandwidth, power, and type. No I/O.
+   * Side effects: may push a sample and drop from the front past maxInterferenceSamples.
+   *   An unchanged sample for the same signal inside SOLUTION_HEARTBEAT_MS (10 s) is
+   *   skipped, same as a solution heartbeat, so a full day of steady interference
+   *   stays inside maxInterferenceSamples. A backwards clock step is stored.
+   *   maxPower is the largest finite powerDbm of the full list, or null. count is
+   *   the full list length. At most MAX_DETECTIONS_PER_SAMPLE (32) detections are
+   *   copied, matching the archive. The sample freq is the first detection's finite
+   *   center frequency, or null. No I/O.
    * @emits none
    */
   addInterference(signalType, detections, timestamp = Date.now()) {
-    const powers = detections.map((d) => d.powerDbm).filter(Number.isFinite);
+    const list = Array.isArray(detections) ? detections : [];
+    const powers = list.map((d) => d.powerDbm).filter(Number.isFinite);
+    const stored = list.slice(0, MAX_DETECTIONS_PER_SAMPLE).map((detection) => ({
+      freq: Number.isFinite(detection.centerFrequencyHz) ? detection.centerFrequencyHz : null,
+      bandwidth: Number.isFinite(detection.bandwidthHz) ? detection.bandwidthHz : null,
+      power: Number.isFinite(detection.powerDbm) ? detection.powerDbm : null,
+      type: detection.type || '',
+    }));
+    const count = list.length;
+    const maxPower = powers.length ? Math.max(...powers) : null;
+    const fingerprint = detectionFingerprint(stored);
+    const last = this.lastInterference.get(signalType);
+    // Unchanged report inside the 10 second heartbeat: keep the sample already stored.
+    // timestamp < last.t is a backwards clock step and is stored, not skipped.
+    if (last && timestamp >= last.t && timestamp - last.t < SOLUTION_HEARTBEAT_MS
+      && last.count === count && last.maxPower === maxPower && last.fingerprint === fingerprint) return;
     this.interference.push({
       t: timestamp,
       signal: signalType,
-      count: detections.length,
-      maxPower: powers.length ? Math.max(...powers) : null,
-      freq: detections.length && Number.isFinite(detections[0].centerFrequencyHz)
-        ? detections[0].centerFrequencyHz
-        : null,
-      detections: detections.map((detection) => ({
-        freq: Number.isFinite(detection.centerFrequencyHz) ? detection.centerFrequencyHz : null,
-        bandwidth: Number.isFinite(detection.bandwidthHz) ? detection.bandwidthHz : null,
-        power: Number.isFinite(detection.powerDbm) ? detection.powerDbm : null,
-        type: detection.type || '',
-      })),
+      count,
+      maxPower,
+      freq: stored.length && Number.isFinite(stored[0].freq) ? stored[0].freq : null,
+      detections: stored,
     });
+    this.lastInterference.set(signalType, { t: timestamp, count, maxPower, fingerprint });
+    this.markDirty();
+    // A short burst keeps the newest samples. A long run is bucketed so the
+    // start of the day is not thrown away once the cap is reached.
     if (this.interference.length > this.maxInterferenceSamples) {
-      this.interference.splice(0, this.interference.length - this.maxInterferenceSamples);
+      this.interference = capInterference(this.interference, this.maxInterferenceSamples);
     }
   }
 
@@ -301,8 +448,9 @@ class History {
    * @returns {void}
    * Side effects: mutates tracks, interference, and solution. A track whose value is not
    *   an array is deleted and logged. Tracks with nothing left are deleted. interference
-   *   and solution are also sliced to the last maxInterferenceSamples. Those two lists
-   *   are not tested as sky positions. No file I/O.
+   *   and solution are reduced to maxInterferenceSamples with the same bucket rule as
+   *   since(), so a 24 h span is kept instead of dropping the oldest hours. Those two
+   *   lists are not tested as sky positions. No file I/O.
    * @emits none
    */
   prune(now = Date.now()) {
@@ -319,12 +467,13 @@ class History {
       if (kept.length) this.tracks.set(key, kept);
       else this.tracks.delete(key);
     }
-    // Interference and solution lose aged samples only. They are not sky positions.
-    this.interference = this.interference.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff)
-      .slice(-this.maxInterferenceSamples);
-    this.solution = (Array.isArray(this.solution) ? this.solution : [])
-      .filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff)
-      .slice(-this.maxInterferenceSamples);
+    // Aged samples go. What remains is bucketed down to the cap instead of keeping
+    // only the newest tail, which used to turn a 24 h window into 9–14 h.
+    const keptInterference = this.interference.filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff);
+    this.interference = capInterference(keptInterference, this.maxInterferenceSamples);
+    const keptSolution = (Array.isArray(this.solution) ? this.solution : [])
+      .filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff);
+    this.solution = reduceLatest(keptSolution, this.maxInterferenceSamples);
   }
 
   /**
@@ -374,30 +523,129 @@ class History {
   }
 
   /**
-   * Periodic save. Snapshots JSON, then increments _saveGeneration and chains writePayload.
-   * Stringify failures are reported before the first await so a timer cannot reject.
-   * @returns {Promise<void>} Fulfilled when readyToSave is false, when serialize throws,
+   * JSON for one save, downsampled until it is within maxFileBytes.
+   * readStored rejects a file over HISTORY_LOAD_LIMIT (64 MiB). A save that
+   * exceeded that limit used to disable saving on the next start. Oldest
+   * interference and solution samples are bucketed, then track points, until
+   * the document fits. The caller writes this string or skips the save.
+   * @returns {string|null} Null when the document still does not fit. That is logged.
+   * Side effects: prune via serialize, then shrinkForBudget may drop samples. console.warn
+   *   when the result is still over the limit. JSON.stringify can throw.
+   * @emits none
+   */
+  payloadForSave() {
+    let payload = this.serialize();
+    const limit = this.maxFileBytes;
+    // Each pass halves the largest list. Forty passes is enough to empty every list.
+    for (let guard = 0; Buffer.byteLength(payload) > limit && guard < 40; guard++) {
+      if (!this.shrinkForBudget()) break;
+      payload = JSON.stringify({
+        version: 1,
+        satvisFieldLayout: 2,
+        savedAt: Date.now(),
+        tracks: Object.fromEntries(this.tracks),
+        interference: this.interference,
+        solution: this.solution,
+      });
+    }
+    if (Buffer.byteLength(payload) > limit) {
+      console.warn(`[history] ${this.filePath} is still over the ${limit} byte load limit after downsampling; this save was skipped`);
+      return null;
+    }
+    return payload;
+  }
+
+  /**
+   * Drops about half of the largest stored series so the next JSON is smaller.
+   * Interference is reduced first, then solution, then the longest satellite track,
+   * then the last interference or solution sample. An empty history returns false.
+   * @returns {boolean} True when something was removed.
+   * Side effects: mutates interference, solution, or tracks. No I/O.
+   * @emits none
+   */
+  shrinkForBudget() {
+    if (this.interference.length > 1) {
+      this.interference = reduceInterference(this.interference, Math.max(1, Math.floor(this.interference.length / 2)));
+      return true;
+    }
+    if (this.solution.length > 1) {
+      this.solution = reduceLatest(this.solution, Math.max(1, Math.floor(this.solution.length / 2)));
+      return true;
+    }
+    let longestKey = null;
+    let longest = 1;
+    for (const [key, samples] of this.tracks) {
+      if (Array.isArray(samples) && samples.length > longest) {
+        longest = samples.length;
+        longestKey = key;
+      }
+    }
+    if (longestKey) {
+      const samples = this.tracks.get(longestKey);
+      // Drop the older half. One point is removed when the track has two points.
+      samples.splice(0, Math.max(1, Math.ceil(samples.length / 2)));
+      if (samples.length) this.tracks.set(longestKey, samples);
+      else this.tracks.delete(longestKey);
+      return true;
+    }
+    if (this.interference.length === 1) {
+      const sample = this.interference[0];
+      if (sample && Array.isArray(sample.detections) && sample.detections.length > 1) {
+        sample.detections = sample.detections.slice(0, Math.floor(sample.detections.length / 2));
+        return true;
+      }
+      this.interference = [];
+      return true;
+    }
+    if (this.solution.length === 1) {
+      this.solution = [];
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Periodic save. Skips the disk when nothing changed since the last successful write.
+   * Encodes JSON when the write starts, not when save() is called, and does not queue
+   * a second copy while one write is in flight. A later flush() or save() still sees dirty.
+   * @returns {Promise<void>} Fulfilled when there is nothing to write, when encoding throws,
    *   and when the chained write fails. Those failures are logged. The returned promise
    *   does not reject.
-   * Side effects: may load() through readyToSave. Increments _saveGeneration. Appends
-   *   writePayload to _saveChain. The chain itself swallows rejection. console.warn on failure.
+   * Side effects: may load() through readyToSave. payloadForSave runs before the first
+   *   await when a write is not already queued. Increments _saveGeneration once per
+   *   queued write. Appends writePayload to _saveChain. The chain itself swallows rejection.
+   *   console.warn on failure. A second save() while a write is queued does not encode.
    * @emits none
    */
   save() {
     if (!this.readyToSave()) return Promise.resolve();
+    // The interval calls this even when the receiver has been quiet. Do not rewrite the file.
+    if (!this.dirty) return Promise.resolve();
+    // One encode and one temp file at a time. A save that arrives while a write is
+    // in flight does not build a second JSON string; dirty stays set for the next one.
+    if (this._saveQueued) return this._saveChain;
     let payload;
     try {
-      // Snapshot the JSON first. The generation increment below belongs to this payload.
-      payload = this.serialize();
+      // Encode when this write starts, before the first await, so a circular
+      // sample warns here instead of rejecting the timer.
+      payload = this.payloadForSave();
     } catch (err) {
       console.warn(`[history] could not save: ${err.message}`);
       return Promise.resolve();
     }
+    if (!payload) return Promise.resolve();
+    const stamp = this._dirtyStamp;
+    this._saveQueued = true;
     // writePayload no-ops once flush() or a later save moves _saveGeneration.
     const generation = ++this._saveGeneration;
     // The catch logs a write failure and fulfills. The chain ignores both outcomes so the next save still runs.
-    const write = this._saveChain.then(() => this.writePayload(payload, generation)).catch((err) => {
+    const write = this._saveChain.then(() => this.writePayload(payload, generation)).then(() => {
+      // A sample that arrived while the bytes were being written must not be forgotten.
+      if (this.currentSave(generation) && this._dirtyStamp === stamp) this.dirty = false;
+    }).catch((err) => {
       console.warn(`[history] could not save: ${err.message}`);
+    }).finally(() => {
+      this._saveQueued = false;
     });
     this._saveChain = write.then(() => {}, () => {});
     return write;
@@ -409,9 +657,10 @@ class History {
    * @param {number} generation _saveGeneration at the time save() took the snapshot.
    * @returns {Promise<void>}
    * Side effects: no-op when generation !== _saveGeneration or savesDisabled.
-   *   Otherwise mkdir, write a temp file, and replaceFileSync (the rename is synchronous).
-   *   A generation change after the temp write deletes the temp and returns.
-   *   A failed replace removes the temp, ignoring an rm error, and rethrows.
+   *   Otherwise mkdir, write a temp file, fsync that file, best-effort fsync the
+   *   directory, and replaceFileSync (the rename is synchronous). A generation
+   *   change after the temp write deletes the temp and returns without renaming.
+   *   A failed fsync or replace removes the temp, ignoring an rm error, and rethrows.
    *   Success sets readState to 'loaded' and recheckMissing to false.
    * @emits none
    */
@@ -426,7 +675,14 @@ class History {
       return;
     }
     try {
-      // Synchronous rename, checked just above. An older rename cannot finish after flush()'s snapshot.
+      // Durable bytes, then the directory entry, then the rename. An older rename
+      // cannot finish after flush()'s snapshot because currentSave was checked above.
+      await fsyncFile(temporary);
+      await fsyncDirectory(path.dirname(this.filePath));
+      if (!this.currentSave(generation)) {
+        await fs.promises.rm(temporary, { force: true });
+        return;
+      }
       replaceFileSync(this.filePath, temporary);
     } catch (error) {
       await fs.promises.rm(temporary, { force: true }).catch(() => {});
@@ -439,22 +695,30 @@ class History {
   /**
    * Synchronous save used by flush. Increments _saveGeneration and writes the current memory.
    * @returns {void} Returns immediately when readyToSave is false.
-   * Side effects: increments _saveGeneration, prune via serialize, mkdirSync, writeFileSync,
-   *   and replaceFileSync. A failed replace deletes the temp and the outer catch logs the
-   *   error. Success sets readState to 'loaded' and recheckMissing to false. Does not throw
-   *   to the caller.
+   * Side effects: returns immediately when nothing is dirty. Otherwise increments
+   *   _saveGeneration, prune via payloadForSave, mkdirSync, writeFileSync, fsync of
+   *   the temp file, best-effort directory fsync, and replaceFileSync. A failed
+   *   replace deletes the temp and the outer catch logs the error. Success sets
+   *   readState to 'loaded', recheckMissing to false, and clears dirty when no sample
+   *   arrived during the write. Does not throw to the caller.
    * @emits none
    */
   saveSync() {
     if (!this.readyToSave()) return;
+    // Shutdown and the periodic timer both call into here. An unchanged history is not rewritten.
+    if (!this.dirty) return;
     // This synchronous snapshot becomes the current generation.
     this._saveGeneration++;
     try {
-      const payload = this.serialize();
+      const payload = this.payloadForSave();
+      if (!payload) return;
+      const stamp = this._dirtyStamp;
       fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
       const temporary = temporaryPath(this.filePath);
       fs.writeFileSync(temporary, payload);
       try {
+        fsyncFileSync(temporary);
+        fsyncDirectorySync(path.dirname(this.filePath));
         replaceFileSync(this.filePath, temporary);
       } catch (error) {
         fs.rmSync(temporary, { force: true });
@@ -462,6 +726,7 @@ class History {
       }
       this.readState = 'loaded';
       this.recheckMissing = false;
+      if (this._dirtyStamp === stamp) this.dirty = false;
     } catch (err) {
       console.warn(`[history] could not save: ${err.message}`);
     }
@@ -555,8 +820,9 @@ class History {
    * @returns {void} Returns immediately when filePath is empty.
    * Side effects: readStored on the primary path. 'ok' applies the document, merging when
    *   memory already has samples and readState is neither 'unread' nor 'loaded'.
-   *   'invalid' calls failPermanent. 'missing' calls noteMissing. Any other status calls
-   *   noteRetry. May read a .bak and log. Does not write the history file.
+   *   'invalid' and 'empty' call recoverUnreadable. 'missing' calls noteMissing.
+   *   Any other status calls noteRetry. May read a .bak, rename a bad file aside, and log.
+   *   Does not write a replacement history file.
    * @emits none
    */
   load() {
@@ -570,11 +836,14 @@ class History {
       this.retrySkipLogged = false;
       this.savesDisabled = false;
       this.applyParsed(primary.parsed, merge);
+      // A clean load matches the file. A merge folded in samples that still need a write.
+      if (merge) this.markDirty();
+      else this.dirty = false;
       return;
     }
-    // Size, JSON, or version failure. failPermanent disables saves and does not overwrite the file.
-    if (primary.status === 'invalid') {
-      this.failPermanent();
+    // Empty (power-cut zeros) or a size/JSON/version failure. A good .bak resumes saving.
+    if (primary.status === 'invalid' || primary.status === 'empty') {
+      this.recoverUnreadable(primary.status);
       return;
     }
     // ENOENT. noteMissing may restore .bak and ask the next save to look again.
@@ -587,9 +856,77 @@ class History {
   }
 
   /**
-   * Size, JSON, and version failures. The file on disk stays where it is.
+   * An empty file, or a corrupt file that may have a good .bak.
+   * A readable .bak is loaded, the bad main file is renamed to
+   * history.json.corrupt-<timestamp>, and saving stays enabled so the next save
+   * rewrites history.json from that backup. An empty file with no usable .bak
+   * starts from the samples already in memory (or empty) and saving stays enabled.
+   * Any other unreadable file with no usable .bak calls failPermanent, which
+   * disables saves so the only copy is not overwritten.
+   * @param {'empty'|'invalid'} status Result from readStored on the main file.
+   * @returns {void}
+   * Side effects: may read the .bak, rename the main file, replace memory, and log.
+   *   Does not write a new history.json. Sets dirty when saving should resume.
+   * @emits none
+   */
+  recoverUnreadable(status) {
+    const backup = this.readStored(`${this.filePath}.bak`);
+    if (backup.status === 'ok') {
+      this.moveCorruptAside();
+      this.readState = 'loaded';
+      this.recheckMissing = false;
+      this.retrySkipLogged = false;
+      this.savesDisabled = false;
+      const kind = status === 'empty' ? 'empty' : 'unreadable';
+      console.warn(`[history] ${this.filePath} was ${kind}; loaded ${this.filePath}.bak and saving will resume`);
+      this.applyParsed(backup.parsed, this.hasSamples());
+      // The restored samples are not on the main path until the next save.
+      this.markDirty();
+      return;
+    }
+    // A zeroed file is not a document worth preserving. Start clean and keep saving.
+    if (status === 'empty') {
+      this.readState = 'loaded';
+      this.recheckMissing = false;
+      this.retrySkipLogged = false;
+      this.savesDisabled = false;
+      if (!this.hasSamples()) {
+        this.tracks = new Map();
+        this.interference = [];
+        this.solution = [];
+      }
+      console.warn(`[history] ${this.filePath} is empty and has no usable backup; starting a new history and saving stays enabled`);
+      this.markDirty();
+      return;
+    }
+    this.failPermanent();
+  }
+
+  /**
+   * Renames the unreadable main file to filePath.corrupt-<epoch ms>.
+   * The name uses only digits after the dot so it is legal on Windows.
+   * A missing file is left alone. A failed rename is logged and does not throw;
+   * the caller still loads the .bak and will try to replace the main file later.
+   * @returns {void}
+   * Side effects: rename of the main file. console.warn. Does not touch the .bak.
+   * @emits none
+   */
+  moveCorruptAside() {
+    const aside = `${this.filePath}.corrupt-${Date.now()}`;
+    try {
+      if (!fs.existsSync(this.filePath)) return;
+      moveAsideSync(this.filePath, aside);
+      console.warn(`[history] moved unreadable ${this.filePath} aside to ${aside}`);
+    } catch (error) {
+      console.warn(`[history] could not move ${this.filePath} aside: ${error.message}`);
+    }
+  }
+
+  /**
+   * Size, JSON, and version failures when no usable .bak exists. The file on disk stays where it is.
    * Sets savesDisabled. On the first failure, logs, clears memory when it has no
-   * samples, and applies a readable .bak in memory. Saves stay disabled after that restore.
+   * samples, and applies a readable .bak in memory if one appears between the checks.
+   * Saves stay disabled after that restore so the bad main file is not overwritten.
    * @returns {void} A later call, once readState is already 'invalid', returns after refreshing the flags.
    * Side effects: console.warn on the first failure. May read the .bak and replace or merge memory. No write.
    * @emits none
@@ -627,6 +964,9 @@ class History {
     // First observation: restore .bak when it is readable, merged if memory already has samples.
     if (!again && !this.restoreBackup('missing')) {
       console.warn(`[history] ${this.filePath} is missing; will check again before saving`);
+    } else if (!again) {
+      // The backup is in memory and the main file is gone. The next save should recreate it.
+      this.markDirty();
     }
     // First miss checks again on the next save. A second consecutive miss allows the save to create the file.
     this.recheckMissing = !again;
@@ -671,20 +1011,23 @@ class History {
   /**
    * Classifies one history file.
    * @param {string} filePath Primary file or its .bak.
-   * @returns {object} status 'ok' with parsed, 'invalid', 'missing', or 'retry' with code.
-   *   invalid means size over 64 MiB, a JSON parse failure, or version !== 1.
-   *   missing is ENOENT. Any other read error, including EPERM, EBUSY, and EIO, is retry.
-   * Side effects: stat and read. console.warn for invalid and retry. ENOENT is not logged here.
+   * @returns {object} status 'ok' with parsed, 'invalid', 'empty', 'missing', or 'retry' with code.
+   *   empty means zero bytes or only NULs and whitespace. invalid means size over 64 MiB,
+   *   a JSON parse failure, or version !== 1. missing is ENOENT. Any other read error,
+   *   including EPERM, EBUSY, and EIO, is retry.
+   * Side effects: stat and read. console.warn for invalid and retry. ENOENT and empty are not logged here.
    * @emits none
    */
   readStored(filePath) {
     let text;
     try {
-      // Over 64 MiB is invalid. The body is not parsed.
-      if (fs.statSync(filePath).size > 64 * 1024 * 1024) {
+      const size = fs.statSync(filePath).size;
+      // Over 64 MiB is invalid. The body is not parsed. An empty file is recoverable.
+      if (size > HISTORY_LOAD_LIMIT) {
         console.warn(`[history] could not load: History file exceeds the 64 MiB load limit (${filePath})`);
         return { status: 'invalid' };
       }
+      if (size === 0) return { status: 'empty' };
       text = fs.readFileSync(filePath, 'utf8');
     } catch (err) {
       // ENOENT is missing, not invalid.
@@ -693,6 +1036,8 @@ class History {
       // EPERM, EBUSY, EIO, and every other read error are retry. Saves are not disabled.
       return { status: 'retry', code: err.code || '' };
     }
+    // A power cut can leave a file of NUL bytes. That is empty, not a document to freeze.
+    if (isBlankHistory(text)) return { status: 'empty' };
     try {
       const parsed = JSON.parse(text);
       // A missing document or a version other than 1 is invalid and must not be overwritten.
@@ -773,8 +1118,24 @@ function mergeSamples(existing, incoming, id) {
   return merged;
 }
 
-/** Unchanged solutions are stored at most once per 10 seconds. */
+/** Unchanged solutions and unchanged interference reports are stored at most once per 10 seconds. */
 const SOLUTION_HEARTBEAT_MS = 10000;
+
+/**
+ * Stable text for one sample's stored detections, used by the 10 second heartbeat.
+ * Power, frequency, bandwidth, and type are included so a real change is not skipped.
+ * @param {object[]} stored Detections already copied onto the sample. A missing list is empty.
+ * @returns {string}
+ * Side effects: none.
+ * @emits none
+ */
+function detectionFingerprint(stored) {
+  let text = '';
+  for (const detection of stored || []) {
+    text += `${detection.freq},${detection.power},${detection.bandwidth},${detection.type};`;
+  }
+  return text;
+}
 
 /**
  * Time-sorted samples cut to at most limit.
@@ -819,6 +1180,26 @@ function reduceSamples(samples, limit, key, keep) {
  * Side effects: none.
  * @emits none
  */
+/**
+ * Caps an interference list without throwing away a long time span.
+ * When the first and last sample are closer than limit seconds, this is a burst
+ * and the newest limit samples are kept. A longer series is bucketed by
+ * reduceInterference so a 24 h window still reaches its start.
+ * @param {object[]} samples Time-sorted interference samples.
+ * @param {number} limit Maximum length.
+ * @returns {object[]}
+ * Side effects: none. samples is not mutated. slice returns a new array; reduceInterference does too.
+ * @emits none
+ */
+function capInterference(samples, limit) {
+  if (!Array.isArray(samples) || samples.length <= limit) return samples;
+  const first = samples[0] && samples[0].t;
+  const last = samples[samples.length - 1] && samples[samples.length - 1].t;
+  const span = last - first;
+  if (!Number.isFinite(span) || span < limit * 1000) return samples.slice(-limit);
+  return reduceInterference(samples, limit);
+}
+
 function reduceInterference(samples, limit) {
   return reduceSamples(samples, limit, (sample) => sample.signal, (previous, sample) => {
     if ((sample.count > 0) !== (previous.count > 0)) return sample.count > 0 ? sample : previous;
@@ -907,5 +1288,6 @@ function isValidSkyPosition(elevation, azimuth) {
 }
 
 module.exports = {
-  History, SOLUTION_HEARTBEAT_MS, solutionSample, MAX_TRACKS, replaceFile, replaceFileSync,
+  History, SOLUTION_HEARTBEAT_MS, solutionSample, MAX_TRACKS, MAX_DETECTIONS_PER_SAMPLE,
+  HISTORY_LOAD_LIMIT, replaceFile, replaceFileSync,
 };

@@ -6,8 +6,15 @@
  */
 'use strict';
 
+// The libuv pool is created on first use of fs, dns, or zlib. Set the size before
+// any of those run. A hung NAS read pins one worker; the default pool has four,
+// so a few stuck scans stall history saves and static files. An explicit env value
+// is kept. src/start.js sets the same default before this file is loaded.
+if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = '16';
+
 const http = require('node:http');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { SerialPort } = require('serialport');
 
@@ -17,6 +24,7 @@ const { decode } = require('./messages');
 const { saneTimestamp } = require('./novatel');
 const { History } = require('./history');
 const { InterferenceArchive } = require('./archive');
+const { logLimited } = require('./loglimit');
 
 /**
  * Logs an unhandled promise rejection. Does not call process.exit.
@@ -48,7 +56,12 @@ const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml',
+  '.gif': 'image/gif',
 };
+/** At most one ephemeris SSE frame per this many milliseconds, however many satellites arrived. */
+const EPHEMERIS_COALESCE_MS = 250;
 
 /**
  * Live view filled by processReceiverLog.
@@ -125,9 +138,11 @@ let lastStatusLog = '';
  * Remembers the latest receiver status, logs it when the summary changes, and broadcasts it.
  * @param {object} state Shallow status copy emitted by the receiver.
  * @returns {void}
- * Side effects: assigns latestStatus. console.log only when the summary line differs
- *   from lastStatusLog. The line names the serial path and baud, or host:port, and
- *   appends lastError when it is set. Then broadcast('status', state).
+ * Side effects: assigns latestStatus. console.log when the summary line differs from
+ *   lastStatusLog. Repeats of a changing pair (connected, then disconnected) are
+ *   counted and summarised once a minute by logLimited. The line names the serial
+ *   path and baud, or host:port, and appends lastError when it is set. Then
+ *   broadcast('status', state).
  * @emits none
  */
 receiver.on('status', (state) => {
@@ -136,7 +151,9 @@ receiver.on('status', (state) => {
     ? `${state.serialPath} @ ${state.baudRate}`
     : `${state.host}:${state.port}`;
   const line = `[receiver] ${state.connected ? 'connected to' : 'disconnected from'} ${target}${state.lastError ? ` (${state.lastError})` : ''}`;
-  if (line !== lastStatusLog) console.log(line);
+  // An identical line is not logged again. Two alternating lines used to defeat that
+  // check and print on every reconnect. Those changes share one rate-limit bucket.
+  if (line !== lastStatusLog) logLimited('log', 'receiver-status', line);
   lastStatusLog = line;
   broadcast('status', state);
 });
@@ -217,7 +234,10 @@ function processReceiverLog(message) {
     // It does not replace the last good record in store.latest.
     record = decode(message);
   } catch (error) {
-    console.error(`[receiver] could not decode log: ${error.message}`);
+    // The first failure is logged in full. A burst is counted and summarised once a minute.
+    // The vm tests that slice this function do not define logLimited, so they still see console.error.
+    if (typeof logLimited === 'function') logLimited('error', 'receiver-decode', `[receiver] could not decode log: ${error.message}`);
+    else console.error(`[receiver] could not decode log: ${error.message}`);
     if (typeof receiver !== 'undefined' && receiver && typeof receiver.setError === 'function') receiver.setError(error);
     const name = (message && message.header && message.header.messageName) || 'UNKNOWN';
     noteCount(name);
@@ -268,6 +288,21 @@ function processReceiverLog(message) {
     }
     entry.satellites = Object.keys(entry.records);
     store.ephemeris[name] = entry;
+    // The live message below does not carry the whole store. One coalesced frame
+    // per EPHEMERIS_COALESCE_MS carries the satellite that just changed.
+    // Sliced tests have no noteEphemeris; the in-memory store above is what they assert.
+    if (typeof noteEphemeris === 'function') {
+      const satelliteId = entry.lastSatellite;
+      noteEphemeris({
+        name,
+        count: entry.count,
+        lastSatellite: satelliteId,
+        lastAt: entry.lastAt,
+        satelliteId,
+        record: ephemerisDeltaRecord(entry.records[satelliteId]),
+        satellites: entry.satellites,
+      });
+    }
   }
 
   if (name === 'ITDETECTSTATUS') {
@@ -285,7 +320,12 @@ function processReceiverLog(message) {
     // history.addInterference runs only for a CRC-valid record.
     // crcValid === false is logged. Any other non-true crcValid is skipped with no warning.
     if (!trusted) {
-      if (record.crcValid === false) console.warn('[receiver] excluding CRC-failed ITDETECTSTATUS from history');
+      // One warning for the first failed CRC, then a once-per-minute count. Sliced tests use console.warn.
+      if (record.crcValid === false) {
+        const crcLine = '[receiver] excluding CRC-failed ITDETECTSTATUS from history';
+        if (typeof logLimited === 'function') logLimited('warn', 'itdetect-crc', crcLine);
+        else console.warn(crcLine);
+      }
     } else if (bySignal.size) {
       for (const [signal, signalDetections] of bySignal) {
         history.addInterference(signal, signalDetections, reportTime);
@@ -315,11 +355,12 @@ function processReceiverLog(message) {
   });
   if (store.rawLog.length > config.rawLogSize) store.rawLog.shift();
 
-  // ephemeris is undefined unless this record is a trusted ephemeris, so JSON.stringify omits it.
+  // Ephemeris state goes out through noteEphemeris, not on this frame. Attaching the
+  // whole store here was about 728 KB per satellite and disconnected every browser
+  // when a connect replayed ~195 ephemerides into the 256 KiB backlog.
   broadcast('message', {
     record,
     counts: store.counts,
-    ephemeris: trusted && record.kind === 'ephemeris' ? store.ephemeris : undefined,
   });
 }
 
@@ -330,8 +371,11 @@ function processReceiverLog(message) {
  * @param {*} data Value passed to JSON.stringify.
  * @returns {void} Returns when clients is empty, or when JSON.stringify throws.
  * Side effects: an encode failure is logged and leaves the client set alone. A client
- *   that is already destroyed, has writableLength above 256 KiB, or whose write throws
- *   is removed and destroyed. A failed write destroys that client only. Does not throw.
+ *   that is already destroyed, or whose write throws, is removed and destroyed.
+ *   writableLength above 256 KiB destroys the client for a message that is not
+ *   replaceable. A replaceable event (status, archive, ephemeris, or an ephemeris
+ *   message) is skipped and the client stays. A failed write destroys that client
+ *   only. Does not throw.
  * @emits none
  */
 function broadcast(event, data) {
@@ -343,9 +387,17 @@ function broadcast(event, data) {
     console.error(`[stream] could not encode ${event} event: ${error.message}`);
     return;
   }
+  // status, archive, and ephemeris are replaced by the next frame. An ephemeris
+  // 'message' is too: the coalesced ephemeris event carries the table. Checked
+  // here so a test that loads only this function does not need another helper.
+  // Other messages still disconnect a client past the 256 KiB backlog.
+  const replaceable = event === 'status' || event === 'archive' || event === 'ephemeris'
+    || (event === 'message' && !!(data && data.record && data.record.kind === 'ephemeris'));
   for (const res of clients) {
-    // Backpressure or a dead socket drops this client only.
+    // A dead socket is dropped. A full buffer drops a replaceable frame and keeps
+    // the client; any other frame disconnects that client only.
     if (res.destroyed || res.writableLength > 256 * 1024) {
+      if (!res.destroyed && replaceable) continue;
       clients.delete(res);
       res.destroy();
     } else {
@@ -381,6 +433,51 @@ function snapshot() {
     historyRetentionMinutes: config.historyRetentionMinutes,
     archive: archive.status(),
   };
+}
+
+/**
+ * Copy of one ephemeris record for an SSE delta, without the raw log text.
+ * The table reads data.parameters. The raw line stays in the store for the
+ * connect snapshot and in the message event's own record. Omitting it here
+ * keeps a coalesced frame from repeating every raw ephemeris line.
+ * @param {object|undefined} record Stored ephemeris record. Missing returns null.
+ * @returns {object|null}
+ * Side effects: none. The stored record is not mutated.
+ * @emits none
+ */
+function ephemerisDeltaRecord(record) {
+  if (!record) return null;
+  const copy = { ...record };
+  delete copy.raw;
+  return copy;
+}
+
+const pendingEphemeris = new Map();
+let ephemerisTimer = null;
+
+/**
+ * Queues one changed ephemeris satellite and flushes them as a single SSE event.
+ * Many ONALL ephemerides arrive in one burst. They used to each rebroadcast the
+ * whole store. Updates for the same satellite inside the window collapse to the
+ * latest. The timer is unref'd so it does not keep the process alive.
+ * Defined after broadcast so a test that slices processReceiverLog up to broadcast
+ * does not arm this timer. The function declaration is still in scope for the server.
+ * @param {object} update name, satelliteId, count, lastSatellite, lastAt, record, satellites.
+ * @returns {void}
+ * Side effects: pendingEphemeris and a 250 ms timer. That timer calls broadcast.
+ * @emits none
+ */
+function noteEphemeris(update) {
+  if (!update || !update.name) return;
+  pendingEphemeris.set(`${update.name}:${update.satelliteId || ''}`, update);
+  if (ephemerisTimer) return;
+  ephemerisTimer = setTimeout(() => {
+    ephemerisTimer = null;
+    const updates = [...pendingEphemeris.values()];
+    pendingEphemeris.clear();
+    if (updates.length) broadcast('ephemeris', { updates });
+  }, EPHEMERIS_COALESCE_MS);
+  if (ephemerisTimer.unref) ephemerisTimer.unref();
 }
 
 /**
@@ -964,15 +1061,52 @@ server.on('error', (error) => {
 });
 
 /**
+ * URLs to print when the HTTP server starts listening.
+ * 0.0.0.0 is not a useful browser address, so that bind prints
+ * http://127.0.0.1:port and then each non-internal IPv4 address from
+ * os.networkInterfaces(). A specific WEB_HOST is printed as-is.
+ * @param {string} host config.webHost.
+ * @param {number|string} port config.webPort.
+ * @returns {string[]} Absolute http URLs, localhost first when host is 0.0.0.0.
+ * Side effects: may call os.networkInterfaces(). A throw from that call is ignored
+ *   and only the localhost URL is returned. Does not log.
+ * @emits none
+ */
+function webListenLines(host, port) {
+  if (host !== '0.0.0.0') return [`http://${host}:${port}`];
+  const lines = [`http://127.0.0.1:${port}`];
+  const seen = new Set(['127.0.0.1']);
+  let interfaces = {};
+  try {
+    interfaces = os.networkInterfaces() || {};
+  } catch {
+    interfaces = {};
+  }
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries || []) {
+      if (!entry || entry.internal) continue;
+      if (entry.family !== 'IPv4' && entry.family !== 4) continue;
+      if (!entry.address || seen.has(entry.address)) continue;
+      seen.add(entry.address);
+      lines.push(`http://${entry.address}:${port}`);
+    }
+  }
+  return lines;
+}
+
+/**
  * Logs the listen addresses, starts the receiver, and starts archive auto-refresh.
  * @returns {void}
- * Side effects: console.log for the web URL, history retention, and receiver target.
+ * Side effects: one console.log per URL from webListenLines (localhost, then LAN
+ *   IPv4 addresses, when bound to 0.0.0.0), history retention, and receiver target.
  *   receiver.start(). archive.startAuto(5000). When archive auto is enabled, logs the
  *   archive root, day count, and refresh minutes.
  * @emits status through receiver.start.
  */
 server.listen(config.webPort, config.webHost, () => {
-  console.log(`[web] http://${config.webHost}:${config.webPort}`);
+  for (const url of webListenLines(config.webHost, config.webPort)) {
+    console.log(`[web] ${url}`);
+  }
   console.log(`[history] retaining ${config.historyRetentionMinutes} minutes${config.historyFile ? ` in ${config.historyFile}` : ' (memory only)'}`);
   const serialTarget = `${config.serialPath} @ ${config.serialBaudRate}`;
   const tcpTarget = `${config.receiverHost}:${config.receiverPort}`;
