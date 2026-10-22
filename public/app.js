@@ -29,6 +29,11 @@ let countsDirty = false;
 let ephemerisDirty = false;
 let timelineDirty = false;
 let lastErrorNotice = '';
+/** Hides #client-error after a few minutes when nothing clears it sooner. */
+let clientErrorTimer = null;
+/** EventSource reconnect delay after readyState CLOSED. Doubles up to 30 s and resets on open. */
+let streamRetryMs = 1000;
+let streamRetryTimer = null;
 
 /**
  * Shows a display failure in #client-error and logs each distinct message once.
@@ -47,6 +52,34 @@ function reportClientError(context, error) {
   }
   if (lastErrorNotice !== message) console.error(message, error);
   lastErrorNotice = message;
+  // A one-off failure used to stay on the wall until someone pressed Retry.
+  // The next successful snapshot also hides it. This timer covers a wall that
+  // does not get another snapshot. No styling is changed. Sliced startup tests
+  // have no setTimeout; the notice still shows, and Retry or a snapshot clears it.
+  if (typeof setTimeout === 'function') {
+    if (clientErrorTimer) clearTimeout(clientErrorTimer);
+    clientErrorTimer = setTimeout(() => {
+      clientErrorTimer = null;
+      clearClientError();
+    }, 3 * 60 * 1000);
+  }
+}
+
+/**
+ * Hides #client-error and forgets the last message so a later failure is logged again.
+ * Called after a successful snapshot or history fetch, by the few-minute timer, and
+ * by Retry display. Does nothing when the element is missing.
+ * @returns {void}
+ * Side effects: #client-error hidden, lastErrorNotice cleared, clientErrorTimer cleared. events: none.
+ */
+function clearClientError() {
+  const notice = $('client-error');
+  if (notice) notice.hidden = true;
+  lastErrorNotice = '';
+  if (clientErrorTimer) {
+    clearTimeout(clientErrorTimer);
+    clientErrorTimer = null;
+  }
 }
 
 /**
@@ -466,26 +499,55 @@ function handleStreamEvent(context, event, handler) {
 /**
  * Opens an EventSource on /events when the tab is visible and no source is already open.
  * @returns {void}
- * Side effects: network SSE. Listens for status, snapshot, message, archive, open, and error. error marks the page offline and redraws the bar; it does not close the source or start a backoff timer. A hidden tab is skipped; the visibility listener closes the source and calls this again when the tab is shown. events: none.
+ * Side effects: network SSE. Listens for status, snapshot, message, ephemeris, archive, open, and error. error marks the page offline and redraws the bar. When readyState is CLOSED (2) the source cannot reconnect itself, so it is dropped and scheduleStreamReconnect arms a backoff. A hidden tab is skipped; the visibility listener closes the source and calls this again when the tab is shown. events: none.
  */
 function connectStream() {
-  // No second connection, and no connection while the tab is hidden. This does not arm a reconnect timer.
+  // No second connection, and no connection while the tab is hidden. A pending backoff is left for scheduleStreamReconnect.
   if (source || document.hidden) return;
   source = new EventSource('/events');
-  // SSE names listened for: status, snapshot, message, and archive. Also the EventSource open and error events.
+  // SSE names listened for: status, snapshot, message, ephemeris, and archive. Also the EventSource open and error events.
   source.addEventListener('status', (event) => handleStreamEvent('Receiver status', event, renderStatus));
   source.addEventListener('snapshot', (event) => handleStreamEvent('Loading live snapshot', event, applySnapshot));
   source.addEventListener('message', (event) => handleStreamEvent('Reading live report', event, applyPayload));
+  source.addEventListener('ephemeris', (event) => handleStreamEvent('Ephemeris', event, applyEphemerisUpdates));
   source.addEventListener('archive', (event) => handleStreamEvent('Archive status', event, applyArchiveStatus));
   source.addEventListener('open', () => {
     connection.offline = false;
+    streamRetryMs = 1000;
+    if (streamRetryTimer) {
+      clearTimeout(streamRetryTimer);
+      streamRetryTimer = null;
+    }
     renderConnectionBar();
   });
-  // error marks the page offline and redraws the bar. The source stays open; no backoff is scheduled here.
+  // error marks the page offline. CONNECTING (0) still retries inside this EventSource.
+  // CLOSED (2) does not. Drop it and open a new one after a backoff.
   source.addEventListener('error', () => {
     connection.offline = true;
     renderConnectionBar();
+    if (source && source.readyState === 2) {
+      source.close();
+      source = null;
+      scheduleStreamReconnect();
+    }
   });
+}
+
+/**
+ * Opens /events again after the stream was closed.
+ * The delay starts at 1 s and doubles up to 30 s. A hidden tab, an open source,
+ * or a timer that is already armed does nothing. open resets the delay.
+ * @returns {void}
+ * Side effects: streamRetryTimer and streamRetryMs. The timer calls connectStream. events: none.
+ */
+function scheduleStreamReconnect() {
+  if (document.hidden || source || streamRetryTimer) return;
+  const delay = streamRetryMs;
+  streamRetryMs = Math.min(streamRetryMs * 2, 30000);
+  streamRetryTimer = setTimeout(() => {
+    streamRetryTimer = null;
+    connectStream();
+  }, delay);
 }
 
 /**
@@ -530,6 +592,13 @@ function applySnapshot(snap) {
   $('raw-log').replaceChildren();
   (snap.rawLog || []).slice(-MAX_RAW_ROWS).forEach((record) => queueRecord(pendingRaw, record, MAX_RAW_ROWS));
   countsDirty = ephemerisDirty = timelineDirty = true;
+  // A snapshot arrived, so the previous client-error notice is stale. Retry still hides it too.
+  // Sliced tests do not define clearClientError; hiding the stub element is enough there.
+  if (typeof clearClientError === 'function') clearClientError();
+  else {
+    const clientNotice = $('client-error');
+    if (clientNotice) clientNotice.hidden = true;
+  }
 }
 
 /**
@@ -538,6 +607,29 @@ function applySnapshot(snap) {
  * @returns {void}
  * Side effects: state and queues. validateRecord and recordLiveHistory may throw. events: none.
  */
+/**
+ * Merges coalesced ephemeris deltas into state.ephemeris.
+ * The connect snapshot still replaces the whole map. Later frames carry only the
+ * satellites that changed, under payload.updates. A full payload.ephemeris object,
+ * if one is ever sent, is still applied by applyPayload.
+ * @param {object} payload Object with an updates array.
+ * @returns {void}
+ * Side effects: state.ephemeris and ephemerisDirty. events: none.
+ */
+function applyEphemerisUpdates(payload) {
+  const updates = Array.isArray(payload.updates) ? payload.updates : [];
+  for (const update of updates) {
+    if (!update || typeof update.name !== 'string' || !update.name) continue;
+    const entry = state.ephemeris[update.name] || (state.ephemeris[update.name] = { count: 0, records: {}, satellites: [] });
+    if (Number.isFinite(update.count)) entry.count = update.count;
+    entry.lastSatellite = update.lastSatellite;
+    entry.lastAt = update.lastAt;
+    if (update.satelliteId && update.record) entry.records[update.satelliteId] = update.record;
+    entry.satellites = Array.isArray(update.satellites) ? update.satellites : Object.keys(entry.records);
+  }
+  if (updates.length) ephemerisDirty = true;
+}
+
 function applyPayload(payload) {
   validateRecord(payload.record);
   state.counts = payload.counts;
@@ -1042,6 +1134,7 @@ async function loadHistory() {
     }
     pruneClientHistory();
     capHistoryWindow(data.retentionMinutes);
+    clearClientError();
   } catch (error) {
     if (generation === historyRequest) reportClientError('Could not load history (existing data retained)', error);
   }
@@ -1194,7 +1287,9 @@ function recordLiveHistory(record) {
       }
       const samples = state.tracks[key] || (state.tracks[key] = []);
       const last = samples[samples.length - 1];
-      if (last && now - last.t < 20000) continue;
+      // Skip only a newer point inside 20 s. now < last.t is a backwards clock step;
+      // now - last.t would stay negative and the track would freeze.
+      if (last && now >= last.t && now - last.t < 20000) continue;
       samples.push({ t: now, el: sat.elevation, az: sat.azimuth });
       if (samples.length > MAX_TRACK_SAMPLES) samples.splice(0, samples.length - MAX_TRACK_SAMPLES);
     }
@@ -5165,6 +5260,10 @@ function heapReloadLimitMb() {
 /**
  * Reloads the page when performance.memory is over the heap threshold.
  * Browsers without performance.memory do nothing. The URL, including wall=1, is kept.
+ * location.reload() leaves the Fullscreen API, and a page cannot re-enter it without
+ * a user gesture. Wall layout is the html.wall class from ?wall=1, which survives
+ * the reload. Fullscreen on an unattended display is Chrome kiosk mode, documented
+ * in the README, not a control on this page.
  * @returns {void}
  * Side effects: sessionStorage key gnssHeapReloadAt, console.warn, and location.reload. events: none.
  */
@@ -5207,6 +5306,10 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     source?.close();
     source = null;
+    if (streamRetryTimer) {
+      clearTimeout(streamRetryTimer);
+      streamRetryTimer = null;
+    }
     historyRequest++;
     historyController?.abort();
     cancelWallReflow();

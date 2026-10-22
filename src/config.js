@@ -250,8 +250,15 @@ const config = {
   historyFile: process.env.HISTORY_FILE === undefined
     ? path.join(__dirname, '..', 'data', 'history.json')
     : process.env.HISTORY_FILE || null,
-  // HISTORY_SAVE_SEC defaults to 60.
-  historySaveSeconds: integerSetting('HISTORY_SAVE_SEC', 60, 1),
+  // HISTORY_SAVE_SEC defaults to 300 (5 minutes). A quiet interval does not rewrite the file.
+  // Shutdown still flushes a history that changed. The old 60 second default rewrote
+  // tens of gigabytes a day and blocked the event loop on JSON.stringify.
+  historySaveSeconds: integerSetting('HISTORY_SAVE_SEC', 300, 1),
+  // Periods for the two logs this process always requests. Defaults match the previous
+  // hardcoded ONTIME 1 and ONTIME 5. Baud and the receiver's saved config are not changed.
+  // BESTSATS_LOG_SEC defaults to 1. TRACKSTAT_LOG_SEC defaults to 5.
+  bestsatsLogSeconds: integerSetting('BESTSATS_LOG_SEC', 1, 1),
+  trackstatLogSeconds: integerSetting('TRACKSTAT_LOG_SEC', 5, 1),
 
   // Historic interference, BESTPOS and BESTSATS archive: root\YYYY\DDD\*.LOG, loaded on demand.
   // NOVATEL_ARCHIVE_ROOT defaults to \\20.20.20.1\novatel\pwrpak1.

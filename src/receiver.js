@@ -10,6 +10,7 @@ const net = require('node:net');
 const { EventEmitter } = require('node:events');
 const { SerialPort } = require('serialport');
 const { parseAsciiLog, readBinaryLog, findSyncIndex } = require('./novatel');
+const { logLimited } = require('./loglimit');
 
 /** Reassembly cap. ingest drops the oldest bytes past this size. */
 const MAX_BUFFER_BYTES = 1 << 20;
@@ -19,6 +20,20 @@ const NEWLINE = 0x0a;
  * Names that prove the serial port is emitting NovAtel logs.
  * emitLog clears the auto-mode probe when crcValid is true and the message name is in this set.
  */
+/**
+ * ONTIME period for a log this process requests.
+ * A positive integer is used as-is. Anything else, including a missing option,
+ * returns fallback so existing callers keep BESTSATSA at 1 s and TRACKSTAT at 5 s.
+ * @param {*} value options.bestsatsLogSeconds or options.trackstatLogSeconds.
+ * @param {number} fallback Seconds used when value is not an integer >= 1.
+ * @returns {number}
+ * Side effects: none.
+ * @emits none
+ */
+function logPeriodSeconds(value, fallback) {
+  return Number.isInteger(value) && value >= 1 ? value : fallback;
+}
+
 const PROBE_LOGS = new Set([
   'VERSION', 'RXSTATUS', 'BESTPOS', 'BESTGNSSPOS', 'RANGE', 'SATVIS2', 'BESTSATS', 'TRACKSTAT',
   'ITDETECTSTATUS', 'GPSEPHEM', 'GLOEPHEMERIS', 'GALINAVEPHEMERIS', 'GALFNAVEPHEMERIS',
@@ -55,6 +70,7 @@ class ReceiverClient extends EventEmitter {
     // failed serial attempt and connects immediately. Other failures put it back
     // to 'serial' and wait for scheduleReconnect.
     this.autoTarget = 'serial';
+    this.serialRateWarned = false;
     this.state = {
       connected: false,
       phase: 'stopped',
@@ -254,7 +270,9 @@ class ReceiverClient extends EventEmitter {
     // Auto mode: this serial failure switches to TCP and connects immediately.
     if (this.options.transport === 'auto' && this.autoTarget === 'serial') {
       this.autoTarget = 'tcp';
-      console.warn(`[receiver] serial unavailable (${error.message || error}); falling back to TCP`);
+      // Auto mode retries serial, then TCP, for as long as the receiver is down.
+      // The first line is printed; later cycles are counted once a minute.
+      logLimited('warn', 'serial-fallback', `[receiver] serial unavailable (${error.message || error}); falling back to TCP`);
       this.connect();
       return;
     }
@@ -499,8 +517,11 @@ class ReceiverClient extends EventEmitter {
    * Always sends options.ephemerisLogCommands, then profile logCommands only when
    * options.sendLogCommands is true. Profile lines matching
    * /^LOG (?:ITDETECTSTATUS|BESTSATS|TRACKSTAT)[A-Z]? /i are filtered out. The list
-   * always ends with LOG BESTSATSA ONTIME 1, LOG TRACKSTATA ONTIME 5, and
-   * LOG ITDETECTSTATUSA ONTIME 1. The send flag is options.sendLogCommands.
+   * always ends with LOG BESTSATSA ONTIME <bestsatsLogSeconds>, LOG TRACKSTATA
+   * ONTIME <trackstatLogSeconds>, and LOG ITDETECTSTATUSA ONTIME 1. Those two
+   * periods default to 1 and 5 when the option is missing or not a positive integer.
+   * The send flag is options.sendLogCommands. Baud is not changed and SAVECONFIG
+   * is never sent.
    * @param {import('node:net').Socket|import('serialport').SerialPort} transport Open socket or port.
    * @returns {void}
    * Side effects: one transport.write per command, each ending in CR LF, without waiting
@@ -519,8 +540,8 @@ class ReceiverClient extends EventEmitter {
       // Ephemeris commands are always sent. The three logs below are always appended after the profile.
       ...(this.options.ephemerisLogCommands || []),
       ...profileCommands,
-      'LOG BESTSATSA ONTIME 1',
-      'LOG TRACKSTATA ONTIME 5',
+      `LOG BESTSATSA ONTIME ${logPeriodSeconds(this.options.bestsatsLogSeconds, 1)}`,
+      `LOG TRACKSTATA ONTIME ${logPeriodSeconds(this.options.trackstatLogSeconds, 5)}`,
       'LOG ITDETECTSTATUSA ONTIME 1',
     ];
     for (const command of commands) {
@@ -555,6 +576,32 @@ class ReceiverClient extends EventEmitter {
       baudRate: this.options.serialBaudRate,
       lastError: null,
     });
+    this.warnIfSerialOversubscribed();
+  }
+
+  /**
+   * Warns once when this connection is serial at 19200 baud or below.
+   * BESTSATSA once a second plus TRACKSTAT every five seconds can exceed a real
+   * RS-232 link at 9600 baud (about 960 bytes/s). USB virtual COM ports are not
+   * limited that way. The baud and the receiver's saved configuration are left
+   * alone; BESTSATS_LOG_SEC and TRACKSTAT_LOG_SEC slow only the two requests
+   * this process sends. SAVECONFIG is not sent.
+   * @returns {void}
+   * Side effects: one console.warn per ReceiverClient, the first time the active
+   *   transport is serial and serialBaudRate is finite and <= 19200. No I/O to the receiver.
+   * @emits none
+   */
+  warnIfSerialOversubscribed() {
+    if (this.serialRateWarned) return;
+    if (this.activeTransport() !== 'serial') return;
+    const baud = Number(this.options.serialBaudRate);
+    if (!Number.isFinite(baud) || baud > 19200) return;
+    this.serialRateWarned = true;
+    const bestsats = logPeriodSeconds(this.options.bestsatsLogSeconds, 1);
+    const trackstat = logPeriodSeconds(this.options.trackstatLogSeconds, 5);
+    console.warn(`[receiver] serial at ${baud} baud may be oversubscribed by LOG BESTSATSA ONTIME ${bestsats} `
+      + `and LOG TRACKSTATA ONTIME ${trackstat}. If this port is real RS-232, set BESTSATS_LOG_SEC and `
+      + 'TRACKSTAT_LOG_SEC to slow those two logs. Baud and the receiver configuration are unchanged.');
   }
 
   /**

@@ -880,7 +880,12 @@ test('server history limits restored samples and caps browser responses', () => 
     t: now - (1999 - index) * 1000, signal: 'L1', count: 1, maxPower: -90, index,
   }));
   history.prune(now);
-  assert.equal(history.interference.length, 500);
+  // A series longer than the cap is bucketed, so the length can be under the cap.
+  // The newest sample and an older hour both have to survive.
+  assert.ok(history.interference.length <= 500);
+  assert.ok(history.interference.length > 100);
+  assert.equal(history.interference[history.interference.length - 1].index, 1999);
+  assert.ok(history.interference[0].index < 1600);
   const response = history.since(3600000, now, 100);
   assert(response.interference.length <= 100);
   assert.equal(response.interference[response.interference.length - 1].index, 1999, 'newest sample kept');
@@ -951,7 +956,7 @@ test('auto transport tries serial first and falls back to TCP when serial does n
     clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
     require: (name) => name === 'serialport' ? { SerialPort: FakePort }
       : name === 'node:net' ? fakeNet
-        : name === './novatel' ? require('../src/novatel') : require(name),
+        : name === './novatel' ? require('../src/novatel') : name === './loglimit' ? require('../src/loglimit') : require(name),
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
   const receiver = new context.module.exports.ReceiverClient({
@@ -1053,7 +1058,7 @@ test('receiver isolates valid logs, reports connection state and disconnects cle
         setTimeout(callback) { timers.push(callback); return timers.length; },
         clearTimeout() {},
         require: (name) => name === 'serialport' ? { SerialPort: FakePort }
-          : name === './novatel' ? require('../src/novatel') : require(name),
+          : name === './novatel' ? require('../src/novatel') : name === './loglimit' ? require('../src/loglimit') : require(name),
       });
       vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
       const receiver = new context.module.exports.ReceiverClient({
@@ -1108,6 +1113,7 @@ test('receiver isolates valid logs, reports connection state and disconnects cle
       const sample = { t: Date.now() };
       sample.circular = sample;
       history.interference.push(sample);
+      history.dirty = true;
       assert.doesNotThrow(() => history.save());
       assert.equal(warnings.length, 1);
       assert.match(warnings[0], /could not save/);
@@ -1443,7 +1449,7 @@ test('a silent serial port is recycled without falling straight through to TCP',
     clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
     require: (name) => name === 'serialport' ? { SerialPort: FakePort }
       : name === 'node:net' ? { createConnection() { throw new Error('TCP should not be opened'); } }
-        : name === './novatel' ? require('../src/novatel') : require(name),
+        : name === './novatel' ? require('../src/novatel') : name === './loglimit' ? require('../src/loglimit') : require(name),
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
   const receiver = new context.module.exports.ReceiverClient({
@@ -1495,7 +1501,7 @@ test('a close error from a serial port that is no longer current is ignored', ()
     clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
     require: (name) => name === 'serialport' ? { SerialPort: FakePort }
       : name === 'node:net' ? { createConnection() { throw new Error('TCP should not be opened'); } }
-        : name === './novatel' ? require('../src/novatel') : require(name),
+        : name === './novatel' ? require('../src/novatel') : name === './loglimit' ? require('../src/loglimit') : require(name),
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
   const receiver = new context.module.exports.ReceiverClient({
@@ -1659,10 +1665,10 @@ test('a failed replace restores the previous file and load falls back to the bac
 });
 
 /**
- * Catches a flush that loses a newer sample, a save that overwrites an unreadable
- * history file, or a deleted file whose backup is not loaded.
+ * Catches a flush that loses a newer sample, a corrupt file with a good backup that
+ * stays unsaved, or a deleted file whose backup is not loaded.
  */
-test('shutdown flush wins over an older async save, and a bad history file is not overwritten', async () => {
+test('shutdown flush wins over an older async save, and a corrupt history file is recovered from its backup', async () => {
   const dir = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'history-flush-'));
   const file = path.join(dir, 'history.json');
   const history = new History({
@@ -1718,13 +1724,18 @@ test('shutdown flush wins over an older async save, and a bad history file is no
   } finally {
     console.warn = originalWarn;
   }
-  assert.equal(blocked.savesDisabled, true);
+  // A corrupt main file with a good .bak is moved aside and saving resumes.
+  assert.equal(blocked.savesDisabled, false);
   assert.ok(blocked.interference.length >= 1);
+  const corruptNames = fs.readdirSync(dir).filter((name) => name.includes('.corrupt-'));
+  assert.equal(corruptNames.length, 1);
+  assert.equal(fs.readFileSync(path.join(dir, corruptNames[0]), 'utf8'), '{');
   blocked.addInterference('L1', sample(-50), now + 3);
   await blocked.save();
   blocked.saveSync();
-  assert.equal(fs.readFileSync(file, 'utf8'), '{');
-  assert.match(warnings.join('\n'), /saves disabled/);
+  const rewritten = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.ok(rewritten.interference.some((item) => item.maxPower === -50));
+  assert.match(warnings.join('\n'), /saving will resume/);
 
   fs.rmSync(file);
   const fromBackup = new History({

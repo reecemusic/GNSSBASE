@@ -18,6 +18,7 @@ const {
   parseAsciiLog, interpretItDetectStatus, decodeItDetectStatusBinary, novatelCrc32Buffer, gpsToMs,
 } = require('./novatel');
 const { decode } = require('./messages');
+const { logLimited } = require('./loglimit');
 const { solutionSample, replaceFile } = require('./history');
 
 const gzip = promisify(zlib.gzip);
@@ -790,6 +791,11 @@ class InterferenceArchive extends EventEmitter {
       stallTimeoutMs: 120000,
       // A call that never settles must not block later loads forever. The OS request is not cancelled.
       hungResetMs: 10 * 60 * 1000,
+      // A stream that never emits 'close' used to leave stuckHandles at 1 forever,
+      // so assertAvailable and autoTick refused every later load. Age it out at
+      // three hung-reset intervals unless the caller sets stuckHandleMs. The OS
+      // read is not cancelled; the counter is what lets the next scan start.
+      stuckHandleMs: null,
       now: () => Date.now(),
       ...options,
     };
@@ -1086,7 +1092,8 @@ class InterferenceArchive extends EventEmitter {
       if (generation !== this.generation) return;
       this.stopStream();
       this.autoState.lastError = error.message;
-      console.warn(`[archive] load failed: ${error.message}; live receiver data is unaffected`);
+      // Automatic refresh retries this. The first failure is logged; later ones are counted once a minute.
+      logLimited('warn', 'archive-load', `[archive] load failed: ${error.message}; live receiver data is unaffected`);
       if (this.view) {
         this.restoreView();
         this.update({ message: `Refresh failed (${error.message}); showing the previously loaded data` }, true);
@@ -1366,7 +1373,9 @@ class InterferenceArchive extends EventEmitter {
    * Clears this.stream and cancelScan, then invokes cancelScan (scanFile's
    * abandon, resolving null). When the stream exists and is not closed,
    * stuckHandles increments, the 'close' event decrements it (not below 0),
-   * and trackHung is armed on that close promise. destroy() is still called.
+   * and trackHung is armed on that close promise. If 'close' never arrives,
+   * stuckHandleMs (default three times hungResetMs) drops the counter, records
+   * lastError, and lets the next scan start. destroy() is still called.
    * A stream that is already closed does not change stuckHandles.
    * No parameters.
    * @returns {void}
@@ -1385,10 +1394,36 @@ class InterferenceArchive extends EventEmitter {
       if (!stream.closed) {
         this.stuckHandles++;
         const closed = new Promise((resolve) => {
-          stream.once('close', () => {
+          let settled = false;
+          /**
+           * Drops one stuck-handle count. 'close' and the age-out timer both call this.
+           * The second call is ignored so the counter cannot go negative from both.
+           * @returns {void}
+           * Side effects: may decrement stuckHandles and clear the age-out timer.
+           * Events: none.
+           */
+          const release = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
             if (this.stuckHandles > 0) this.stuckHandles--;
             resolve();
-          });
+          };
+          stream.once('close', release);
+          // Default is 3x hungResetMs, which is longer than the short wait in the
+          // existing "still blocks until close" test. An explicit stuckHandleMs wins.
+          const ageMs = Number.isFinite(this.options.stuckHandleMs) && this.options.stuckHandleMs >= 0
+            ? this.options.stuckHandleMs
+            : this.options.hungResetMs * 3;
+          const timer = setTimeout(() => {
+            const message = 'A network folder read did not close and was released so archive loading can continue';
+            console.warn(`[archive] ${message}`);
+            this.addError(message);
+            this.autoState.lastError = message;
+            release();
+            this.update({}, true);
+          }, ageMs);
+          if (typeof timer.unref === 'function') timer.unref();
         });
         this.trackHung(closed);
       }

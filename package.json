@@ -5,18 +5,18 @@
   "main": "src/server.js",
   "type": "commonjs",
   "scripts": {
-    "start": "node src/server.js",
+    "start": "node src/start.js",
     "sim": "node tools/simulator.js",
-    "test": "node --test tools/memory.test.js tools/archive.test.js tools/solution.test.js tools/robustness.test.js"
+    "test": "node --test tools/memory.test.js tools/archive.test.js tools/solution.test.js tools/robustness.test.js tools/uptime.test.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "dependencies": {
-    "serialport": "^12.0.0"
+    "serialport": "^13.0.0"
   },
   "private": true,
   "allowScripts": {
-    "@serialport/bindings-cpp@12.0.1": true
+    "@serialport/bindings-cpp@13.0.0": true
   }
 }

@@ -72,9 +72,52 @@ const TIME_STATUS_NAMES = new Set([
 // GPS epoch is 1980-01-06 UTC. gpsToMs adds week * 604800000 (one week in
 // milliseconds) and subtracts LEAP_SECONDS.
 const GPS_EPOCH_MS = Date.UTC(1980, 0, 6);
-// GPS-UTC offset. LEAP_SECONDS is 18 since 2017-01-01. Until the constant is
-// updated, archive GPS time is 1 s off live reception after a new leap second.
+// GPS-UTC offset. LEAP_SECONDS is 18 since 2017-01-01. NOVATEL_LEAP_SECONDS overrides
+// it. A receiver-provided offset, once a decoded log actually carries one, wins over
+// both via setReceiverLeapSeconds. None of the logs this process already decodes
+// include that offset: ephemeris clockOffset is the satellite clock bias, not UTC.
+// Until one of those is set, archive GPS time is 1 s off live reception after a new leap second.
 const LEAP_SECONDS = 18;
+/** Set by setReceiverLeapSeconds when a decoded log reports the offset. Null uses the env or 18. */
+let receiverLeapSeconds = null;
+
+/**
+ * GPS-UTC leap seconds used by gpsToMs.
+ * A value passed to setReceiverLeapSeconds wins. Otherwise NOVATEL_LEAP_SECONDS
+ * when it is an integer from 0 through 60. Otherwise LEAP_SECONDS (18).
+ * @returns {number}
+ * Side effects: reads process.env.NOVATEL_LEAP_SECONDS. Does not throw.
+ * Events: none.
+ */
+function currentLeapSeconds() {
+  if (Number.isInteger(receiverLeapSeconds) && receiverLeapSeconds >= 0 && receiverLeapSeconds <= 60) {
+    return receiverLeapSeconds;
+  }
+  const raw = process.env.NOVATEL_LEAP_SECONDS;
+  if (raw !== undefined && raw !== '') {
+    const value = Number(raw);
+    if (Number.isInteger(value) && value >= 0 && value <= 60) return value;
+  }
+  return LEAP_SECONDS;
+}
+
+/**
+ * Remembers a leap-second offset reported by the receiver.
+ * Ignored unless value is an integer from 0 through 60. No decoded log currently
+ * calls this. It is the hook for a future TIME or CLOCK offset field.
+ * @param {number} value GPS-UTC leap seconds.
+ * @returns {void}
+ * Side effects: assigns receiverLeapSeconds when value is in range. Does not log.
+ * Events: none.
+ */
+function setReceiverLeapSeconds(value) {
+  // null clears a previous receiver value so the environment or the default is used again.
+  if (value === null || value === undefined) {
+    receiverLeapSeconds = null;
+    return;
+  }
+  if (Number.isInteger(value) && value >= 0 && value <= 60) receiverLeapSeconds = value;
+}
 
 /**
  * Converts a GPS week and seconds-of-week to Unix milliseconds.
@@ -88,8 +131,8 @@ const LEAP_SECONDS = 18;
  */
 function gpsToMs(week, seconds) {
   if (!Number.isFinite(week) || !Number.isFinite(seconds)) return null;
-  // 1980-01-06 plus week * 604800000 ms, then subtract LEAP_SECONDS.
-  const ms = GPS_EPOCH_MS + week * 604800000 + (seconds - LEAP_SECONDS) * 1000;
+  // 1980-01-06 plus week * 604800000 ms, then subtract the configured leap seconds.
+  const ms = GPS_EPOCH_MS + week * 604800000 + (seconds - currentLeapSeconds()) * 1000;
   return Number.isFinite(ms) && Math.abs(ms) <= 8640000000000000 ? ms : null;
 }
 
@@ -589,6 +632,9 @@ module.exports = {
   findSyncIndex,
   gpsToUtc,
   gpsToMs,
+  currentLeapSeconds,
+  setReceiverLeapSeconds,
+  LEAP_SECONDS,
   saneTimestamp,
   SANE_GPS_EARLIEST_MS,
   SANE_GPS_SKEW_MS,
