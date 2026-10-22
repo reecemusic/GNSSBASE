@@ -1,3 +1,8 @@
+/**
+ * Locks in the archive scanner and NAS failure modes: binary and ASCII
+ * framing, cached summaries, and loads that time out or keep the previous
+ * data when the share stalls or returns an error.
+ */
 'use strict';
 
 const test = require('node:test');
@@ -13,25 +18,56 @@ const { InterferenceArchive, FileSummary, createItDetectScanner, fileNameTime } 
 const GPS_EPOCH_MS = Date.UTC(1980, 0, 6);
 const NOW = Date.UTC(2026, 9, 20, 12, 0, 0);
 
+/**
+ * Converts a UTC millisecond timestamp into GPS week and milliseconds-of-week.
+ * Adds 18000 ms (18 s) before splitting. A week is 604800000 ms.
+ * @param {number} t UTC time in milliseconds.
+ * @returns {{week: number, ms: number}} GPS week and milliseconds into that week.
+ */
 function gpsTime(t) {
+  // UTC plus 18 s, then split into GPS week and ms-of-week (604800000 ms).
   const gps = t - GPS_EPOCH_MS + 18000;
   return { week: Math.floor(gps / 604800000), ms: gps % 604800000 };
 }
 
+/**
+ * Builds one NovAtel binary frame.
+ * Header bytes written: sync AA 44 12, header length 28, message id at offset 4,
+ * antenna at byte 6, body length at offset 8, GPS week at offset 14, and
+ * milliseconds-of-week at offset 16. Other header bytes stay 0.
+ * The last four bytes are the CRC32 of everything before them; corrupt flips the low bit.
+ * @param {number} id Message id.
+ * @param {number} t UTC timestamp passed through gpsTime.
+ * @param {Buffer} body Message body.
+ * @param {number} [antenna=0] Value written at header byte 6.
+ * @param {boolean} [corrupt=false] When true, XOR the CRC with 1.
+ * @returns {Buffer} Header, body, and 4-byte CRC.
+ */
 function binaryFrame(id, t, body, { antenna = 0, corrupt = false } = {}) {
   const header = Buffer.alloc(28);
+  // Sync AA 44 12, then header length 28.
   header.set([0xaa, 0x44, 0x12, 28]);
+  // Message id, uint16 little-endian at offset 4.
   header.writeUInt16LE(id, 4);
+  // Antenna value at byte 6.
   header[6] = antenna;
+  // Body length, uint16 little-endian at offset 8.
   header.writeUInt16LE(body.length, 8);
   const { week, ms } = gpsTime(t);
+  // GPS week at offset 14 and milliseconds-of-week at offset 16.
   header.writeUInt16LE(week, 14);
   header.writeUInt32LE(ms, 16);
   const frame = Buffer.concat([header, body, Buffer.alloc(4)]);
+  // CRC32 of every byte except these four. corrupt flips the low bit.
   frame.writeUInt32LE((novatelCrc32Buffer(frame, 0, frame.length - 4) ^ (corrupt ? 1 : 0)) >>> 0, frame.length - 4);
   return frame;
 }
 
+/**
+ * Builds an ITDETECTSTATUS binary body: a count, then one 36-byte record per detection.
+ * @param {Array<{rf: number, type?: number, center: number, bandwidth: number, power: number}>} [detections] Detection records. type defaults to 0.
+ * @returns {Buffer}
+ */
 function itBody(detections = []) {
   const body = Buffer.alloc(4 + detections.length * 36);
   body.writeUInt32LE(detections.length, 0);
@@ -46,12 +82,28 @@ function itBody(detections = []) {
   return body;
 }
 
+/**
+ * Builds one CRC-terminated ASCII log line. Week and seconds come from gpsTime.
+ * @param {number} t UTC timestamp.
+ * @param {string} [data='0'] Payload after the semicolon.
+ * @param {string} [name='ITDETECTSTATUSA'] Log name.
+ * @returns {Buffer} `#` line with an 8-digit CRC of the sentence between `#` and `*`.
+ */
 function asciiLine(t, data = '0', name = 'ITDETECTSTATUSA') {
   const { week, ms } = gpsTime(t);
   const body = `${name},FILE,0,53.0,FINESTEERING,${week},${(ms / 1000).toFixed(3)},02000000,0000,16809;${data}`;
+  // Eight-digit CRC of the sentence between # and *.
   return Buffer.from(`#${body}*${novatelCrc32(body).toString(16).padStart(8, '0')}\r\n`, 'latin1');
 }
 
+/**
+ * Builds a 72-byte BESTPOS body. Only status, type, tracked, and used are written.
+ * @param {number} used Satellites used, byte 65.
+ * @param {number} [type=16] Position type at byte 4.
+ * @param {number} [status=0] Solution status at byte 0.
+ * @param {number} [tracked=30] Satellites tracked, byte 64.
+ * @returns {Buffer} 72-byte body. Every other byte stays 0.
+ */
 function bestposBody(used, type = 16, status = 0, tracked = 30) {
   const body = Buffer.alloc(72);
   body.writeUInt32LE(status, 0);
@@ -61,15 +113,37 @@ function bestposBody(used, type = 16, status = 0, tracked = 30) {
   return body;
 }
 
+/**
+ * Builds a CRC-terminated BESTPOS ASCII line.
+ * @param {number} t UTC timestamp.
+ * @param {number} used Satellites used, written as the last field.
+ * @param {string} [type='SINGLE'] Position type text.
+ * @param {string} [status='SOL_COMPUTED'] Solution status text.
+ * @param {string} [name='BESTPOSA'] Log name.
+ * @returns {Buffer}
+ */
 function bestposAscii(t, used, type = 'SINGLE', status = 'SOL_COMPUTED', name = 'BESTPOSA') {
   return asciiLine(t, `${status},${type},51,-1,100,0,WGS84,1,1,1,"",0,0,30,${used}`, name);
 }
 
+/**
+ * Builds a CRC-terminated BESTSATS ASCII line, one GPS entry per status.
+ * @param {number} t UTC timestamp.
+ * @param {string[]} statuses Per-satellite status strings. PRNs are 1-based indexes.
+ * @param {string} [name='BESTSATSA'] Log name.
+ * @returns {Buffer}
+ */
 function bestsatsAscii(t, statuses, name = 'BESTSATSA') {
   return asciiLine(t, [statuses.length, ...statuses.flatMap((status, index) =>
     ['GPS', index + 1, status, '00000007'])].join(','), name);
 }
 
+/**
+ * Builds a BESTSATS binary body: uint32 count, then 16-byte records.
+ * Each record leaves the system word 0 and writes PRN, status, and mask 7.
+ * @param {number[]} statuses Status word per satellite. PRN is the 1-based index.
+ * @returns {Buffer}
+ */
 function bestsatsBody(statuses) {
   const body = Buffer.alloc(4 + statuses.length * 16);
   body.writeUInt32LE(statuses.length, 0);
@@ -81,6 +155,7 @@ function bestsatsBody(statuses) {
   return body;
 }
 
+/** Catches a scan that invents fix type or tracked count, or that changes when the same log is split. */
 test('BESTSATS ASCII and binary recover GOOD count without inventing fix type or tracked count', () => {
   const start = NOW - 3600000;
   const log = Buffer.concat([
@@ -106,6 +181,7 @@ test('BESTSATS ASCII and binary recover GOOD count without inventing fix type or
   for (const size of [1, 3, 17, 29, 100, 4096]) assert.deepEqual(scan(log, size), expected, `chunk size ${size}`);
 });
 
+/** Catches a scan that stops after a bad BESTSATS or truncated detection instead of keeping the next valid reports. */
 test('archive skips malformed decoded records and continues through the following valid reports', () => {
   const start = NOW - 3600000;
   const truncated = Buffer.alloc(4);
@@ -124,6 +200,7 @@ test('archive skips malformed decoded records and continues through the followin
   assert.deepEqual(summary.coverage, [[start + 4000, start + 4000]]);
 });
 
+/** Catches BESTPOS times, CRC errors, or solution intervals that change when the log is read in small chunks. */
 test('BESTPOS scanner parses ASCII and binary with receiver times, CRC checks and chunk boundaries', () => {
   const start = NOW - 3600000;
   const log = Buffer.concat([
@@ -151,7 +228,11 @@ test('BESTPOS scanner parses ASCII and binary with receiver times, CRC checks an
   for (const size of [1, 3, 17, 29, 100, 4096]) assert.deepEqual(scan(log, size), expected, `chunk size ${size}`);
 });
 
-/** A mixed log: large unrelated binary frames, binary and ASCII ITDETECTSTATUS, and noise. */
+/**
+ * Mixed log: unrelated binary frames, binary and ASCII ITDETECTSTATUS, and noise.
+ * @param {number} start UTC start time in milliseconds.
+ * @returns {Buffer} Concatenated frames used by the scanner tests.
+ */
 function sampleLog(start) {
   const filler = Buffer.alloc(4000, 0xaa); // repeated sync-like bytes inside a skipped frame
   return Buffer.concat([
@@ -171,6 +252,12 @@ function sampleLog(start) {
   ]);
 }
 
+/**
+ * Pushes a buffer through the ITDETECT scanner in fixed-size chunks.
+ * @param {Buffer} buffer Log bytes.
+ * @param {number} chunkSize Maximum bytes per push.
+ * @returns {object} FileSummary JSON.
+ */
 function scan(buffer, chunkSize) {
   const summary = new FileSummary();
   const scanner = createItDetectScanner(summary);
@@ -178,6 +265,7 @@ function scan(buffer, chunkSize) {
   return summary.toJSON();
 }
 
+/** Catches ITDETECTSTATUS reports dropped at a chunk boundary, or clear reports stored as detections. */
 test('scanner decodes binary and ASCII ITDETECTSTATUS regardless of chunk boundaries', () => {
   const start = NOW - 3600000;
   const log = sampleLog(start);
@@ -195,20 +283,40 @@ test('scanner decodes binary and ASCII ITDETECTSTATUS regardless of chunk bounda
   }
 });
 
+/** Catches a file-name clock that misses the YYYY-MM-DD_HH-mm-ss stamp or accepts an unrelated name. */
 test('file names give approximate start times', () => {
   assert.equal(fileNameTime('NMUT23450006R_2026-10-02_00-43-27.LOG'), Date.UTC(2026, 9, 2, 0, 43, 27));
   assert.equal(fileNameTime('other.log'), null);
 });
 
+/**
+ * Resolves with archive.status() once state is listed, waiting on status events if needed.
+ * @param {object} archive InterferenceArchive under test.
+ * @param {string[]} states Status states that end the wait.
+ * @returns {Promise<object>} Matching status object.
+ */
 async function waitFor(archive, states) {
   while (!states.includes(archive.status().state)) await once(archive, 'status');
   return archive.status();
 }
 
+/**
+ * Creates a temporary archive root under os.tmpdir() and removes it when the test ends.
+ * @param {object} t Node test context. t.after deletes the temp directory.
+ * @param {object} [extra] Extra InterferenceArchive options merged over the temp paths.
+ * @returns {{root: string, dir: string, write: Function, options: object}}
+ */
 function makeArchive(t, extra = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'archive-test-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const root = path.join(dir, 'pwrpak1');
+  /**
+   * Writes one log under root/2026/<doy>/, creating the folder if needed.
+   * @param {string} doy Day-of-year folder name.
+   * @param {string} name File name.
+   * @param {Buffer} buffer File contents.
+   * @returns {void}
+   */
   const write = (doy, name, buffer) => {
     const folder = path.join(root, '2026', doy);
     fs.mkdirSync(folder, { recursive: true });
@@ -221,6 +329,7 @@ function makeArchive(t, extra = {}) {
   return { root, dir, write, options };
 }
 
+/** Catches a load that reads outside the requested days, ignores the cache, or drops saved settings. */
 test('archive loads the requested days from YYYY/DDD folders and reuses its cache', async (t) => {
   const { root, write, options } = makeArchive(t);
   // 2026-10-20 is day 293.
@@ -258,6 +367,7 @@ test('archive loads the requested days from YYYY/DDD folders and reuses its cach
   assert.equal(reloaded.status().samples, 0);
 });
 
+/** Catches a missing root reported as ready, or a cancel that lets the scan continue. */
 test('archive reports an unreachable folder and can be cancelled', async (t) => {
   const { root, write, options } = makeArchive(t);
   const archive = new InterferenceArchive(options);
@@ -273,6 +383,7 @@ test('archive reports an unreachable folder and can be cancelled', async (t) => 
   assert.equal(archive.status().state, 'cancelled', 'a cancelled scan does not resume');
 });
 
+/** Catches BESTPOS intervals that ignore the query window, or an old cache version that is reused. */
 test('BESTPOS-only archives load, clip long intervals, invalidate old caches and reload from cache', async (t) => {
   const { write, options } = makeArchive(t);
   const start = NOW - 3600000;
@@ -315,6 +426,7 @@ test('BESTPOS-only archives load, clip long intervals, invalidate old caches and
   assert.deepEqual(archive.query(query).solution, []);
 });
 
+/** Catches BESTSATS samples merged into BESTPOS, or a cache reload that changes the query. */
 test('BESTSATS loads from cache and stays separate from BESTPOS across files and report order', async (t) => {
   const { write, options } = makeArchive(t);
   const start = NOW - 3600000;
@@ -346,6 +458,7 @@ test('BESTSATS loads from cache and stays separate from BESTPOS across files and
   assert.deepEqual(archive.query(query).bestsats, []);
 });
 
+/** Catches BESTSATS storage or a query that grows without a bound as the used count changes every second. */
 test('rapidly changing BESTSATS counts have bounded scan, storage and response sizes', async (t) => {
   const { write, options } = makeArchive(t, { maxSamples: 20 });
   const start = NOW - 3600000;
@@ -367,6 +480,7 @@ test('rapidly changing BESTSATS counts have bounded scan, storage and response s
   assert(archive.query({ from: start, to: NOW, buckets: 10 }).bestsats.length <= 11);
 });
 
+/** Catches solution storage or a query that grows without a bound, or coarsening that leaves the source span. */
 test('BESTPOS storage and query sizes stay bounded even with rapidly changing solutions', async (t) => {
   const { write, options } = makeArchive(t, { maxSamples: 20 });
   const start = NOW - 3600000;
@@ -393,6 +507,7 @@ test('BESTPOS storage and query sizes stay bounded even with rapidly changing so
     'coarsening stays inside the continuous source coverage');
 });
 
+/** Catches query downsampling that joins BESTPOS intervals across a gap with no reports. */
 test('query downsampling keeps continuous coverage but never fills a missing BESTPOS gap', () => {
   const archive = new InterferenceArchive({ defaultRoot: os.tmpdir() });
   const summary = new FileSummary();
@@ -410,6 +525,7 @@ test('query downsampling keeps continuous coverage but never fills a missing BES
   assert(detailed.solution.every((s) => s.end <= 94000 || s.t >= 150000), 'lost output remains a real gap');
 });
 
+/** Catches detection storage past the sample limit, or a query that claims finer resolution than was stored. */
 test('archive coarsens detection resolution to stay within its sample limit', async (t) => {
   const { root, write, options } = makeArchive(t, { maxSamples: 1000, cacheDir: null });
   const start = NOW - 3 * 3600000;
@@ -431,6 +547,7 @@ test('archive coarsens detection resolution to stay within its sample limit', as
   assert(result.samples.length <= 750);
 });
 
+/** Catches a refresh that hides the loaded archive before the new scan is ready to swap in. */
 test('a background refresh keeps the loaded data visible until the new load is swapped in', async (t) => {
   const { root, write, options } = makeArchive(t);
   write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
@@ -459,6 +576,7 @@ test('a background refresh keeps the loaded data visible until the new load is s
   assert(after.reports > first.reports);
 });
 
+/** Catches a failed or cancelled refresh that drops the archive already loaded. */
 test('a failed or cancelled background refresh restores the previous data', async (t) => {
   const { root, write, options } = makeArchive(t);
   write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
@@ -484,6 +602,7 @@ test('a failed or cancelled background refresh restores the previous data', asyn
   assert.equal(status.samples, first.samples);
 });
 
+/** Catches a hung fs.access that never fails the load, or an auto tick that starts more NAS work behind it. */
 test('NAS calls that hang time out, and automatic refresh waits for them to settle', async (t) => {
   const { root, options } = makeArchive(t, { fsTimeoutMs: 50 });
   fs.mkdirSync(root, { recursive: true });
@@ -513,6 +632,7 @@ test('NAS calls that hang time out, and automatic refresh waits for them to sett
   assert.equal(archive.hung, 0);
 });
 
+/** Catches a cancel that still lists the directory, or a retry that starts before the hung access settles. */
 test('a cancelled directory request cannot start more NAS work or be retried until it settles', async (t) => {
   const { root, options } = makeArchive(t);
   let release;
@@ -530,6 +650,7 @@ test('a cancelled directory request cannot start more NAS work or be retried unt
   assert.equal(archive.status().state, 'cancelled');
 });
 
+/** Catches a stalled read that waits on destroy, or a late stream error that is left unhandled. */
 test('a stalled NAS read times out even when destroy is waiting for Windows, and late errors are handled', async (t) => {
   const { root, write, options } = makeArchive(t, { stallTimeoutMs: 40, cacheDir: null });
   write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
@@ -561,6 +682,7 @@ test('a stalled NAS read times out even when destroy is waiting for Windows, and
   assert.equal(archive.hung, 0);
 });
 
+/** Catches an EIO during listing or reading that discards the archive loaded before the refresh. */
 test('network errors while listing or reading fail a refresh without discarding the previous archive', async (t) => {
   const { root, write, options } = makeArchive(t, { cacheDir: null });
   write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
@@ -589,6 +711,7 @@ test('network errors while listing or reading fail a refresh without discarding 
   }
 });
 
+/** Catches a readable stream that never emits data and leaves the load hanging. */
 test('a read that stops delivering data is abandoned instead of hanging the load', async (t) => {
   const { root, write, options } = makeArchive(t, { stallTimeoutMs: 80, cacheDir: null });
   write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
@@ -603,6 +726,7 @@ test('a read that stops delivering data is abandoned instead of hanging the load
   assert.match(status.message, /no data received/);
 });
 
+/** Catches auto mode overlapping a load, forgetting the setting, or staying on after clear. */
 test('automatic mode loads, never overlaps a running load, and is turned off by Unload', async (t) => {
   const { root, write, options } = makeArchive(t, { refreshMs: 3600000 });
   write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 2 * 3600000));
@@ -632,12 +756,30 @@ test('automatic mode loads, never overlaps a running load, and is turned off by 
   assert.equal(archive.autoTimer, null);
 });
 
+/** Catches abbreviated BESTSATS or BESTPOS blocks that fail when split, or a short block that is accepted. */
 test('abbreviated ASCII BESTSATS and BESTPOS (as logged on the NAS) are decoded across chunk boundaries', () => {
   const t = NOW - 3600000;
   const { week, ms } = gpsTime(t);
+  /**
+   * Abbreviated ASCII header for one log, using GPS week and seconds plus offset.
+   * @param {string} name Log name.
+   * @param {number} offset Milliseconds added to the header time.
+   * @returns {string} Header line ending in CRLF.
+   */
   const header = (name, offset) => `<${name} FILE 0 54.0 FINESTEERING ${week} ${((ms + offset) / 1000).toFixed(3)} 02000808 be05 18279\r\n`;
+  /**
+   * Abbreviated BESTSATS block: header, count, and one GPS row per status.
+   * @param {number} offset Milliseconds added to the header time.
+   * @param {string[]} statuses Status words.
+   * @returns {string} Multi-line abbreviated block.
+   */
   const bestsats = (offset, statuses) => header('BESTSATS', offset) + `<     ${statuses.length} \r\n`
     + statuses.map((status, index) => `<                    GPS ${index + 1} ${status} 00000003 \r\n`).join('');
+  /**
+   * Abbreviated BESTPOS block with a fixed NARROW_INT body.
+   * @param {number} offset Milliseconds added to the header time.
+   * @returns {string} Header plus one BESTPOS body line.
+   */
   const bestpos = (offset) => header('BESTPOS', offset)
     + '<     SOL_COMPUTED NARROW_INT 51.1 -114.0 1064.6 -16.2 WGS84 0.01 0.01 0.02 "0" 1.000 0.000 31 27 27 20 00 21 3f 37\r\n';
   const log = Buffer.concat([
@@ -670,4 +812,146 @@ test('abbreviated ASCII BESTSATS and BESTPOS (as logged on the NAS) are decoded 
   scanner.end();
   assert.equal(truncated.toJSON().bestsatsReports, 0, 'a block with missing rows is rejected');
   assert.equal(truncated.toJSON().crcErrors, 1);
+});
+
+/** Catches a non-target length past EOF that consumes the ITDETECTSTATUS frame after it. */
+test('a carried non-target length that overruns end of file does not swallow the tail', () => {
+  const start = NOW - 3600000;
+  const detection = binaryFrame(2065, start, itBody([{ rf: 5, center: 1176.45, bandwidth: 3, power: -90 }]));
+  const liar = Buffer.alloc(28);
+  liar.set([0xaa, 0x44, 0x12, 28]);
+  liar.writeUInt16LE(43, 4);
+  liar.writeUInt16LE(20000, 8);
+  const log = Buffer.concat([liar, detection]);
+  for (const size of [log.length, 7, 64]) {
+    const summary = new FileSummary();
+    const scanner = createItDetectScanner(summary);
+    for (let offset = 0; offset < log.length; offset += size) scanner.push(log.subarray(offset, offset + size));
+    scanner.end();
+    const json = summary.toJSON();
+    assert.equal(json.reportCount, 1, `chunk size ${size}`);
+    assert.equal(json.samples.length, 1);
+    assert.equal(json.samples[0].signal, 'L5');
+  }
+});
+
+/** Catches a skip that trusts a non-target length when the following bytes are not a sync. */
+test('a non-target frame whose length does not land on the next sync is not skipped over', () => {
+  const start = NOW - 3600000;
+  const detection = binaryFrame(2065, start, itBody([{ rf: 5, center: 1176.45, bandwidth: 3, power: -90 }]));
+  const liar = Buffer.alloc(42, 0x11);
+  liar.set([0xaa, 0x44, 0x12, 28]);
+  liar.writeUInt16LE(43, 4);
+  liar.writeUInt16LE(15, 8);
+  const log = Buffer.concat([liar, detection]);
+  for (const size of [log.length, 1, 7, 64]) {
+    const summary = scan(log, size);
+    assert.equal(summary.reportCount, 1, `chunk size ${size}`);
+    assert.equal(summary.samples.length, 1);
+    assert.equal(summary.samples[0].signal, 'L5');
+  }
+});
+
+/** Catches a cache hit that keeps a null sample instead of rescanning the log. */
+test('a cached summary with a null sample is discarded and the file is rescanned', async (t) => {
+  const zlib = require('node:zlib');
+  const { write, options } = makeArchive(t);
+  write('293', 'X_2026-10-20_10-00-00.LOG', sampleLog(NOW - 3600000));
+  const archive = new InterferenceArchive(options);
+  archive.load({ days: 1 });
+  let status = await waitFor(archive, ['ready', 'error']);
+  assert.equal(status.state, 'ready', status.message);
+  const cacheFile = fs.readdirSync(options.cacheDir).find((name) => name.endsWith('.json.gz'));
+  const cachePath = path.join(options.cacheDir, cacheFile);
+  const parsed = JSON.parse(zlib.gunzipSync(fs.readFileSync(cachePath)));
+  parsed.solution.push(null);
+  fs.writeFileSync(cachePath, zlib.gzipSync(JSON.stringify(parsed)));
+  const again = new InterferenceArchive(options);
+  again.load({ days: 1 });
+  status = await waitFor(again, ['ready', 'error']);
+  assert.equal(status.state, 'ready', status.message);
+  assert.equal(status.filesCached, 0);
+  assert.ok(status.errors.some((error) => /unusable/i.test(error)));
+  assert.ok(status.reports > 0);
+});
+
+/** Catches a hung withTimeout that still blocks loads after hungResetMs. */
+test('a network call that never settles stops blocking archive loads after hungResetMs', async () => {
+  const archive = new InterferenceArchive({
+    hungResetMs: 40, fsTimeoutMs: 20, cacheDir: null, settingsFile: null, defaultRoot: path.parse(process.cwd()).root,
+  });
+  let release;
+  const hung = new Promise((resolve) => { release = resolve; });
+  await assert.rejects(archive.withTimeout(hung, 'test share'), /did not respond/);
+  assert.equal(archive.pendingFs, 1);
+  assert.equal(archive.hung, 1);
+  assert.throws(() => archive.assertAvailable(), /outstanding request/);
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal(archive.pendingFs, 0);
+  assert.equal(archive.hung, 0);
+  assert.doesNotThrow(() => archive.assertAvailable());
+  assert.match(archive.autoState.lastError, /marked finished/);
+  release();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(archive.pendingFs, 0);
+  assert.equal(archive.hung, 0);
+});
+
+/** Catches a stream marked finished while its handle is still open, so the next scan starts too early. */
+test('a released hung read still blocks the next scan until the handle closes', async () => {
+  const { EventEmitter } = require('node:events');
+  const archive = new InterferenceArchive({
+    hungResetMs: 30, fsTimeoutMs: 20, cacheDir: null, settingsFile: null,
+    defaultRoot: path.parse(process.cwd()).root, refreshMs: 1000,
+  });
+  const stream = new EventEmitter();
+  stream.closed = false;
+  stream.destroy = () => {};
+  archive.stream = stream;
+  archive.stopStream();
+  assert.equal(archive.stuckHandles, 1);
+  assert.equal(archive.hung, 1);
+  assert.throws(() => archive.assertAvailable(), /outstanding request/);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(archive.hung, 0);
+  assert.equal(archive.stuckHandles, 1);
+  assert.throws(() => archive.assertAvailable(), /outstanding request/);
+  archive.settings.auto = true;
+  archive.autoState.lastError = 'A network folder request stayed open and was marked finished so archive loading can continue';
+  let started = 0;
+  archive.start = () => { started += 1; };
+  archive.autoTick();
+  archive.stopAuto();
+  assert.equal(started, 0);
+  assert.match(archive.autoState.lastError, /marked finished/);
+  stream.emit('close');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(archive.stuckHandles, 0);
+  assert.equal(archive.hung, 0);
+  assert.doesNotThrow(() => archive.assertAvailable());
+});
+
+/** Catches a missing cache file that is not restored from its .bak copy. */
+test('archive cache falls back to its backup when the cache file is missing', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cache-bak-'));
+  try {
+    const archive = new InterferenceArchive({
+      cacheDir: dir, settingsFile: null, defaultRoot: path.parse(dir).root,
+    });
+    const file = { path: path.join(dir, 'receiver.LOG'), size: 10, mtimeMs: 20 };
+    const summary = {
+      coverage: [], samples: [], solution: [], solutionReports: 0, solutionResolutionMs: 1000,
+      bestsats: [], bestsatsReports: 0, bestsatsResolutionMs: 1000, marker: 1,
+    };
+    await archive.writeCache(file, summary);
+    summary.marker = 2;
+    await archive.writeCache(file, summary);
+    const cachePath = archive.cachePath(file);
+    assert.ok(fs.existsSync(`${cachePath}.bak`));
+    fs.rmSync(cachePath);
+    const restored = await archive.readCache(file);
+    assert.equal(restored.marker, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

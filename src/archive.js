@@ -1,3 +1,11 @@
+/**
+ * Scans NovAtel receiver logs stored on an SMB/NAS share.
+ *
+ * Logs live in YYYY/DDD folders under the archive root (DDD is the day of
+ * year). The scanner keeps bounded summaries of interference (ITDETECTSTATUS),
+ * BESTPOS, and BESTSATS, gzip-caches each summary as JSON, and
+ * InterferenceArchive emits 'status' while a load progresses.
+ */
 'use strict';
 
 const fs = require('node:fs');
@@ -10,7 +18,7 @@ const {
   parseAsciiLog, interpretItDetectStatus, decodeItDetectStatusBinary, novatelCrc32Buffer, gpsToMs,
 } = require('./novatel');
 const { decode } = require('./messages');
-const { solutionSample } = require('./history');
+const { solutionSample, replaceFile } = require('./history');
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -37,6 +45,7 @@ const MAX_DETECTIONS_PER_SAMPLE = 32;
 const MAX_ERRORS = 20;
 const MAX_QUERY_BUCKETS = 4000;
 const READ_CHUNK_BYTES = 1 << 20;
+// Case-insensitive suffix _YYYY-MM-DD_HH-MM-SS.LOG. fileNameTime reads it as UTC.
 const FILE_NAME_TIME = /_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})\.LOG$/i;
 // File names and day folders may use local time; allow for any time zone offset.
 const FILE_TIME_TOLERANCE_MS = 14 * 3600000;
@@ -49,13 +58,29 @@ const DATA_FIELDS = ['coverage', 'samples', 'solution', 'solutionResolutionMs', 
 const NETWORK_ERRORS = new Set(['EIO', 'ENETDOWN', 'ENETUNREACH', 'EHOSTDOWN', 'EHOSTUNREACH',
   'ENOTCONN', 'ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'UNKNOWN']);
 
+/**
+ * Builds an Error that archive loading treats as a failed load rather than a per-file skip.
+ * @param {string} message Error text.
+ * @returns {Error} The error, with `fatal` set true.
+ * Side effects: none. Does not throw.
+ * Events: none.
+ */
 function fatalError(message) {
   const error = new Error(message);
   error.fatal = true;
   return error;
 }
 
-/** True when sample `a` should replace `b` as the strongest report in a bucket. */
+/**
+ * Reports whether sample `a` should replace `b` as the strongest sample in a bucket.
+ * A sample with count > 0 beats a sample whose count is not > 0. Otherwise a finite
+ * maxPower beats a missing one, a higher maxPower wins, and then the higher count wins.
+ * @param {{count: number, maxPower: number|null}} a Candidate sample.
+ * @param {{count: number, maxPower: number|null}} b Sample already kept.
+ * @returns {boolean} True when `a` replaces `b`. Equal count and power returns false.
+ * Side effects: none.
+ * Events: none.
+ */
 function stronger(a, b) {
   if ((a.count > 0) !== (b.count > 0)) return a.count > 0;
   const aPower = Number.isFinite(a.maxPower);
@@ -65,7 +90,19 @@ function stronger(a, b) {
   return a.count > b.count;
 }
 
-/** Latest value per bucket, spanning only contiguous reporting; never bridge missing BESTPOS output. */
+/**
+ * Collapses intervals into buckets of `resolutionMs`, keeping contiguous reporting only.
+ * The bucket key is Math.floor(sample.t / resolutionMs). When the previous interval in
+ * that bucket ends at or after sample.t, the bucket keeps the previous start, takes the
+ * newer sample's other fields, and extends end to the later end. When sample.t is past
+ * the previous end, the bucket is replaced by sample, so the gap is not bridged.
+ * Used for BESTPOS and BESTSATS intervals.
+ * @param {Array<{t: number, end: number}>} samples Intervals in fold order.
+ * @param {number} resolutionMs Bucket width in milliseconds.
+ * @returns {Array<object>} One interval per occupied bucket, in first-seen key order.
+ * Side effects: none.
+ * Events: none.
+ */
 function reduceSolutions(samples, resolutionMs) {
   const kept = new Map();
   for (const sample of samples) {
@@ -77,7 +114,18 @@ function reduceSolutions(samples, resolutionMs) {
   return [...kept.values()];
 }
 
-/** Converts one ITDETECTSTATUS report into per-signal samples in the shape used by live history. */
+/**
+ * Converts one ITDETECTSTATUS report into per-signal samples in the live-history shape.
+ * Detections are grouped by signalType, or 'OTHER' when signalType is missing. count is
+ * the group length. maxPower is the max finite powerDbm, or null. freq is the first
+ * detection's centerFrequencyHz, or null. detections keeps at most
+ * MAX_DETECTIONS_PER_SAMPLE entries, each with freq, bandwidth, power, and type.
+ * @param {number} t Report time in milliseconds.
+ * @param {Array<object>} detections Detections on that report.
+ * @returns {Array<object>} One sample per signal present in the report.
+ * Side effects: none.
+ * Events: none.
+ */
 function reportSamples(t, detections) {
   const bySignal = new Map();
   for (const detection of detections) {
@@ -107,10 +155,22 @@ function reportSamples(t, detections) {
 }
 
 /**
- * Compact file summary: interference coverage and strongest detections per second,
- * plus bounded intervals of unchanged BESTPOS solutions and BESTSATS counts.
+ * Bounded per-file summary: ITDETECTSTATUS coverage and the strongest detection per
+ * signal per second, plus BESTPOS solution intervals and BESTSATS counts.
+ * Not an EventEmitter. Methods mutate the summary and emit nothing.
+ * @param {number} [maxSolutions=MAX_SOLUTION_SAMPLES] Constructor cap on solution intervals before coarsening.
+ * @returns {FileSummary} The constructed summary.
+ * Side effects: the constructor initializes empty coverage, samples, solution, and bestsats holders. No I/O.
+ * Events: none.
  */
 class FileSummary {
+  /**
+   * Creates an empty summary. Solution intervals coarsen once they pass maxSolutions.
+   * @param {number} [maxSolutions=MAX_SOLUTION_SAMPLES] Cap on solution intervals before coarsening.
+   * @returns {FileSummary}
+   * Side effects: initializes empty coverage, samples, solution, and bestsats holders.
+   * Events: none.
+   */
   constructor(maxSolutions = MAX_SOLUTION_SAMPLES) {
     this.reportCount = 0;
     this.crcErrors = 0;
@@ -125,11 +185,37 @@ class FileSummary {
     this.bestsatsSummary = null;
   }
 
+  /**
+   * Records a BESTSATS used-satellite count at time `t`.
+   * Creates a nested FileSummary on first use and stores the count as a solution
+   * interval whose only populated field is satellitesUsed.
+   * @param {number} t Report time in milliseconds.
+   * @param {number} used Count passed through to addSolution as satellitesUsed.
+   * @returns {void}
+   * Side effects: mutates this.bestsatsSummary.
+   * Events: none.
+   */
   addBestSats(t, used) {
     if (!this.bestsatsSummary) this.bestsatsSummary = new FileSummary(this.maxSolutions);
     this.bestsatsSummary.addSolution(t, { satellitesUsed: used });
   }
 
+  /**
+   * Records a BESTPOS-style solution interval.
+   * solutionSample returning null leaves the summary unchanged. Otherwise
+   * solutionReports increments. When the last interval has the same used, tracked,
+   * status, and type and `t` is inside [last.t, last.end], its end moves to
+   * t + SOLUTION_HOLD_MS. Otherwise, when a last interval exists and t >= last.t,
+   * last.end is clipped to min(last.end, t) and a new interval ending at
+   * t + SOLUTION_HOLD_MS is pushed. Past maxSolutions the
+   * intervals are sorted and solutionResolutionMs doubles, via reduceSolutions,
+   * until the length is at most 75% of maxSolutions.
+   * @param {number} t Report time in milliseconds.
+   * @param {object} data Fields consumed by solutionSample (satellitesUsed, and so on).
+   * @returns {void}
+   * Side effects: mutates solution, solutionReports, lastSolution, and maybe solutionResolutionMs.
+   * Events: none.
+   */
   addSolution(t, data) {
     const sample = solutionSample(data, t);
     if (!sample) return;
@@ -154,6 +240,19 @@ class FileSummary {
     }
   }
 
+  /**
+   * Records one interference report.
+   * A non-finite `t` returns immediately. Otherwise reportCount increments and the
+   * last coverage run is extended when `t` is within COVERAGE_GAP_MS of that run;
+   * if not, a new [t, t] run is pushed. Each per-signal sample in the same
+   * 1-second bucket as the previous sample for that signal (Math.floor(t / 1000))
+   * replaces it only when stronger() says so. A new second is appended.
+   * @param {number} t Report time in milliseconds.
+   * @param {Array<object>} detections Detections passed to reportSamples.
+   * @returns {void}
+   * Side effects: mutates reportCount, coverage, samples, and lastBySignal.
+   * Events: none.
+   */
   addReport(t, detections) {
     if (!Number.isFinite(t)) return;
     this.reportCount++;
@@ -175,6 +274,16 @@ class FileSummary {
     }
   }
 
+  /**
+   * Plain JSON shape stored in the gzip cache and merged by addSummary.
+   * bestsats comes from the nested summary's solution array, or [] when no BESTSATS
+   * report has been added. bestsatsResolutionMs is 1000 in that empty case.
+   * No parameters.
+   * @returns {object} reportCount, crcErrors, coverage, samples, solution, solutionReports,
+   *   solutionResolutionMs, bestsats, bestsatsReports, bestsatsResolutionMs.
+   * Side effects: none. Does not include lastBySignal or lastSolution.
+   * Events: none.
+   */
   toJSON() {
     return {
       reportCount: this.reportCount,
@@ -192,16 +301,89 @@ class FileSummary {
 }
 
 /**
- * Incremental scanner for NovAtel log files. Only ITDETECTSTATUS, BESTPOS and BESTSATS are
- * decoded; every other binary frame is skipped by its length
- * without CRC work, so large RANGE/ephemeris traffic costs very little.
+ * True when `index` begins a log, false when it does not, null when more bytes are required.
+ * '#' (0x23) and '<' (0x3c) are boundaries. Any other byte that is not 0xAA is not.
+ * 0xAA needs two more bytes: true when they are 0x44 and either 0x12 or 0x13 (a binary
+ * sync), null when those bytes are not in the buffer yet, false otherwise.
+ * @param {Buffer} buf Buffer to inspect.
+ * @param {number} index Index of the candidate first byte.
+ * @returns {boolean|null}
+ * Side effects: none.
+ * Events: none.
+ */
+function frameBoundary(buf, index) {
+  if (index >= buf.length) return null;
+  const byte = buf[index];
+  if (byte === 0x23 || byte === 0x3c) return true;
+  if (byte !== 0xaa) return false;
+  if (index + 2 >= buf.length) return null;
+  return buf[index + 1] === 0x44 && (buf[index + 2] === 0x12 || buf[index + 2] === 0x13);
+}
+
+/**
+ * True when a cached or scanned summary has the arrays the merger reads.
+ * coverage and samples must be arrays, and every sample needs a finite t.
+ * solution and bestsats must be arrays of objects with finite t and end.
+ * @param {object|null|undefined} summary Value returned by readCache or toJSON.
+ * @returns {boolean} False when summary is missing or any of those checks fail.
+ * Side effects: none.
+ * Events: none.
+ */
+function summaryUsable(summary) {
+  if (!summary) return false;
+  /**
+   * True when `samples` is an array and every entry has finite `t` and `end`.
+   * @param {object[]|undefined} samples
+   * @returns {boolean}
+   * Side effects: none. Events: none.
+   */
+  const finiteEnds = (samples) => Array.isArray(samples)
+    && samples.every((sample) => sample && Number.isFinite(sample.t) && Number.isFinite(sample.end));
+  return Array.isArray(summary.coverage)
+    && Array.isArray(summary.samples)
+    && summary.samples.every((sample) => sample && Number.isFinite(sample.t))
+    && finiteEnds(summary.solution)
+    && finiteEnds(summary.bestsats);
+}
+
+/**
+ * Incremental scanner for one NovAtel log. Decodes only ITDETECTSTATUS, BESTPOS,
+ * and BESTSATS. Other binary frames are skipped by their declared length only when
+ * frameBoundary accepts the following bytes, without CRC work.
+ * push() consumes chunks. end() finishes a carried tail at EOF.
+ * @param {FileSummary} summary Summary mutated as reports are accepted.
+ * @returns {{push: function(Buffer): void, end: function(): void}}
+ * Side effects: none until push or end is called. Those mutate `summary`.
+ * Events: none.
  */
 function createItDetectScanner(summary) {
   let carry = null;
-  let skip = 0;
 
+  /**
+   * Decodes one binary frame that the sync loop already classified as ITDETECTSTATUS,
+   * BESTPOS, or BESTSATS.
+   * Returns immediately, before the CRC check, when the low 5 bits of header byte 6
+   * are nonzero (marked in source as the secondary antenna). A CRC32 that does not
+   * equal the trailer uint32 increments crcErrors and returns; the report is not
+   * stored. GPS week 0 returns without storing. Week is the uint16 at offset 14.
+   * The uint32 at offset 16 is milliseconds and is passed to gpsToMs as seconds (divided by 1000).
+   * BESTSATS requires a count of 0..255 and a body of 4 + count * 16 bytes, then
+   * counts records whose uint32 at offset 12 is 0 and calls addBestSats.
+   * BESTPOS requires a body of at least 72 bytes, then decode() and addSolution.
+   * A BESTPOS decode error propagates. ITDETECTSTATUS uses decodeItDetectStatusBinary;
+   * a thrown decode increments crcErrors, logs a warning, and returns.
+   * Shape failures on BESTSATS and BESTPOS also increment crcErrors and return.
+   * @param {Buffer} buf Chunk that contains the frame.
+   * @param {number} start Index of the AA 44 12 sync.
+   * @param {number} total Frame length in bytes, including the 4-byte CRC.
+   * @returns {void}
+   * Side effects: mutates `summary` and may console.warn.
+   * Events: none.
+   */
   function handleBinary(buf, start, total) {
     if ((buf[start + 6] & 0x1f) !== 0) return; // secondary antenna (ITDETECTSTATUS_1)
+    // Counted binary samples require the CRC32 of the frame to equal the trailer uint32.
+    // A mismatch increments crcErrors and returns. There is no null-checksum path here.
     if (novatelCrc32Buffer(buf, start, start + total - 4) !== buf.readUInt32LE(start + total - 4)) {
       summary.crcErrors++;
       return;
@@ -241,8 +423,30 @@ function createItDetectScanner(summary) {
     }
   }
 
+  /**
+   * Decodes one ASCII log line (a '#' sentence, or an abbreviated block already
+   * rewritten by abbreviatedToAscii).
+   * The gate is `!parsed || parsed.crcValid === false`. That rejects a failed parse
+   * and a checksum that failed. It does not require crcValid === true. crcValid
+   * null (no '*' checksum, which is what abbreviatedToAscii produces) continues
+   * and can be stored when the rest of the line is valid. crcValid true continues
+   * the same way. A false checksum increments crcErrors and is not stored.
+   * A falsy header.week, including week 0, returns without storing and without a crcErrors increment.
+   * BESTSATS requires an integer count of 0..255 and 1 + count * 4 fields, then
+   * counts decoded satellites whose status is 'GOOD'. BESTPOS requires at least
+   * 15 fields, then decode() and addSolution (a decode error propagates).
+   * Any other name is interpreted as ITDETECTSTATUS. A thrown interpret or
+   * BESTSATS decode increments crcErrors, logs a warning, and returns.
+   * @param {string} line One log line, without a trailing checksum for abbreviated input.
+   * @returns {void}
+   * Side effects: mutates `summary` and may console.warn.
+   * Events: none.
+   */
   function handleAscii(line) {
     const parsed = parseAsciiLog(line);
+    // Reject a failed parse or crcValid === false (not stored; crcErrors++).
+    // crcValid === null is not this check: abbreviated ASCII has no checksum and can be stored.
+    // crcValid === true also continues and can be stored.
     if (!parsed || parsed.crcValid === false) {
       summary.crcErrors++;
       return;
@@ -283,21 +487,41 @@ function createItDetectScanner(summary) {
     }
   }
 
+  /**
+   * Scans one chunk joined to any carried tail.
+   * Binary candidates match the AA 44 12 sync. Header byte 3 must be 28
+   * (LONG_HEADER_LENGTH). Message length is the uint16 at offset 8. Total size
+   * is that header length plus the message length plus 4 CRC bytes. A header
+   * length other than 28, or a total above MAX_FRAME_BYTES, steps one byte.
+   * Only ITDETECTSTATUS, BESTPOS, and BESTSATS ids are decoded. Any other id
+   * is skipped by its declared length only when frameBoundary says the next
+   * bytes are '#', '<', or a binary sync. Otherwise the scan steps one byte.
+   * If that declared length reaches the end of the buffer, or a target frame's
+   * length runs past the buffer, the tail from the sync is carried.
+   * '#' markers are read through the next LF. A '<' marker is an abbreviated
+   * block (abbreviatedEnd / abbreviatedToAscii). A marker with no terminator
+   * that is still under the size cap is carried; past the cap the scan steps one byte.
+   * When neither a sync nor an ASCII marker remains, at most ASCII_CARRY_BYTES of the
+   * unscanned tail is carried so a marker split across chunks survives.
+   * @param {Buffer} input Next chunk from the file.
+   * @returns {void}
+   * Side effects: mutates `summary` via handleBinary / handleAscii, and the carry buffer.
+   * Events: none.
+   */
   function push(input) {
-    let chunk = input;
-    if (skip) {
-      if (chunk.length <= skip) {
-        skip -= chunk.length;
-        return;
-      }
-      chunk = chunk.subarray(skip);
-      skip = 0;
-    }
+    const chunk = input;
     const buf = carry ? Buffer.concat([carry, chunk]) : chunk;
     carry = null;
     let i = 0;
     const nextAscii = ASCII_MARKERS.map(() => -2);
     let nextSync = -2;
+    /**
+     * Index of the nearest ASCII marker at or after `from`, or -1 when none remains.
+     * @param {number} from First index to consider.
+     * @returns {number}
+     * Side effects: refreshes the nextAscii cache for markers that were before `from`.
+     * Events: none.
+     */
     const asciiFrom = (from) => {
       let nearest = -1;
       for (let index = 0; index < ASCII_MARKERS.length; index++) {
@@ -318,6 +542,8 @@ function createItDetectScanner(summary) {
         return;
       }
       if (ascii !== -1 && (sync === -1 || ascii < sync)) {
+        // Abbreviated ASCII starts with '<'. Continuation lines are also '<'.
+        // abbreviatedToAscii rewrites the block as an unchecksummed #NAMEA line.
         if (buf[ascii] === 0x3c) {
           const end = abbreviatedEnd(buf, ascii);
           if (end === -1) {
@@ -345,24 +571,38 @@ function createItDetectScanner(summary) {
         i = newline + 1;
         continue;
       }
+      // Fewer than 28 header bytes remain after the sync: carry the tail.
       if (buf.length - sync < LONG_HEADER_LENGTH) {
         carry = Buffer.from(buf.subarray(sync));
         return;
       }
+      // AA 44 12. Byte 3 is the header length. Message length is the uint16 at offset 8.
+      // total = headerLength + messageLength + 4 CRC bytes.
       const total = buf[sync + 3] + buf.readUInt16LE(sync + 8) + 4;
+      // Require header length 28 and a total that fits in MAX_FRAME_BYTES. Otherwise step one byte.
       if (buf[sync + 3] !== LONG_HEADER_LENGTH || total > MAX_FRAME_BYTES) {
         i = sync + 1;
         continue;
       }
       const messageId = buf.readUInt16LE(sync + 4);
+      // Decode only ITDETECTSTATUS, BESTPOS, and BESTSATS. Other ids are not CRC-checked.
       if (messageId !== IT_MESSAGE_ID && messageId !== BESTPOS_MESSAGE_ID && messageId !== BESTSATS_MESSAGE_ID) {
-        if (sync + total > buf.length) {
-          skip = sync + total - buf.length;
+        // Declared length reaches or passes the end of this buffer, so the next byte is unavailable. Carry the tail.
+        if (sync + total >= buf.length) {
+          carry = Buffer.from(buf.subarray(sync));
           return;
         }
-        i = sync + total;
+        // Skip the frame only when the next bytes are '#', '<', or a binary sync.
+        // frameBoundary false: step one byte. null: more bytes are required, so carry the tail.
+        const boundary = frameBoundary(buf, sync + total);
+        if (boundary === null) {
+          carry = Buffer.from(buf.subarray(sync));
+          return;
+        }
+        i = boundary ? sync + total : sync + 1;
         continue;
       }
+      // A target frame whose declared length runs past the buffer: carry the tail.
       if (sync + total > buf.length) {
         carry = Buffer.from(buf.subarray(sync));
         return;
@@ -372,10 +612,53 @@ function createItDetectScanner(summary) {
     }
   }
 
-  /** At end of file an abbreviated message cannot be followed by more rows, so the carried block is complete. */
+  /**
+   * True when `buf` begins with a long header (AA 44 12), header byte 3 is 28,
+   * and total = headerLength + uint16 message length at offset 8 + 4 is within
+   * MAX_FRAME_BYTES and greater than buf.length. The message id is not consulted.
+   * @param {Buffer|null} buf Carried tail.
+   * @returns {boolean}
+   * Side effects: none.
+   * Events: none.
+   */
+  function declaredLengthOverruns(buf) {
+    if (!buf || buf.length < LONG_HEADER_LENGTH) return false;
+    if (buf[0] !== 0xaa || buf[1] !== 0x44 || buf[2] !== 0x12 || buf[3] !== LONG_HEADER_LENGTH) return false;
+    const total = buf[3] + buf.readUInt16LE(8) + 4;
+    return total <= MAX_FRAME_BYTES && total > buf.length;
+  }
+
+  /**
+   * Finishes the carried tail at EOF, then clears it.
+   * A carried block that starts with '<' and already contains a newline is completed
+   * through abbreviatedToAscii and handleAscii. A block that starts with '<' but has
+   * no newline is not completed.
+   * When declaredLengthOverruns is true (long header, header length 28, total <=
+   * MAX_FRAME_BYTES and total > the bytes held), the first byte is dropped and the
+   * rest is pushed, so a lied length cannot swallow the tail. The loop also stops
+   * when the carry does not shrink, and after carry.length passes.
+   * No parameters.
+   * @returns {void}
+   * Side effects: may call handleAscii and push, which mutate `summary`, then sets carry to null.
+   * Events: none.
+   */
   function end() {
-    if (carry && carry[0] === 0x3c && carry.indexOf(0x0a) !== -1) {
-      handleAscii(abbreviatedToAscii(carry.toString('latin1')));
+    // Stop after this many passes even when each pass shrinks the carry.
+    let guard = carry ? carry.length : 0;
+    while (carry && carry.length && guard-- > 0) {
+      // EOF: a carried '<' block that already contains a newline is complete.
+      if (carry[0] === 0x3c && carry.indexOf(0x0a) !== -1) {
+        handleAscii(abbreviatedToAscii(carry.toString('latin1')));
+        break;
+      }
+      // Not a long header whose declared length runs past the bytes we hold.
+      if (!declaredLengthOverruns(carry)) break;
+      // Drop the first byte and rescan the rest so a lied length cannot swallow the tail.
+      const next = Buffer.from(carry.subarray(1));
+      carry = null;
+      push(next);
+      // Guard: stop if this rescan did not shrink the carry.
+      if (carry && carry.length >= next.length) break;
     }
     carry = null;
   }
@@ -383,12 +666,25 @@ function createItDetectScanner(summary) {
   return { push, end };
 }
 
-/** Index just past an abbreviated ASCII block starting at `start`, or -1 if the buffer may end inside it. */
+/**
+ * Index just past an abbreviated ASCII block that starts at `start`, or -1 when
+ * the buffer may still end inside the block or the block exceeds MAX_ABBREVIATED_BYTES.
+ * The block starts with '<' and continues while the next line starts with '<'
+ * followed by a space (0x20) or a tab (0x09). A line that does not continue the
+ * block ends it at the first byte of that line. Fewer than two bytes after a
+ * newline, or no further newline, returns -1.
+ * @param {Buffer} buf Buffer containing the block.
+ * @param {number} start Index of the opening '<'.
+ * @returns {number}
+ * Side effects: none.
+ * Events: none.
+ */
 function abbreviatedEnd(buf, start) {
   let newline = buf.indexOf(0x0a, start);
   while (newline !== -1) {
     const next = newline + 1;
     if (next + 1 >= buf.length) return -1;
+    // A continuation line is '<' followed by a space or a tab. Anything else ends the block.
     if (buf[next] !== 0x3c || (buf[next + 1] !== 0x20 && buf[next + 1] !== 0x09)) return next;
     if (next - start > MAX_ABBREVIATED_BYTES) return -1;
     newline = buf.indexOf(0x0a, next);
@@ -396,14 +692,36 @@ function abbreviatedEnd(buf, start) {
   return -1;
 }
 
-/** Rewrites an abbreviated block as an (unchecksummed) '#NAMEA,header;fields' line for the ASCII parser. */
+/**
+ * Rewrites an abbreviated ASCII block as one unchecksummed '#NAMEA,header;fields' line.
+ * Lines that start with '<' are kept. The first line, with the '<' removed, is the
+ * header (message name, then header fields). Later lines are continuation rows of
+ * fields. The result has no '*' checksum, so parseAsciiLog sets crcValid to null.
+ * That null checksum is accepted by this archive scanner's handleAscii. This rewrite
+ * exists for the archive scanner only.
+ * @param {string} text Abbreviated block, including its newlines.
+ * @returns {string} A '#' ASCII line with no checksum.
+ * Side effects: none.
+ * Events: none.
+ */
 function abbreviatedToAscii(text) {
   const lines = text.split(/\r?\n/).filter((line) => line.startsWith('<'));
   const header = lines[0].slice(1).trim().split(/\s+/);
   const fields = lines.slice(1).flatMap((line) => line.slice(1).trim().split(/\s+/)).filter(Boolean);
+  // No '*' checksum. parseAsciiLog yields crcValid null, which handleAscii in this scanner accepts.
   return `#${header[0]}A,${header.slice(1).join(',')};${fields.join(',')}`;
 }
 
+/**
+ * UTC time from a log file name, or null when the name does not match.
+ * FILE_NAME_TIME is the case-insensitive suffix _YYYY-MM-DD_HH-MM-SS.LOG.
+ * The calendar fields are read with Date.UTC (month is 1-based in the name).
+ * @param {string} name String whose suffix is tested against FILE_NAME_TIME.
+ * @returns {number|null} Milliseconds since the UTC epoch, or null when the suffix
+ *   does not match or Date.UTC is not finite.
+ * Side effects: none.
+ * Events: none.
+ */
 function fileNameTime(name) {
   const match = FILE_NAME_TIME.exec(name);
   if (!match) return null;
@@ -412,6 +730,15 @@ function fileNameTime(name) {
   return Number.isFinite(t) ? t : null;
 }
 
+/**
+ * Checks an archive root before it is stored or listed.
+ * The trimmed value must be non-empty, at most 400 characters, free of NUL,
+ * and an absolute path.
+ * @param {string} root Candidate archive root.
+ * @returns {string} The trimmed path.
+ * Side effects: none. Throws Error when the check fails.
+ * Events: none.
+ */
 function validateRoot(root) {
   const value = String(root || '').trim();
   if (!value || value.length > 400 || value.includes('\0')) throw new Error('Archive folder must be a non-empty path');
@@ -420,11 +747,29 @@ function validateRoot(root) {
 }
 
 /**
- * Historic interference archive read from a `root\YYYY\DDD\*.LOG` tree (DDD = day of year).
- * Files are scanned one at a time and summaries cached on disk, so the NAS is read once per
- * file and memory/response size stay bounded regardless of how many days are requested.
+ * Historic interference archive read from an SMB/NAS tree of NovAtel logs
+ * at root/YYYY/DDD/*.LOG (DDD is the day of year). Files are scanned one at
+ * a time. Bounded ITDETECTSTATUS, BESTPOS, and BESTSATS summaries are
+ * gzip-cached, so an unchanged file is not read from the share again.
+ *
+ * Extends EventEmitter. The only event this class emits is 'status', and
+ * only update() calls emit. Other methods emit 'status' only by calling update().
+ * @param {object} [options] Constructor overrides. See the constructor for each field.
+ * @returns {InterferenceArchive} The constructed archive.
+ * Side effects: the constructor may read the settings file and initializes idle state. It does not emit.
+ * Events: emits 'status' via update().
  */
 class InterferenceArchive extends EventEmitter {
+  /**
+   * Copies options over the defaults, reads settings, and resets to idle.
+   * Does not schedule automatic refresh; startAuto() does that when settings.auto is set.
+   * @param {object} [options] Overrides for defaultRoot, defaultDays, maxDays, maxSamples,
+   *   maxFiles, maxCacheFiles, cacheDir, settingsFile, defaultAuto, refreshMs, busyRetryMs,
+   *   fsTimeoutMs, stallTimeoutMs, hungResetMs, and now.
+   * @returns {InterferenceArchive}
+   * Side effects: may read the settings file. Initializes counters, state, and settings.
+   * Events: none. Does not emit 'status'.
+   */
   constructor(options) {
     super();
     this.options = {
@@ -443,6 +788,8 @@ class InterferenceArchive extends EventEmitter {
       // A NAS that stops answering must never wedge loading: fs calls and stalled reads are abandoned.
       fsTimeoutMs: 20000,
       stallTimeoutMs: 120000,
+      // A call that never settles must not block later loads forever. The OS request is not cancelled.
+      hungResetMs: 10 * 60 * 1000,
       now: () => Date.now(),
       ...options,
     };
@@ -451,6 +798,7 @@ class InterferenceArchive extends EventEmitter {
     this.view = null;
     this.hung = 0;
     this.pendingFs = 0;
+    this.stuckHandles = 0;
     this.autoTimer = null;
     this.autoState = { lastRunAt: null, nextRunAt: null, lastError: null };
     this.stream = null;
@@ -460,6 +808,16 @@ class InterferenceArchive extends EventEmitter {
     this.reset({ state: 'idle' });
   }
 
+  /**
+   * Loads root, days, and auto from the settings file, or the defaults.
+   * A missing file (ENOENT) returns defaults quietly. Any other read or parse
+   * failure logs a warning and returns defaults. Saved root and days are validated.
+   * auto is kept only when it is a boolean.
+   * No parameters.
+   * @returns {{root: string, days: number, auto: boolean}}
+   * Side effects: synchronous read of settingsFile. May console.warn.
+   * Events: none.
+   */
   readSettings() {
     const defaults = { root: this.options.defaultRoot, days: this.options.defaultDays, auto: this.options.defaultAuto };
     if (!this.options.settingsFile) return defaults;
@@ -476,6 +834,14 @@ class InterferenceArchive extends EventEmitter {
     }
   }
 
+  /**
+   * Writes this.settings as pretty JSON to settingsFile.
+   * Does nothing when settingsFile is not set. A failure is logged and swallowed.
+   * No parameters.
+   * @returns {void}
+   * Side effects: mkdir and write of the settings file. May console.warn.
+   * Events: none.
+   */
   saveSettings() {
     if (!this.options.settingsFile) return;
     try {
@@ -486,6 +852,13 @@ class InterferenceArchive extends EventEmitter {
     }
   }
 
+  /**
+   * Accepts a whole number of days from 1 through maxDays.
+   * @param {number} days Requested day count.
+   * @returns {number} The same number when it is in range.
+   * Side effects: none. Throws Error when it is not an integer in range.
+   * Events: none.
+   */
   validateDays(days) {
     const value = Number(days);
     if (!Number.isInteger(value) || value < 1 || value > this.options.maxDays) {
@@ -494,6 +867,13 @@ class InterferenceArchive extends EventEmitter {
     return value;
   }
 
+  /**
+   * Settings, defaults, the maxDays limit, and the current status() object.
+   * No parameters.
+   * @returns {object}
+   * Side effects: none. status() does not emit.
+   * Events: none.
+   */
   info() {
     return {
       settings: this.settings,
@@ -503,6 +883,14 @@ class InterferenceArchive extends EventEmitter {
     };
   }
 
+  /**
+   * Replaces the loaded arrays and the progress state. Does not cancel a load,
+   * clear a background snapshot, or touch the hung counters.
+   * @param {object} patch Fields merged over the idle state object.
+   * @returns {void}
+   * Side effects: assigns coverage, samples, solution, bestsats, sorted, resolutionMs, and state.
+   * Events: none.
+   */
   reset(patch) {
     this.coverage = [];
     this.samples = [];
@@ -539,8 +927,17 @@ class InterferenceArchive extends EventEmitter {
   }
 
   /**
-   * During a background refresh the previously loaded data stays queryable, so the status describes that
-   * data (range, counts, revision, generation) plus the refresh's progress fields.
+   * Status object for the UI.
+   * During a background refresh, this.view holds the previous data. The returned
+   * object then uses that snapshot's state, with PROGRESS_FIELDS overwritten from
+   * the refresh, and reports sample counts from the snapshot. Otherwise it describes
+   * this state and these arrays. generation is dataGeneration (the snapshot's
+   * generation until a successful swap). refreshing is true while a snapshot exists.
+   * auto echoes settings.auto, refreshMs, and autoState.
+   * No parameters.
+   * @returns {object}
+   * Side effects: none. Copies errors rather than returning the live array.
+   * Events: none.
    */
   status() {
     const view = this.view;
@@ -566,14 +963,40 @@ class InterferenceArchive extends EventEmitter {
     };
   }
 
+  /**
+   * True while a load is listing directories or scanning files.
+   * No parameters.
+   * @returns {boolean}
+   * Side effects: none.
+   * Events: none.
+   */
   busy() {
     return this.state.state === 'listing' || this.state.state === 'scanning';
   }
 
+  /**
+   * True when any interference, coverage, solution, or BESTSATS data is loaded.
+   * No parameters.
+   * @returns {boolean}
+   * Side effects: none.
+   * Events: none.
+   */
   hasData() {
     return this.samples.length > 0 || this.coverage.length > 0 || this.solution.length > 0 || this.bestsats.length > 0;
   }
 
+  /**
+   * Merges `patch` into this.state and emits 'status'.
+   * This is the only method that calls emit. The event name is 'status' and the
+   * payload is status(). Unless `force` is true, the emit is skipped when the
+   * previous emit was less than PROGRESS_INTERVAL_MS ago. The patch is applied
+   * either way.
+   * @param {object} patch Fields assigned onto this.state.
+   * @param {boolean} [force=false] When true, emit even inside the progress interval.
+   * @returns {void}
+   * Side effects: mutates this.state and lastProgressAt. Emits 'status' when not throttled.
+   * Events: emits 'status'.
+   */
   update(patch, force = false) {
     Object.assign(this.state, patch);
     const now = Date.now();
@@ -582,11 +1005,26 @@ class InterferenceArchive extends EventEmitter {
     this.emit('status', this.status());
   }
 
+  /**
+   * Appends a load error until MAX_ERRORS messages are stored.
+   * @param {string} message Error text shown in status().
+   * @returns {void}
+   * Side effects: may push onto this.state.errors.
+   * Events: none. The next status emit includes the error.
+   */
   addError(message) {
     if (this.state.errors.length < MAX_ERRORS) this.state.errors.push(message);
   }
 
-  /** Starts loading `days` of history from `root`, replacing any loaded or in-progress archive. */
+  /**
+   * Starts a foreground load of `days` from `root`, replacing any loaded or in-progress archive.
+   * Persists root and days (auto is left as it was) and then calls start() with background false.
+   * @param {{root?: string, days?: number}} [request] Omitted fields fall back to this.settings.
+   * @returns {object} The status() object returned by start().
+   * Side effects: may throw from assertAvailable, validateRoot, or validateDays. Writes settings.
+   *   Starts the asynchronous load.
+   * Events: emits 'status' via update() inside start().
+   */
   load(request = {}) {
     this.assertAvailable();
     const root = validateRoot(request.root === undefined ? this.settings.root : request.root);
@@ -597,13 +1035,36 @@ class InterferenceArchive extends EventEmitter {
   }
 
   /**
-   * A background start keeps the loaded data visible (and queryable) until the new load finishes;
-   * it is swapped in only on success, and restored on failure or cancellation.
+   * Begins a load of `days` ending at options.now() and returns status() immediately.
+   * run() continues asynchronously.
+   *
+   * A background load snapshots the current arrays and state into this.view when
+   * no snapshot exists, the archive is not busy, the state is not idle, and hasData()
+   * is true. Queries and status() keep that previous data until run() finishes
+   * successfully and drops this.view (the swap). On failure, the catch below
+   * restores the snapshot when this generation is still current.
+   * A foreground load sets this.view to null (it does not restore the snapshot)
+   * and reset() replaces the arrays.
+   *
+   * Cancellation: this increments generation. run(), listFiles(), and scanFile()
+   * return without swapping once generation has moved on. The catch below also
+   * returns when generation has moved on, so it does not restore or set state
+   * 'error' after cancel() or a newer start(). cancel() itself bumps generation,
+   * abandons the stream, and restores the snapshot when one exists.
+   * @param {string} root Archive root. Caller has already validated it.
+   * @param {number} days Day count. Caller has already validated it.
+   * @param {boolean} background True for an automatic refresh that may keep previous data.
+   * @returns {object} this.status() after the load is marked 'listing'.
+   * Side effects: stopStream(), may snapshot or clear this.view, reset(), starts run().
+   * Events: emits 'status' via update(). The failure path emits again via update()
+   *   when this generation is still current.
    */
   start(root, days, background) {
     this.assertAvailable();
     this.stopStream();
     const generation = ++this.generation;
+    // Snapshot previous data only when this background load is not already refreshing,
+    // is not busy, is not idle, and still has data. Queries read this.view until run() swaps.
     if (background && !this.view && !this.busy() && this.state.state !== 'idle' && this.hasData()) {
       this.ensureSorted();
       this.view = {
@@ -621,6 +1082,7 @@ class InterferenceArchive extends EventEmitter {
     });
     this.update({}, true);
     this.run(generation).catch((error) => {
+      // cancel(), clear(), or a newer start() moved generation: do not restore or record this error.
       if (generation !== this.generation) return;
       this.stopStream();
       this.autoState.lastError = error.message;
@@ -635,6 +1097,13 @@ class InterferenceArchive extends EventEmitter {
     return this.status();
   }
 
+  /**
+   * Puts the background snapshot's arrays and state back and drops the snapshot.
+   * No parameters.
+   * @returns {void}
+   * Side effects: assigns the saved data fields and this.state. Sets this.view to null.
+   * Events: none. Callers that need a status event call update() afterward.
+   */
   restoreView() {
     const { data, state } = this.view;
     this.view = null;
@@ -642,6 +1111,17 @@ class InterferenceArchive extends EventEmitter {
     this.state = state;
   }
 
+  /**
+   * Cancels a listing or scanning load.
+   * When not busy, returns status() without changing generation or emitting.
+   * When busy, increments generation, stopStream()s, and either restores the
+   * background snapshot or marks the state 'cancelled'. Files already merged
+   * stay in place on the non-background path.
+   * No parameters.
+   * @returns {object} this.status().
+   * Side effects: may bump generation, abandon the stream, and restore or replace state.
+   * Events: emits 'status' via update() when a busy load is cancelled. No event when not busy.
+   */
   cancel() {
     if (!this.busy()) return this.status();
     this.generation++;
@@ -658,7 +1138,15 @@ class InterferenceArchive extends EventEmitter {
     return this.status();
   }
 
-  /** Unloads everything and turns automatic refresh off, so the archive stays unloaded. */
+  /**
+   * Unloads the archive and turns automatic refresh off so it stays unloaded.
+   * Increments generation (a running load's catch then ignores itself), abandons
+   * the stream, drops any snapshot, and clears the auto timer.
+   * No parameters.
+   * @returns {object} this.status() after the idle reset.
+   * Side effects: may write settings when auto was on. Resets loaded data.
+   * Events: emits 'status' via update().
+   */
   clear() {
     this.generation++;
     this.dataGeneration = this.generation;
@@ -674,7 +1162,16 @@ class InterferenceArchive extends EventEmitter {
     return this.status();
   }
 
-  /** Turns automatic loading on (loading now unless busy) or off. */
+  /**
+   * Turns automatic loading on or off and persists settings.auto.
+   * On enables scheduleAuto(0), so autoTick runs on the next timer turn unless
+   * a later tick finds the archive busy or a hung request. Off calls stopAuto(),
+   * which clears the timer and does not itself cancel a load already running.
+   * @param {boolean} enabled Stored as a boolean.
+   * @returns {object} this.status().
+   * Side effects: writes settings, arms or clears the auto timer, clears lastError.
+   * Events: emits 'status' via update(). autoTick may emit later.
+   */
   setAuto(enabled) {
     this.settings = { ...this.settings, auto: Boolean(enabled) };
     this.saveSettings();
@@ -685,33 +1182,75 @@ class InterferenceArchive extends EventEmitter {
     return this.status();
   }
 
+  /**
+   * Arms the auto timer when settings.auto is true.
+   * @param {number} [delayMs=0] Delay before autoTick.
+   * @returns {void}
+   * Side effects: may replace this.autoTimer via scheduleAuto.
+   * Events: none. autoTick may emit later.
+   */
   startAuto(delayMs = 0) {
     if (this.settings.auto) this.scheduleAuto(delayMs);
   }
 
+  /**
+   * Clears the automatic-refresh timer and nextRunAt.
+   * Does not increment generation and does not stop a scan already running.
+   * No parameters.
+   * @returns {void}
+   * Side effects: clearTimeout on this.autoTimer.
+   * Events: none.
+   */
   stopAuto() {
     clearTimeout(this.autoTimer);
     this.autoTimer = null;
     this.autoState.nextRunAt = null;
   }
 
+  /**
+   * Replaces the single auto timer. The timer is unref'd when the handle supports
+   * it, so it does not keep the process alive. autoTick checks settings.auto.
+   * @param {number} delayMs Delay before autoTick, also reflected in nextRunAt.
+   * @returns {void}
+   * Side effects: clearTimeout of the previous timer, assigns this.autoTimer and nextRunAt.
+   * Events: none.
+   */
   scheduleAuto(delayMs) {
     clearTimeout(this.autoTimer);
     this.autoState.nextRunAt = Date.now() + delayMs;
     this.autoTimer = setTimeout(() => this.autoTick(), delayMs);
+    // unref: the automatic refresh timer must not keep the process alive.
     if (typeof this.autoTimer.unref === 'function') this.autoTimer.unref();
   }
 
-  /** One automatic refresh. Never interrupts a load in progress and never piles up behind a hung NAS. */
+  /**
+   * One automatic refresh. Does nothing when settings.auto is false.
+   * busy() (listing or scanning) reschedules after busyRetryMs and does not
+   * call start(), so a running load is not overlapped.
+   * When hung, pendingFs, or stuckHandles is positive, this does not start a
+   * scan. It reschedules after refreshMs. start() is also guarded by
+   * assertAvailable(), which throws for those counters or an unclosed stream.
+   * Otherwise it records lastRunAt, schedules the next refresh, and start()s
+   * in the background so previous data stays until that load swaps.
+   * No parameters.
+   * @returns {void}
+   * Side effects: may replace the auto timer, lastRunAt, and lastError, and may start a load.
+   * Events: emits 'status' via update() when a hung request skips the scan, and via start()
+   *   when a refresh begins. No event when auto is off or the only action is the busy reschedule.
+   */
   autoTick() {
     this.autoTimer = null;
     if (!this.settings.auto) return;
+    // A listing or scanning load is already running. Do not start another one.
     if (this.busy()) {
       this.scheduleAuto(this.options.busyRetryMs);
       return;
     }
-    if (this.hung > 0 || this.pendingFs > 0) {
-      this.autoState.lastError = 'The network folder has not answered an earlier request yet; will retry';
+    // hung, pendingFs, or stuckHandles: do not start a scan. Retry after refreshMs.
+    if (this.hung > 0 || this.pendingFs > 0 || this.stuckHandles > 0) {
+      if (this.hung > 0 || this.pendingFs > 0 || !this.autoState.lastError) {
+        this.autoState.lastError = 'The network folder has not answered an earlier request yet; will retry';
+      }
       this.scheduleAuto(this.options.refreshMs);
       this.update({}, true);
       return;
@@ -721,17 +1260,41 @@ class InterferenceArchive extends EventEmitter {
     this.start(this.settings.root, this.settings.days, true);
   }
 
+  /**
+   * Throws when a network request is still outstanding.
+   * The condition is hung > 0, pendingFs > 0, stuckHandles > 0, or a current
+   * stream that is not closed. autoTick refuses to start a scan in the counter
+   * case; load() and start() call this before touching the share.
+   * No parameters.
+   * @returns {void}
+   * Side effects: none. Throws Error when a request is still outstanding.
+   * Events: none.
+   */
   assertAvailable() {
-    if (this.hung > 0 || this.pendingFs > 0 || (this.stream && !this.stream.closed)) {
+    // Refuse a new load while a timed-out call, an open fs call, a stuck stream, or this stream remains.
+    if (this.hung > 0 || this.pendingFs > 0 || this.stuckHandles > 0 || (this.stream && !this.stream.closed)) {
       throw new Error('Archive network folder still has an outstanding request; wait before retrying. Live data is unaffected.');
     }
   }
 
-  /** Bounds a NAS call; a call that times out is still counted until it finally settles. */
+  /**
+   * Races a filesystem promise against fsTimeoutMs.
+   * Increments pendingFs first. armCounterReset decrements it when `promise`
+   * settles, or after hungResetMs if it never settles. The timer rejects with
+   * a fatal error. On that timeout the original promise is not cancelled;
+   * trackHung increments hung until the same promise settles or hungResetMs
+   * drops the hung count. The OS call is not cancelled.
+   * @param {Promise<*>} promise Filesystem operation already started.
+   * @param {string} label Text used in the timeout error and the hung-reset warning.
+   * @returns {Promise<*>} The filesystem result. Rejects with a fatal error on timeout.
+   * Side effects: pendingFs, and hung when the race times out. Arms hungResetMs timers.
+   * Events: none directly. armCounterReset emits 'status' via update() if a call never settles.
+   */
   async withTimeout(promise, label) {
+    // Count the call before the race. It stays counted until it settles or hungResetMs.
     this.pendingFs++;
-    const settled = () => { this.pendingFs--; };
-    Promise.resolve(promise).then(settled, settled);
+    const release = this.armCounterReset('pendingFs', `${label} stayed open and was marked finished so archive loading can continue`);
+    Promise.resolve(promise).then(release, release);
     let timer;
     let timedOut = false;
     const timeout = new Promise((resolve, reject) => {
@@ -744,16 +1307,72 @@ class InterferenceArchive extends EventEmitter {
       return await Promise.race([promise, timeout]);
     } finally {
       clearTimeout(timer);
+      // Timeout does not cancel the OS call. trackHung increments hung until that promise settles.
       if (timedOut) this.trackHung(promise);
     }
   }
 
+  /**
+   * Counts a filesystem or close operation that outlived its waiter.
+   * Increments hung and decrements it when `promise` settles. armCounterReset
+   * also drops hung after hungResetMs if the promise never settles, and logs
+   * that the original call may still be in flight. The OS call is not cancelled.
+   * @param {Promise<*>} promise Operation to wait for. Errors are treated as settled.
+   * @returns {void}
+   * Side effects: increments hung and arms a hungResetMs timer.
+   * Events: none directly. The reset timer emits 'status' via update() if it fires.
+   */
   trackHung(promise) {
     this.hung++;
-    const done = () => { this.hung--; };
-    Promise.resolve(promise).then(done, done);
+    const release = this.armCounterReset('hung', 'A network folder request stayed open and was marked finished so archive loading can continue');
+    Promise.resolve(promise).then(release, release);
   }
 
+  /**
+   * Returns a function that decrements this[counter] once.
+   * The decrement happens when that function runs, or after hungResetMs if it
+   * never runs. The timeout path logs that the original call may still be in
+   * flight, records the message, and emits 'status'. It does not cancel the
+   * OS call. The timer is unref'd. A second settle is ignored.
+   * @param {string} counter Property name, 'pendingFs' or 'hung'.
+   * @param {string} message Warning stored on the timeout path.
+   * @returns {function(): void} Decrements the counter once and clears the timer. Does not emit.
+   * Side effects: arms an unref'd timer. The timer mutates the counter, errors, and autoState.
+   * Events: the timeout path emits 'status' via update(). The returned function emits nothing.
+   */
+  armCounterReset(counter, message) {
+    let settled = false;
+    // If release never runs, drop the counter after hungResetMs. The OS call is not cancelled.
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      this[counter]--;
+      console.warn(`[archive] ${message}; the original call may still be in flight`);
+      this.addError(message);
+      this.autoState.lastError = message;
+      this.update({}, true);
+    }, this.options.hungResetMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    return () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      this[counter]--;
+    };
+  }
+
+  /**
+   * Abandons the current read stream and the scan waiting on it.
+   * Clears this.stream and cancelScan, then invokes cancelScan (scanFile's
+   * abandon, resolving null). When the stream exists and is not closed,
+   * stuckHandles increments, the 'close' event decrements it (not below 0),
+   * and trackHung is armed on that close promise. destroy() is still called.
+   * A stream that is already closed does not change stuckHandles.
+   * No parameters.
+   * @returns {void}
+   * Side effects: may increment stuckHandles, arm hung via trackHung, and destroy the stream.
+   * Events: none directly. trackHung's reset timer may later emit 'status' via update().
+   */
   stopStream() {
     const stream = this.stream;
     this.stream = null;
@@ -761,14 +1380,43 @@ class InterferenceArchive extends EventEmitter {
     this.cancelScan = null;
     if (cancel) cancel();
     if (stream) {
-      if (!stream.closed) this.trackHung(new Promise((resolve) => stream.once('close', resolve)));
-      stream.destroy();
+      // Not closed: count a stuck handle, decrement it on 'close' (not below 0),
+      // and trackHung that close promise.
+      if (!stream.closed) {
+        this.stuckHandles++;
+        const closed = new Promise((resolve) => {
+          stream.once('close', () => {
+            if (this.stuckHandles > 0) this.stuckHandles--;
+            resolve();
+          });
+        });
+        this.trackHung(closed);
+      }
+      if (typeof stream.destroy === 'function') stream.destroy();
     }
   }
 
+  /**
+   * Lists logs in the window and scans or loads each one.
+   * Returns without swapping or setting an error when generation has changed
+   * (cancel, clear, or a newer start). A cached summary that fails summaryUsable
+   * is deleted and that file is rescanned. A scan that fails summaryUsable is
+   * not cached and not merged. fatal errors and NETWORK_ERRORS fail the load;
+   * other per-file errors are recorded and the next file is tried.
+   * After the last file, ensureSorted and pruneCache run. When a background
+   * snapshot exists it is dropped and dataGeneration becomes this generation:
+   * that swap is what makes the new summaries visible. Failure throws to start()'s
+   * catch, which restores the snapshot if this generation is still current.
+   * @param {number} generation Generation captured by start().
+   * @returns {Promise<void>}
+   * Side effects: reads the share and the cache, mutates loaded arrays and state, may write caches.
+   * Events: emits 'status' via update(). The per-file progress update is throttled;
+   *   the scanning and ready updates pass force and emit immediately.
+   */
   async run(generation) {
     const { root, from, to } = this.state;
     const files = await this.listFiles(root, from, to, generation);
+    // A newer start(), cancel(), or clear() bumped generation. Stop with no swap and no error update.
     if (generation !== this.generation) return;
     const bytesTotal = files.reduce((sum, file) => sum + file.size, 0);
     this.update({
@@ -782,13 +1430,28 @@ class InterferenceArchive extends EventEmitter {
       this.update({ currentFile: file.path, bytesDone: bytesBefore });
       let summary = await this.readCache(file);
       if (generation !== this.generation) return;
+      // A cached summary that fails summaryUsable is discarded, both cache files are removed, and the log is rescanned.
+      if (summary && !summaryUsable(summary)) {
+        console.warn(`[archive] discarding unusable cache for ${file.path}`);
+        await this.deleteCache(file);
+        if (generation !== this.generation) return;
+        this.addError(`${path.basename(file.path)}: cached summary was unusable and will be rescanned`);
+        summary = null;
+      }
       const cached = Boolean(summary);
       try {
         if (!summary) {
           summary = await this.scanFile(file, generation, bytesBefore);
           if (!summary || generation !== this.generation) return;
-          await this.writeCache(file, summary);
+          if (!summaryUsable(summary)) {
+            this.addError(`${path.basename(file.path)}: scan produced an unusable summary`);
+            summary = null;
+          } else {
+            await this.writeCache(file, summary);
+          }
         }
+        if (generation !== this.generation) return;
+        if (summary) this.addSummary(summary, from, to);
       } catch (error) {
         if (generation !== this.generation) return;
         if (error.fatal || NETWORK_ERRORS.has(error.code)) {
@@ -797,8 +1460,6 @@ class InterferenceArchive extends EventEmitter {
         this.addError(`${path.basename(file.path)}: ${error.message}`);
         summary = null;
       }
-      if (generation !== this.generation) return;
-      if (summary) this.addSummary(summary, from, to);
       bytesBefore += file.size;
       this.update({
         filesDone: this.state.filesDone + 1,
@@ -813,6 +1474,7 @@ class InterferenceArchive extends EventEmitter {
     }
     this.ensureSorted();
     this.pruneCache();
+    // Successful background refresh: drop the previous-data snapshot so the merged summaries become visible.
     if (this.view) {
       this.view = null;
       this.dataGeneration = generation;
@@ -821,7 +1483,31 @@ class InterferenceArchive extends EventEmitter {
     this.update({ state: 'ready', currentFile: null, finishedAt: Date.now() }, true);
   }
 
-  /** Lists `root\YYYY\DDD\*.LOG` files that can contain reports between `from` and `to`. */
+  /**
+   * Lists root/YYYY/DDD/*.LOG files that can contain reports between `from` and `to`.
+   * Year directories are the UTC years of (from - 1 day) through (to + 1 day).
+   * A child directory whose name is 1 to 3 digits is a day-of-year folder.
+   * dayStart is UTC midnight of that day (1 January plus DDD - 1 days). The
+   * folder is kept when that day, widened by FILE_TIME_TOLERANCE_MS on both
+   * sides, overlaps [from, to]. Each .LOG file's start is fileNameTime(name)
+   * (the _YYYY-MM-DD_HH-MM-SS.LOG suffix as UTC) or, when the name does not
+   * match, the folder's dayStart. After sorting by start, a file is dropped
+   * when its start minus the tolerance is after `to`, or when the next file's
+   * start plus the tolerance is still before `from`. More than maxFiles keeps
+   * the newest maxFiles. filesSkipped counts files removed by that time filter
+   * and does not include the maxFiles cut.
+   * A generation change returns []. The root access failure always fails the load.
+   * fatal and NETWORK_ERRORS from a later directory read also fail the load.
+   * ENOENT for a year folder is skipped. Other directory and stat errors are
+   * recorded and that entry is skipped.
+   * @param {string} root Absolute archive root.
+   * @param {number} from Window start in milliseconds.
+   * @param {number} to Window end in milliseconds.
+   * @param {number} [generation=this.generation] Load generation to abort on.
+   * @returns {Promise<Array<{path: string, size: number, mtimeMs: number, start: number, folderStart: number}>>}
+   * Side effects: directory and stat calls via withTimeout. Sets this.state.filesSkipped. May addError.
+   * Events: none directly. withTimeout's hung reset may emit 'status'.
+   */
   async listFiles(root, from, to, generation = this.generation) {
     try {
       await this.withTimeout(fs.promises.access(root), `Archive folder ${root}`);
@@ -831,6 +1517,7 @@ class InterferenceArchive extends EventEmitter {
     }
     if (generation !== this.generation) return [];
     const folders = [];
+    // Year folders covering the window, plus one day on each side so a boundary day is not missed.
     const firstYear = new Date(from - DAY_MS).getUTCFullYear();
     const lastYear = new Date(to + DAY_MS).getUTCFullYear();
     for (let year = firstYear; year <= lastYear; year++) {
@@ -846,6 +1533,8 @@ class InterferenceArchive extends EventEmitter {
       }
       if (generation !== this.generation) return [];
       for (const entry of entries) {
+        // Day-of-year folder: 1 to 3 digits. dayStart is UTC midnight of that day.
+        // Keep it when the day, widened by FILE_TIME_TOLERANCE_MS on both sides, overlaps [from, to].
         if (!entry.isDirectory() || !/^\d{1,3}$/.test(entry.name)) continue;
         const dayStart = Date.UTC(year, 0, 1) + (Number(entry.name) - 1) * DAY_MS;
         if (dayStart + DAY_MS + FILE_TIME_TOLERANCE_MS < from || dayStart - FILE_TIME_TOLERANCE_MS > to) continue;
@@ -873,6 +1562,7 @@ class InterferenceArchive extends EventEmitter {
           const stat = await this.withTimeout(fs.promises.stat(filePath), name);
           if (generation !== this.generation) return [];
           if (!stat.isFile()) continue;
+          // start is the UTC time of suffix _YYYY-MM-DD_HH-MM-SS.LOG, or this folder's UTC day start.
           files.push({
             path: filePath, size: stat.size, mtimeMs: Math.round(stat.mtimeMs),
             start: fileNameTime(name) ?? folder.dayStart, folderStart: folder.dayStart,
@@ -886,7 +1576,9 @@ class InterferenceArchive extends EventEmitter {
     }
     files.sort((a, b) => a.start - b.start || a.path.localeCompare(b.path));
 
-    // A file's reports run until the next file starts, so earlier files cannot reach `from`.
+    // Drop a file whose start, minus FILE_TIME_TOLERANCE_MS, is after `to`.
+    // Otherwise keep it when it is the last file, or when the next file's start
+    // plus that tolerance is still at or after `from` (reports are treated as running until the next file).
     const relevant = files.filter((file, index) => {
       const next = files[index + 1];
       if (file.start - FILE_TIME_TOLERANCE_MS > to) return false;
@@ -900,6 +1592,20 @@ class InterferenceArchive extends EventEmitter {
     return relevant;
   }
 
+  /**
+   * Streams one log through createItDetectScanner.
+   * The read uses READ_CHUNK_BYTES. A watchdog abandons with a fatal error and
+   * stopStream() when no chunk arrives for stallTimeoutMs. cancelScan resolves
+   * that wait with null (stopStream). A generation change or a null abandon
+   * result returns null. After the last chunk, scanner.end() runs the EOF rescan
+   * and the summary JSON is returned. fatal and stream errors propagate to run().
+   * @param {{path: string, size: number}} file Log to read. path is the filesystem path.
+   * @param {number} generation Load generation. A mismatch returns null.
+   * @param {number} bytesBefore Bytes already finished in this load, added to progress.
+   * @returns {Promise<object|null>} summary.toJSON(), or null when the load was superseded.
+   * Side effects: sets this.stream, reads the file, mutates the summary, calls update() with bytesDone.
+   * Events: 'status' via update(), throttled by PROGRESS_INTERVAL_MS. stopStream does not emit by itself.
+   */
   async scanFile(file, generation, bytesBefore) {
     const summary = new FileSummary(this.options.maxSamples);
     const scanner = createItDetectScanner(summary);
@@ -918,7 +1624,16 @@ class InterferenceArchive extends EventEmitter {
       abandon(fatalError(`no data received for ${Math.round(this.options.stallTimeoutMs / 1000)} s`));
       this.stopStream();
     }, Math.max(10, Math.min(5000, this.options.stallTimeoutMs / 4)));
-    const read = async () => {
+    /**
+     * Reads the stream and returns the summary JSON, or null if generation changed.
+     * scanner.end() runs after the last chunk so a carried abbreviated block or an
+     * overrun declared length can be finished.
+     * No parameters.
+     * @returns {Promise<object|null>}
+     * Side effects: scanner.push / scanner.end, and update() with bytesDone.
+     * Events: 'status' only when update() is outside the progress interval.
+     */
+    const reading = (async () => {
       for await (const chunk of stream) {
         if (generation !== this.generation) return null;
         lastDataAt = Date.now();
@@ -927,11 +1642,27 @@ class InterferenceArchive extends EventEmitter {
         this.update({ bytesDone: bytesBefore + bytes });
       }
       if (generation !== this.generation) return null;
+      // EOF: end() completes a carried '<' block or rescans a declared length that overruns the tail.
       scanner.end();
       return summary.toJSON();
-    };
+    })();
+    let winner = null;
+    reading.catch((error) => {
+      queueMicrotask(() => {
+        if (winner === 'read') return;
+        const code = error && error.code;
+        if (code === 'ERR_STREAM_PREMATURE_CLOSE' || code === 'ERR_STREAM_DESTROYED') return;
+        console.warn(`[archive] scan read settled after it was abandoned: ${error && error.message ? error.message : error}`);
+      });
+    });
     try {
-      return await Promise.race([read(), abandoned]);
+      const outcome = await Promise.race([
+        reading.then((value) => ({ source: 'read', value }), (error) => ({ source: 'read', error })),
+        abandoned.then((value) => ({ source: 'abandon', value }), (error) => ({ source: 'abandon', error })),
+      ]);
+      winner = outcome.source;
+      if (outcome.error) throw outcome.error;
+      return outcome.value;
     } catch (error) {
       if (generation !== this.generation) return null;
       throw error;
@@ -941,47 +1672,152 @@ class InterferenceArchive extends EventEmitter {
     }
   }
 
+  /**
+   * Gzip-cache path for one log, or null when cacheDir is not configured.
+   * The file name is sha1 of file.path.toLowerCase() plus '.json.gz'. That hash
+   * is only the file name. cacheMatches decides whether the JSON is this log.
+   * @param {{path: string}} file Log identity. path is the path string that is hashed.
+   * @returns {string|null}
+   * Side effects: none.
+   * Events: none.
+   */
   cachePath(file) {
     if (!this.options.cacheDir) return null;
     const key = crypto.createHash('sha1').update(file.path.toLowerCase()).digest('hex');
     return path.join(this.options.cacheDir, `${key}.json.gz`);
   }
 
-  async readCache(file) {
-    const cachePath = this.cachePath(file);
-    if (!cachePath) return null;
+  /**
+   * True when cached JSON is the summary for this log.
+   * The file identity compared is path, size, and mtimeMs, and version must
+   * equal CACHE_VERSION. The sha1 file name is not compared again here.
+   * The summary arrays and the solution / bestsats counters must also be present
+   * so a partial JSON file is treated as a miss.
+   * @param {object|null|undefined} parsed Gunzipped cache object.
+   * @param {{path: string, size: number, mtimeMs: number}} file Log stat used as the key.
+   * @returns {boolean}
+   * Side effects: none.
+   * Events: none.
+   */
+  cacheMatches(parsed, file) {
+    // Key: path, size, and mtimeMs, plus CACHE_VERSION. Not a hash of the log bytes.
+    return Boolean(parsed) && parsed.version === CACHE_VERSION && parsed.path === file.path && parsed.size === file.size
+      && parsed.mtimeMs === file.mtimeMs && Array.isArray(parsed.coverage) && Array.isArray(parsed.samples)
+      && Array.isArray(parsed.solution) && Number.isFinite(parsed.solutionReports)
+      && Number.isFinite(parsed.solutionResolutionMs) && Array.isArray(parsed.bestsats)
+      && Number.isFinite(parsed.bestsatsReports) && Number.isFinite(parsed.bestsatsResolutionMs);
+  }
+
+  /**
+   * Reads one gzip JSON cache file and returns it when cacheMatches accepts it.
+   * ENOENT returns null quietly. Any other read, gunzip, or parse failure logs
+   * a warning and returns null. A JSON object that does not match the key returns null.
+   * @param {string} cachePath Path of the .json.gz or .json.gz.bak file.
+   * @param {{path: string, size: number, mtimeMs: number}} file Log the cache must describe.
+   * @returns {Promise<object|null>}
+   * Side effects: reads cachePath. May console.warn.
+   * Events: none.
+   */
+  async readCacheFile(cachePath, file) {
+    let raw;
     try {
-      const parsed = JSON.parse(await gunzip(await fs.promises.readFile(cachePath)));
-      if (parsed.version !== CACHE_VERSION || parsed.path !== file.path || parsed.size !== file.size
-        || parsed.mtimeMs !== file.mtimeMs || !Array.isArray(parsed.coverage) || !Array.isArray(parsed.samples)
-        || !Array.isArray(parsed.solution) || !Number.isFinite(parsed.solutionReports)
-        || !Number.isFinite(parsed.solutionResolutionMs) || !Array.isArray(parsed.bestsats)
-        || !Number.isFinite(parsed.bestsatsReports) || !Number.isFinite(parsed.bestsatsResolutionMs)) {
-        return null;
-      }
-      return parsed;
+      raw = await fs.promises.readFile(cachePath);
     } catch (error) {
       if (error.code !== 'ENOENT') console.warn(`[archive] ignoring cache for ${file.path}: ${error.message}`);
       return null;
     }
+    try {
+      const parsed = JSON.parse(await gunzip(raw));
+      return this.cacheMatches(parsed, file) ? parsed : null;
+    } catch (error) {
+      console.warn(`[archive] ignoring cache for ${file.path}: ${error.message}`);
+      return null;
+    }
   }
 
+  /**
+   * Loads the gzip JSON cache for `file`, falling back to the .json.gz.bak copy.
+   * The backup is the previous cache left by replaceFile. A primary miss, a
+   * corrupt primary, or a primary that fails cacheMatches tries the .bak.
+   * Returns null when cacheDir is unset or neither copy passes cacheMatches
+   * (path, size, mtimeMs, and CACHE_VERSION).
+   * @param {{path: string, size: number, mtimeMs: number}} file Log identity.
+   * @returns {Promise<object|null>} Parsed cache object, or null.
+   * Side effects: reads the cache file and maybe the .bak. Warns when the backup is used.
+   * Events: none.
+   */
+  async readCache(file) {
+    const cachePath = this.cachePath(file);
+    if (!cachePath) return null;
+    const primary = await this.readCacheFile(cachePath, file);
+    if (primary) return primary;
+    // Primary missed or failed cacheMatches. Fall back to the .json.gz.bak left by replaceFile.
+    const backup = await this.readCacheFile(`${cachePath}.bak`, file);
+    if (!backup) return null;
+    console.warn(`[archive] using cache backup for ${file.path}`);
+    return backup;
+  }
+
+  /**
+   * Gzip-caches `summary` for `file`.
+   * The JSON identity stored with the summary is version, path, size, and mtimeMs.
+   * Bytes are written to a temp file beside the cache and moved into place with
+   * replaceFile, which turns the previous cache into the `.bak` file beside it. Failures are
+   * logged and recorded with addError; they do not fail the load.
+   * @param {{path: string, size: number, mtimeMs: number}} file Log identity stored in the JSON.
+   * @param {object} summary Plain summary from FileSummary.toJSON.
+   * @returns {Promise<void>}
+   * Side effects: mkdir, write of a temp file, replaceFile. May console.warn and addError.
+   * Events: none.
+   */
   async writeCache(file, summary) {
     const cachePath = this.cachePath(file);
     if (!cachePath) return;
     try {
       await fs.promises.mkdir(this.options.cacheDir, { recursive: true });
+      // JSON identity stored with the summary: version, path, size, and mtimeMs.
       const payload = await gzip(JSON.stringify({
         version: CACHE_VERSION, path: file.path, size: file.size, mtimeMs: file.mtimeMs, ...summary,
       }));
-      const temporary = `${cachePath}.${process.pid}.tmp`;
+      const temporary = `${cachePath}.${process.pid}.${Date.now()}.tmp`;
       await fs.promises.writeFile(temporary, payload);
-      await fs.promises.rename(temporary, cachePath);
+      // Atomic replace (replaceFile): the previous cache becomes the .bak file.
+      await replaceFile(cachePath, temporary);
     } catch (error) {
       console.warn(`[archive] could not cache ${file.path}: ${error.message}`);
+      this.addError(`${path.basename(file.path)}: could not write archive cache (${error.message})`);
     }
   }
 
+  /**
+   * Deletes the gzip cache for `file` and its .bak, if cacheDir is set.
+   * @param {{path: string}} file Log whose cachePath is removed.
+   * @returns {Promise<void>}
+   * Side effects: unlinks the cache file and the .bak file. ENOENT is ignored. Other errors are logged.
+   * Events: none.
+   */
+  async deleteCache(file) {
+    const cachePath = this.cachePath(file);
+    if (!cachePath) return;
+    // Unlink both the gzip cache and its .bak.
+    for (const target of [cachePath, `${cachePath}.bak`]) {
+      try {
+        await fs.promises.unlink(target);
+      } catch (error) {
+        if (error.code !== 'ENOENT') console.warn(`[archive] could not delete cache for ${file.path}: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * Drops the oldest gzip caches when the directory has more than maxCacheFiles .json.gz names.
+   * Oldest is by the cache file's own mtime. Each removed .json.gz also removes its .bak.
+   * Does nothing when cacheDir is unset or the count is within the cap. Failures are logged.
+   * No parameters.
+   * @returns {void}
+   * Side effects: synchronous readdir, stat, and rm of cache files.
+   * Events: none.
+   */
   pruneCache() {
     const dir = this.options.cacheDir;
     if (!dir) return;
@@ -991,13 +1827,28 @@ class InterferenceArchive extends EventEmitter {
       if (entries.length <= this.options.maxCacheFiles) return;
       entries.sort((a, b) => a.mtimeMs - b.mtimeMs);
       for (const entry of entries.slice(0, entries.length - this.options.maxCacheFiles)) {
-        fs.unlinkSync(path.join(dir, entry.name));
+        fs.rmSync(path.join(dir, entry.name), { force: true });
+        fs.rmSync(path.join(dir, `${entry.name}.bak`), { force: true });
       }
     } catch (error) {
       console.warn(`[archive] could not prune cache: ${error.message}`);
     }
   }
 
+  /**
+   * Merges one file summary into the loaded window [from, to].
+   * Coverage runs and samples outside the window are skipped; runs and solution
+   * intervals that overlap the window are clipped to it. solutionResolutionMs and
+   * bestsatsResolutionMs rise to the summary's resolution. Either interval array
+   * over maxSamples is sorted and reduced by doubling its resolution until it is
+   * at most 75% of maxSamples. samples over maxSamples call coarsen().
+   * @param {object} summary Plain summary (toJSON or a cache object).
+   * @param {number} from Window start in milliseconds.
+   * @param {number} to Window end in milliseconds.
+   * @returns {void}
+   * Side effects: mutates coverage, samples, solution, bestsats, their resolutions, and sorted.
+   * Events: none.
+   */
   addSummary(summary, from, to) {
     for (const run of summary.coverage) {
       if (!Array.isArray(run) || run[1] < from || run[0] > to) continue;
@@ -1035,7 +1886,14 @@ class InterferenceArchive extends EventEmitter {
     if (this.samples.length > this.options.maxSamples) this.coarsen();
   }
 
-  /** Halves detection resolution (keeping the strongest per signal and bucket) until within the limit. */
+  /**
+   * Widens detection buckets until samples.length is at most 75% of maxSamples.
+   * Each pass doubles resolutionMs and keeps the stronger sample per signal per bucket.
+   * No parameters.
+   * @returns {void}
+   * Side effects: ensureSorted(), then replaces this.samples and this.resolutionMs.
+   * Events: none.
+   */
   coarsen() {
     this.ensureSorted();
     while (this.samples.length > this.options.maxSamples * 0.75) {
@@ -1050,6 +1908,15 @@ class InterferenceArchive extends EventEmitter {
     }
   }
 
+  /**
+   * Sorts samples, solution, bestsats, and coverage, then merges coverage runs
+   * whose start is within COVERAGE_GAP_MS of the previous run's end.
+   * Returns immediately when this.sorted is already true.
+   * No parameters.
+   * @returns {void}
+   * Side effects: reorders those arrays, replaces coverage with the merged runs, sets sorted.
+   * Events: none.
+   */
   ensureSorted() {
     if (this.sorted) return;
     this.samples.sort((a, b) => a.t - b.t);
@@ -1067,8 +1934,22 @@ class InterferenceArchive extends EventEmitter {
   }
 
   /**
-   * Returns loaded history between `from` and `to` reduced to at most `buckets` time buckets:
-   * the strongest sample per signal per bucket, and coverage runs merged across sub-bucket gaps.
+   * Returns loaded history between `from` and `to`, reduced to at most `buckets` buckets.
+   * buckets is clamped to 10..MAX_QUERY_BUCKETS. A floor of 0 or NaN is treated as 1000
+   * before that clamp; a negative floor is clamped up to 10.
+   * bucketMs is at least the data resolution and at least the window divided by that count.
+   * The strongest sample per signal per bucket is kept. detectionSamples counts
+   * in-range samples with count > 0, including ones that lose that contest.
+   * Coverage is clipped to the window and merged across gaps of max(COVERAGE_GAP_MS, bucketMs).
+   * Solution and BESTSATS intervals that overlap the window are clipped and passed
+   * through reduceSolutions at the wider of bucketMs and their own resolution.
+   * While a background snapshot exists, the snapshot is queried and is not re-sorted here.
+   * @param {{from: number, to: number, buckets: number}} range Query window and bucket count.
+   * @returns {object} from, to, bucketMs, resolutionMs, revision, detectionSamples, coverage,
+   *   samples, solution, solutionResolutionMs, bestsats, bestsatsResolutionMs.
+   * Side effects: when no snapshot exists, ensureSorted() may reorder the live arrays.
+   *   Throws Error when from/to is not a finite range with to > from.
+   * Events: none.
    */
   query({ from, to, buckets }) {
     if (!this.view) this.ensureSorted();

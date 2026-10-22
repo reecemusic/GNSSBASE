@@ -1,3 +1,8 @@
+/**
+ * Locks in solution-history plotting: server heartbeat samples, browser runs
+ * that break on gaps, BESTPOS versus BESTSATS precedence, and live readouts
+ * that go stale.
+ */
 'use strict';
 
 const assert = require('node:assert/strict');
@@ -9,6 +14,14 @@ const { History, SOLUTION_HEARTBEAT_MS } = require('../src/history');
 
 const browserCode = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
 
+/**
+ * Evaluates a source slice inside a vm context.
+ * @param {string} code Full source text.
+ * @param {string} start First source substring. The slice begins at this match.
+ * @param {string} end Source substring searched for from the start match. The slice ends there.
+ * @param {object} context vm context that receives the slice.
+ * @returns {void}
+ */
 function loadFunctions(code, start, end, context) {
   const first = code.indexOf(start);
   const last = code.indexOf(end, first);
@@ -16,13 +29,26 @@ function loadFunctions(code, start, end, context) {
   vm.runInContext(code.slice(first, last), context);
 }
 
+/**
+ * Clones a JSON value so assertions see plain data.
+ * @param {*} value Any JSON-safe value.
+ * @returns {*} Deep copy.
+ */
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
+/**
+ * Builds a BESTPOS-like solution record.
+ * @param {number} used Satellites used.
+ * @param {string} [type='SINGLE'] Position type.
+ * @param {string} [status='SOL_COMPUTED'] Solution status.
+ * @returns {object} Fields the history and plot code read. satellitesTracked is 30.
+ */
 const bestpos = (used, type = 'SINGLE', status = 'SOL_COMPUTED') => ({
   solutionStatus: status, positionType: type, satellitesUsed: used, satellitesTracked: 30,
 });
 
-test('server solution history keeps changes plus a heartbeat and survives save/load', (t) => {
+/** Catches solution history that stores every second, drops a change, fails save/load, or keeps more than the cap. */
+test('server solution history keeps changes plus a heartbeat and survives save/load', async (t) => {
   const file = path.join(fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'solution-')), 'history.json');
   t.after(() => fs.rmSync(path.dirname(file), { recursive: true, force: true }));
   const history = new History({ retentionMs: 3600000, trackSampleMs: 20000, maxInterferenceSamples: 1000, filePath: file });
@@ -41,7 +67,7 @@ test('server solution history keeps changes plus a heartbeat and survives save/l
   });
   assert.equal(history.since(3600000).solution.length, 7);
 
-  history.save();
+  await history.save();
   const restored = new History({ retentionMs: 3600000, trackSampleMs: 20000, maxInterferenceSamples: 1000, filePath: file });
   restored.load();
   assert.deepEqual(restored.solution, history.solution);
@@ -52,11 +78,20 @@ test('server solution history keeps changes plus a heartbeat and survives save/l
   assert.equal(capped.solution[0].used, 15);
 });
 
+/** Catches runs joined across a long silence, or a fix tier that treats an invalid solution as a fix. */
 test('browser solution runs merge repeats, break on lost output and map fix tiers', () => {
   const context = vm.createContext({
     POSITION_TYPE_TEXT: { SINGLE: ['', 'single'], FIXEDPOS: ['', 'fixed'], NARROW_FLOAT: ['', 'float'], WAAS: ['', 'diff'] },
   });
   loadFunctions(browserCode, 'const SOLUTION_HOLD_MS =', 'function drawSolutionTimeline(', context);
+  /**
+   * Builds one solution-history sample with tracked fixed at 30.
+   * @param {number} t Sample time in milliseconds.
+   * @param {number|null} used Satellites used.
+   * @param {string|null} [type='SINGLE'] Position type.
+   * @param {string} [status='SOL_COMPUTED'] Solution status.
+   * @returns {object}
+   */
   const sample = (t, used, type = 'SINGLE', status = 'SOL_COMPUTED') => ({ t, used, tracked: 30, status, type });
   const samples = [
     sample(0, 18), sample(10000, 18), sample(20000, 19),
@@ -79,6 +114,7 @@ test('browser solution runs merge repeats, break on lost output and map fix tier
   assert.equal(context.fixTier(sample(0, 10, 'SOMETHING_NEW')), 1, 'unknown computed types count as single');
 });
 
+/** Catches a no-fix tier that is not red, or another tier that is not green. */
 test('fix plot colours no fix red and every other quality tier green', () => {
   const context = vm.createContext({});
   loadFunctions(browserCode, 'const SOLUTION_HOLD_MS =', 'function drawSolutionTimeline(', context);
@@ -89,6 +125,7 @@ test('fix plot colours no fix red and every other quality tier green', () => {
     ['#3ddc84', '#3ddc84', '#3ddc84', '#3ddc84']);
 });
 
+/** Catches BESTPOS thinning that keeps a repeat inside the heartbeat or drops a type change. */
 test('browser records live BESTPOS with the same thinning and history merge as the server', () => {
   const context = vm.createContext({
     Date, MAX_INTERFERENCE_SAMPLES: 10000, MAX_TRACK_SAMPLES: 1081, MAX_TRACKS: 512,
@@ -103,7 +140,7 @@ test('browser records live BESTPOS with the same thinning and history merge as t
   context.recordSolution(bestpos(20, 'FIXEDPOS'), now + 11000);
   assert.deepEqual(plain(context.state.solutionHistory.map((s) => [s.t - now, s.used, s.type])),
     [[0, 20, 'SINGLE'], [10000, 20, 'SINGLE'], [11000, 20, 'FIXEDPOS']]);
-  context.recordLiveHistory({ name: 'BESTPOS', data: bestpos(7) });
+  context.recordLiveHistory({ name: 'BESTPOS', crcValid: true, data: bestpos(7) });
   assert.equal(context.state.solutionHistory.at(-1).used, 7);
   assert.equal(context.solutionSample({ t: 5, used: 300, type: 'SINGLE' }, 5).used, null, 'counts are bounded');
   assert.equal(context.solutionSample({ status: 'SOL_COMPUTED' }, 5), null, 'samples need a count or a type');
@@ -112,6 +149,7 @@ test('browser records live BESTPOS with the same thinning and history merge as t
   assert.equal(context.state.solutionHistory.length, 3);
 });
 
+/** Catches a merge that lets an archive sample replace a live one, or that fills the gap between archive intervals. */
 test('browser merges historic BESTPOS intervals with local precedence and archive visibility', () => {
   const context = vm.createContext({
     state: {
@@ -139,6 +177,7 @@ test('browser merges historic BESTPOS intervals with local precedence and archiv
   assert.equal(context.timelineSolutionSamples(10000, 210000).length, 1);
 });
 
+/** Catches solution rows that change the band-row height, or a viewBox that disagrees with TIMELINE.height. */
 test('timeline geometry keeps the band rows and adds two solution rows above the axis', () => {
   const context = vm.createContext({});
   loadFunctions(browserCode, 'const TIMELINE =', 'const TIMELINE_BANDS', context);
@@ -149,6 +188,7 @@ test('timeline geometry keeps the band rows and adds two solution rows above the
   assert.match(html, new RegExp(`id="timeline" viewBox="0 0 900 ${TIMELINE.height}"`));
 });
 
+/** Catches BESTSATS replacing a BESTPOS count, or a fix run invented where only BESTSATS exists. */
 test('BESTSATS counts fill gaps only, with BESTPOS precedence and no fabricated fix', () => {
   const context = vm.createContext({
     state: {
@@ -173,6 +213,7 @@ test('BESTSATS counts fill gaps only, with BESTPOS precedence and no fabricated 
   assert.equal(context.timelineSolutionSamples(0, 160000).length, 1);
 });
 
+/** Catches a band timeline that drops the clear sample when another band in the same report is jammed. */
 test('a report with interference in one band shows clear status in the other bands', () => {
   const context = vm.createContext({
     classifyBand: (signal) => (/L2/.test(signal) ? 'L2' : /L5/.test(signal) ? 'L5' : /L1/.test(signal) ? 'L1' : 'OTHER'),
@@ -186,13 +227,29 @@ test('a report with interference in one band shows clear status in the other ban
     { t: 3000, signal: 'GPSL1CA', count: 1, maxPower: -95 },
     { t: 3000, signal: 'GPSL2C', count: 2, maxPower: -85 },
   ];
+  /**
+   * Returns the band timeline as [time, count] pairs.
+   * @param {string} band Band id passed to timelineBandSamples.
+   * @returns {Array<[number, number]>}
+   */
   const summary = (band) => plain(context.timelineBandSamples(samples, band).map((s) => [s.t, s.count]));
   assert.deepEqual(summary('L1'), [[0, 0], [1000, 0], [2000, 0], [3000, 1]]);
   assert.deepEqual(summary('L2'), [[0, 0], [1000, 1], [2000, 1], [3000, 2]]);
   assert.deepEqual(summary('L5'), [[0, 0], [1000, 0], [2000, 0], [3000, 0]], 'one clear sample per report');
 });
 
+/**
+ * Returns a factory for plain SVG element stand-ins.
+ * @returns {Function} (tag, attributes, textContent) => element.
+ */
 function fakeSvg() {
+  /**
+   * Builds a stub SVG node that records tag, attributes, text, and children.
+   * @param {string} tag Element name.
+   * @param {object} [attributes] Initial attributes, copied onto the node.
+   * @param {string} [textContent] Initial text.
+   * @returns {object} Stub node with append and setAttribute.
+   */
   const element = (tag, attributes = {}, textContent = '') => ({
     tag, attributes: { ...attributes }, textContent, children: [],
     append(...children) { this.children.push(...children); },
@@ -201,6 +258,7 @@ function fakeSvg() {
   return element;
 }
 
+/** Catches a BESTSATS-only span drawn as a no-fix bar. */
 test('BESTSATS-only plot shows satellite count and unavailable fix instead of a no-fix classification', () => {
   const svg = fakeSvg();
   const context = vm.createContext({
@@ -218,6 +276,7 @@ test('BESTSATS-only plot shows satellite count and unavailable fix instead of a 
   assert(chart.children.some((el) => el.textContent === 'Fix type unavailable: BESTSATS does not report it'));
 });
 
+/** Catches a live readout that keeps a stale BESTPOS or that skips the roll when the count or type changes. */
 test('live solution readouts show the current count and fix type, roll on change and go stale', () => {
   const svg = fakeSvg();
   let now = 1_000_000;
@@ -228,6 +287,10 @@ test('live solution readouts show the current count and fix type, roll on change
   });
   loadFunctions(browserCode, 'const TIMELINE =', 'function timelineViewport(', context);
   loadFunctions(browserCode, 'const SOLUTION_HOLD_MS =', 'function drawSolutionTimeline(', context);
+  /**
+   * Draws one live solution readout and returns its value and fix text nodes.
+   * @returns {object} Nodes keyed by tl-live-value and tl-live-fix.
+   */
   const draw = () => {
     const chart = svg('svg');
     context.drawSolutionLive(chart, 0, 90, now);
@@ -262,6 +325,7 @@ test('live solution readouts show the current count and fix type, roll on change
   assert.equal(live['tl-live-fix'].textContent, '—');
 });
 
+/** Catches a missing right-margin label, or one anchored like the left label. */
 test('y-axis labels are duplicated in the right margin', () => {
   const svg = fakeSvg();
   const context = vm.createContext({ svg });
@@ -278,6 +342,7 @@ test('y-axis labels are duplicated in the right margin', () => {
   assert.match(css, /\.tl-label\.tl-label-right, \.spectrum-label\.spectrum-label-right \{ text-anchor: start; \}/);
 });
 
+/** Catches an archive panel that is not between the interference tab and the interference banner. */
 test('historic archive panel sits at the top of the interference tab', () => {
   const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
   const tab = html.indexOf('id="tab-interference"');

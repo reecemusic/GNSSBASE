@@ -31,9 +31,12 @@ changes only take effect when that button is pressed.
 
 Both ASCII (`#...*crc`) and binary (`0xAA 0x44 0x12`) framings are decoded, and the two
 may be interleaved on the same port. CRC is verified on every log.
-Malformed checksums are marked failed, rather than treated as unchecked. CRC-failed
-reports remain visible for diagnosis but do not enter live/saved interference,
-position or sky-track history. SATVIS2 with invalid visibility does not create tracks.
+Malformed checksums are marked failed, rather than treated as unchecked. Reports
+without a checksum stay unchecked. Only CRC-valid reports update the live position,
+health and sky displays, or enter live/saved interference, position or sky-track
+history. CRC-failed and unchecked reports remain visible in the raw log for diagnosis.
+Abbreviated archive logs without a checksum are still decoded. SATVIS2 with invalid
+visibility does not create tracks.
 Incomplete RANGE, SATVIS2 and ITDETECTSTATUS payloads are rejected explicitly instead
 of becoming partial counts or false clear interference reports. Archive scans count
 malformed reports in their error counter and continue with subsequent valid records.
@@ -85,7 +88,11 @@ Skyplot traces and the interference timeline are backed by a time-bounded store 
 options longer than the server's retention are disabled automatically.
 
 History is written to `data/history.json` periodically and on shutdown, then restored at
-startup, so traces and interference records survive a restart. Both memory and file size
+startup, so traces and interference records survive a restart. Samples use the receiver's
+GPS time only when that time is after 2020 and within five minutes of the computer clock;
+otherwise they use the time the report was received, so a receiver that has not set GPS
+week yet still appears on the live chart. A history file that is too large or cannot be
+parsed is left in place and is not overwritten. Both memory and file size
 are bounded by `HISTORY_RETENTION_MIN` (24 h by default), `TRACK_SAMPLE_SEC` and `MAX_IT_SAMPLES`.
 When a window holds more samples than the browser asks for, the newest half is sent as
 recorded and older samples are merged into time buckets (strongest report per band;
@@ -341,6 +348,7 @@ Band cards and statistics remain live-only.
 | `NOVATEL_SERIAL_PATH` / `NOVATEL_SERIAL_BAUD` | `COM11` / `9600` | USB serial port and baud rate |
 | `NOVATEL_SERIAL_PROBE_MS` | `5000` | In `auto` mode, how long an open serial port may go without a decodable log before falling back to TCP |
 | `NOVATEL_HOST` / `NOVATEL_PORT` | `20.20.20.50` / `3001` | Receiver ICOM endpoint (TCP) |
+| `CONNECTION_SETTINGS_FILE` | `data/connection-settings.json` | **Apply & reconnect** writes here. On the next start this file overrides the transport variables above, and the server logs which file it used. Set to an empty string to ignore it. |
 | `NOVATEL_SEND_LOG_CMD` | `false` | When `true`, sends `UNLOGALL THISPORT` plus its own `LOG ...A` requests on connect. Leave `false` when the receiver is running [profiles/GNSSBASE.txt](profiles/GNSSBASE.txt), which already pushes these logs to ICOM1 — `UNLOGALL THISPORT` would remove them. |
 | `NOVATEL_RECONNECT_MS` | `3000` | Reconnect delay |
 | `NOVATEL_IDLE_MS` | `30000` | Recycle the socket if no data arrives for this long |
@@ -358,7 +366,7 @@ Band cards and statistics remain live-only.
 | `ARCHIVE_SETTINGS_FILE` | `data/archive-settings.json` | Where the chosen folder, days and Keep-loaded choice are remembered. Empty string disables saving. |
 | `ARCHIVE_AUTO` | `true` | Default for **Keep loaded** when no choice has been saved; `false` disables automatic loading |
 | `ARCHIVE_REFRESH_MIN` | `15` | Minutes between automatic background refreshes |
-| `ARCHIVE_TIMEOUT_SEC` | `20` | NAS calls slower than this are abandoned (stalled reads after 6×, minimum 60 s) |
+| `ARCHIVE_TIMEOUT_SEC` | `20` | NAS calls slower than this are abandoned (stalled reads after 6×, minimum 60 s). A handle that never closes still blocks the next scan. |
 
 The requested logs are listed in [src/config.js](src/config.js). They are requested in
 ASCII on this tool's own port only — the profile's binary `LOG FILE ...` recording is
