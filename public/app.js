@@ -610,9 +610,10 @@ function flushUpdates(force = false) {
       if (latestByName.BESTPOS) renderBestPos(latestByName.BESTPOS);
       if (latestByName.BESTGNSSPOS) renderBestGnssPos(latestByName.BESTGNSSPOS);
     },
+    // renderRange redraws the skyplot. A call here as well painted it twice.
     satellites: () => {
-      renderSkyplot();
-      if (latestByName.RANGE) renderRange(latestByName.RANGE);
+      if (latestByName.RANGE && latestByName.RANGE.data) renderRange(latestByName.RANGE);
+      else renderSkyplot();
     },
     ephemeris: () => { if (force || ephemerisDirty) renderEphemeris(); },
     interference: () => {
@@ -3021,6 +3022,7 @@ function buildSatMarker(sat) {
   const style = {
     used: { fill: colour, stroke: 'none', label: '#12151a' },
     tracked: { fill: 'rgba(27,32,41,.9)', stroke: colour, label: colour },
+    // Dashed ring, same fill and stroke as tracked. The legend uses the same dash.
     unknown: { fill: 'rgba(27,32,41,.9)', stroke: colour, label: colour },
     visible: { fill: 'none', stroke: 'rgba(140,148,164,.7)', label: '#8c94a4' },
     missing: { fill: 'none', stroke: '#ffb02e', label: '#ffb02e' },
@@ -3032,7 +3034,7 @@ function buildSatMarker(sat) {
     fill: style.fill,
     stroke: style.stroke,
     'stroke-width': 2,
-    'stroke-dasharray': sat.state === 'visible' ? '3 2' : 'none',
+    'stroke-dasharray': sat.state === 'visible' ? '3 2' : sat.state === 'unknown' ? '4 2' : 'none',
   }));
   group.append(svg('text', { x, y: y + 4, class: 'sat-label', fill: style.label }, sat.prn));
   group.append(svg('title', {}, `${sat.system} ${sat.prn}\n${STATE_TEXT[sat.state]}`
@@ -3896,6 +3898,9 @@ const SIGNAL_NAMES = {
   GPS: [[0, 'L1C/A'], [16, 'L1C'], [5, 'L2P'], [9, 'L2P(Y)'], [17, 'L2C'], [14, 'L5']],
   GLONASS: [[0, 'L1C/A'], [1, 'L2C/A'], [5, 'L2P'], [6, 'L3']],
   SBAS: [[0, 'L1C/A'], [6, 'L5']],
+  // OEM7 bits 21-25 name Galileo 2 E1, 6 E6B, 7 E6C, 12 E5a, 17 E5b, 20 E5 AltBOC.
+  // Code 0 is not in that table. The simulator leaves bits 21-25 clear, so those
+  // observations stay "Signal 0" instead of a guessed name.
   GALILEO: [[2, 'E1'], [12, 'E5a'], [17, 'E5b'], [20, 'E5 AltBOC'], [6, 'E6B'], [7, 'E6C']],
   BEIDOU: [[0, 'B1I'], [4, 'B1I'], [7, 'B1C'], [1, 'B2I'], [5, 'B2I'], [9, 'B2a'], [11, 'B2b'], [2, 'B3I'], [6, 'B3I']],
   QZSS: [[0, 'L1C/A'], [16, 'L1C'], [24, 'L1C/B'], [17, 'L2C'], [14, 'L5'], [27, 'L6P'], [28, 'L6D']],

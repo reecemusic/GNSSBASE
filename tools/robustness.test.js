@@ -1859,3 +1859,78 @@ test('a connection settings save failure is reported instead of a silent success
   assert.equal(context.persistConnectionSettings(), null);
   assert.equal(context.receiver.lastError, 'Could not save connection settings: disk full');
 });
+
+/** Catches a satellite flush that draws the skyplot and then draws it again from renderRange. */
+test('the satellite tab draws the skyplot once per update', () => {
+  const calls = [];
+  const context = vm.createContext({
+    document: { hidden: false, querySelector: () => ({ dataset: { tab: 'satellites' } }) },
+    latestByName: { RANGE: { data: { observations: [] } } },
+    dirtyRecords: new Set(['RANGE']),
+    countsDirty: false, ephemerisDirty: false, timelineDirty: false,
+    pendingRaw: [], pendingInterference: [],
+    renderSafely: (_label, render) => render(),
+    renderSkyplot: () => calls.push('skyplot'),
+  });
+  context.renderRange = () => { calls.push('range'); context.renderSkyplot(); };
+  load(context, 'function flushUpdates(', 'function renderStatus(');
+  context.flushUpdates();
+  assert.deepEqual(calls, ['range', 'skyplot']);
+  const rangeStart = code.indexOf('function renderRange(');
+  const rangeSource = code.slice(rangeStart, code.indexOf('\nfunction ', rangeStart + 20));
+  assert.equal(rangeSource.match(/renderSkyplot\(/g).length, 1, 'renderRange still draws the skyplot');
+  calls.length = 0;
+  context.latestByName = {};
+  context.dirtyRecords = new Set(['SATVIS2']);
+  context.flushUpdates();
+  assert.deepEqual(calls, ['skyplot']);
+  calls.length = 0;
+  context.latestByName = { RANGE: {} };
+  context.dirtyRecords = new Set(['RANGE']);
+  context.flushUpdates();
+  assert.deepEqual(calls, ['skyplot'], 'a RANGE report with no body still draws the skyplot once');
+});
+
+/** Catches an unknown satellite drawn with the same ring as a tracked one. */
+test('tracked and usage-unknown skyplot markers use different strokes', () => {
+  const circles = [];
+  const context = vm.createContext({
+    skyPosition: () => ({ x: 1, y: 2 }),
+    constellationColor: () => '#abc',
+    STATE_TEXT: { tracked: 'tracked', unknown: 'unknown' },
+    svg(name, attrs) {
+      const node = { name, attrs, children: [], append(child) { this.children.push(child); } };
+      if (name === 'circle') circles.push(attrs);
+      return node;
+    },
+  });
+  load(context, 'function buildSatMarker(', '/** Merges geometry');
+  const sat = { system: 'GPS', prn: '1', elevation: 40, azimuth: 10 };
+  context.buildSatMarker({ ...sat, state: 'tracked' });
+  context.buildSatMarker({ ...sat, state: 'unknown' });
+  assert.equal(circles[0].fill, circles[1].fill);
+  assert.equal(circles[0].stroke, circles[1].stroke);
+  assert.equal(circles[0]['stroke-dasharray'], 'none');
+  assert.equal(circles[1]['stroke-dasharray'], '4 2');
+  const html = fs.readFileSync(path.join(__dirname, '..', 'public', 'index.html'), 'utf8');
+  const css = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
+  assert.match(html, /class="key-marker unknown"/);
+  assert.match(css, /\.key-marker\.unknown\s*\{[^}]*dashed/);
+  assert.doesNotMatch(html, /key-marker tracked[^<]*<\/span>Tracked, usage unknown/);
+});
+
+/**
+ * OEM7 RANGE/TRACKSTAT bits 21-25 do not define Galileo signal type 0.
+ * The simulator status word leaves those bits clear, so the label stays Signal 0.
+ */
+test('Galileo signal code 0 stays unnamed and documented codes keep their names', () => {
+  const context = vm.createContext({});
+  load(context, 'const SIGNAL_NAMES = {', 'function signalOrder(');
+  const named = [2, 6, 7, 12, 17, 20].map((signal) => context.signalName('GALILEO', (signal << 21).toString(16)));
+  assert.deepEqual(named, ['E1', 'E6B', 'E6C', 'E5a', 'E5b', 'E5 AltBOC']);
+  const simulator = fs.readFileSync(path.join(__dirname, '..', 'tools', 'simulator.js'), 'utf8');
+  assert.match(simulator, /0x08109c04 & ~\(0x7 << 16\)/);
+  const word = ((0x08109c04 & ~(0x7 << 16)) | (3 << 16)) >>> 0;
+  assert.equal(context.signalCode(word), 0);
+  assert.equal(context.signalName('GALILEO', word.toString(16)), 'Signal 0');
+});
