@@ -183,7 +183,8 @@ receiver.on('log', (message) => {
  *   to rawLog as a diagnostic, broadcast, and then ignored for store.latest, so the last
  *   good record stays. CRC-valid records update store.latest. A failed CRC still goes to
  *   the raw log, and an ITDETECTSTATUS record still goes to itdetectHistory. Trusted
- *   ephemeris, BESTPOS, SATVIS2, and ITDETECTSTATUS pass the gates below. Caps rawLog
+ *   ephemeris, BESTPOS, SATVIS2, ITDETECTSTATUS, and the satellites-tracked series
+ *   (RANGE and SATVIS2) pass the gates below. Caps rawLog
  *   at config.rawLogSize and itdetectHistory at config.historySize. console.warn when
  *   a CRC-failed ITDETECTSTATUS is left out of history.addInterference.
  * @emits none. broadcast writes SSE frames.
@@ -347,6 +348,19 @@ function processReceiverLog(message) {
     if (trusted && record.data.visibilityValid !== false) {
       history.addSatellites(record.data.system, record.data.satellites || [], reportTimestamp(record));
     }
+  }
+
+  // The wall satellites-tracked plot reads this series back from /api/history.
+  // RANGE replaces the tracked counts. SATVIS2 updates one constellation's in-view
+  // count. Mocks used by sliced tests do not implement these methods; the live
+  // History class does. A failed CRC does not enter the series.
+  if (trusted && typeof history.addTrackedObservations === 'function' && name === 'RANGE' && record.data) {
+    history.addTrackedObservations(record.data.observations, reportTimestamp(record));
+  }
+  if (trusted && typeof history.addVisibleSatellites === 'function' && name === 'SATVIS2' && record.data && record.data.system) {
+    history.addVisibleSatellites(
+      record.data.system, record.data.satellites, record.data.visibilityValid, reportTimestamp(record),
+    );
   }
 
   // A decoded record is appended to the raw log whether or not its CRC matched.

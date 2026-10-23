@@ -508,6 +508,245 @@ test('the UI log names localhost and LAN addresses when listening on all interfa
   assert.match(serverCode.slice(listenAt, listenAt + 500), /webListenLines\(config\.webHost, config\.webPort\)/);
 });
 
+/** Catches a wall satellites-tracked series that is not saved, or that loses the start of the day. */
+test('satellite-view history keeps constellation counts for 24 h and reloads them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'satview-'));
+  const file = path.join(dir, 'history.json');
+  try {
+    const history = new History({
+      retentionMs: 26 * 60 * 60 * 1000, trackSampleMs: 20000, maxInterferenceSamples: 80, filePath: file,
+    });
+    const start = Date.now() - 24 * 60 * 60 * 1000;
+    const gps = (count) => Array.from({ length: count }, (_, index) => ({ system: 'GPS', prn: index + 1 }));
+    history.addTrackedObservations([
+      ...gps(4),
+      { system: 'GLONASS', prn: 38 },
+      { system: 'GLONASS', prn: 39 },
+      { system: 'GLONASS', prn: 38 },
+      { system: 'OTHER', prn: 1 },
+    ], start);
+    history.addTrackedObservations([
+      ...gps(4),
+      { system: 'GLONASS', prn: 38 },
+      { system: 'GLONASS', prn: 39 },
+      { system: 'GLONASS', prn: 38 },
+    ], start);
+    assert.equal(history.satelliteView.length, 1, 'an older or equal time does not append');
+    history.addVisibleSatellites('GPS', [
+      { prn: 1, elevation: 10, azimuth: 20 },
+      { prn: 2, elevation: 10, azimuth: 30 },
+      { prn: 3, elevation: -1, azimuth: 20 },
+    ], true, start + 1000);
+    history.addVisibleSatellites('GLONASS', [
+      { prn: '12+3', elevation: 40, azimuth: 10 },
+    ], true, start + 2000);
+    assert.deepEqual(history.satelliteView[0].tracked, { GLONASS: 2, GPS: 4 });
+    assert.deepEqual(history.satelliteView[2].inView, { GLONASS: 1, GPS: 2 });
+    history.addTrackedObservations([
+      ...gps(4),
+      { system: 'GLONASS', prn: 38 },
+      { system: 'GLONASS', prn: 39 },
+    ], start + 5000);
+    assert.equal(history.satelliteView.length, 3, 'unchanged counts inside the heartbeat are one point');
+    history.addTrackedObservations(gps(6), start + 8000);
+    assert.equal(history.satelliteView.at(-1).tracked.GPS, 6, 'a change inside the heartbeat is stored');
+    history.addVisibleSatellites('GPS', [], false, start + 9000);
+    assert.equal(history.satelliteView.at(-1).inView.GPS, undefined);
+    assert.equal(history.satelliteView.at(-1).inView.GLONASS, 1);
+
+    // The cap has to hold more than two hours of one-a-minute samples. Below that,
+    // the same rule as the browser keeps the newest samples and a 24 h span never forms.
+    const long = new History({
+      retentionMs: 26 * 60 * 60 * 1000, trackSampleMs: 20000, maxInterferenceSamples: 300, filePath: file,
+    });
+    for (let minute = 0; minute <= 24 * 60; minute++) {
+      long.addTrackedObservations(gps(minute < 12 * 60 ? 3 : 9), start + minute * 60000);
+    }
+    assert.ok(long.satelliteView.length <= 300);
+    assert.ok(long.satelliteView.length > 10);
+    assert.ok(long.satelliteView[0].t < start + 3 * 60 * 60 * 1000, 'the morning is not cut off');
+    assert.equal(long.satelliteView.at(-1).tracked.GPS, 9);
+    assert.ok(long.satelliteView.some((sample) => sample.tracked.GPS === 3));
+    const queried = long.since(24 * 60 * 60 * 1000, Date.now(), 40);
+    assert.ok(queried.satelliteView.length <= 40);
+    assert.ok(queried.satelliteView[0].t < start + 3 * 60 * 60 * 1000);
+    long.saveSync();
+    const loaded = new History({
+      retentionMs: 26 * 60 * 60 * 1000, trackSampleMs: 20000, maxInterferenceSamples: 300, filePath: file,
+    });
+    loaded.load();
+    assert.equal(loaded.satelliteView.at(-1).tracked.GPS, 9);
+    assert.deepEqual(loaded.viewTracked, { GPS: 9 });
+    assert.ok(loaded.satelliteView.some((sample) => sample.tracked.GPS === 3));
+    fs.writeFileSync(file, JSON.stringify({
+      version: 1, satvisFieldLayout: 2, tracks: {}, interference: [],
+      solution: [{ t: Date.now(), used: 1, tracked: 2, status: 'SOL_COMPUTED', type: 'SINGLE' }],
+    }));
+    const older = new History({
+      retentionMs: 3600000, trackSampleMs: 20000, maxInterferenceSamples: 80, filePath: file,
+    });
+    older.load();
+    assert.deepEqual(older.satelliteView, []);
+    assert.equal(older.solution.length, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+/** Catches a server that draws the wall plot from the browser only. */
+test('the server records RANGE and SATVIS2 on the satellite-view history', () => {
+  const recorded = [];
+  const context = vm.createContext({
+    decode: (record) => record,
+    store: { latest: {}, counts: {}, itdetectHistory: [], satvisBySystem: {}, ephemeris: {}, rawLog: [] },
+    config: { historySize: 50, rawLogSize: 200 },
+    history: {
+      addSolution() {}, addSatellites() {}, addInterference() {},
+      addTrackedObservations: (observations, timestamp) => recorded.push(['range', observations.length, timestamp]),
+      addVisibleSatellites: (system, satellites, visibility, timestamp) => recorded.push(['view', system, visibility, timestamp]),
+    },
+    broadcast() {},
+    console,
+    saneTimestamp: (utc, receivedAt) => Date.parse(utc || receivedAt),
+  });
+  load(serverCode, 'function processReceiverLog(', 'function broadcast(', context);
+  context.processReceiverLog({
+    name: 'RANGE', crcValid: true, receivedAt: '2026-10-23T00:00:00.000Z',
+    header: { utc: '2026-10-23T00:00:01.000Z' },
+    data: { observations: [{ system: 'GPS', prn: 1 }] },
+  });
+  context.processReceiverLog({
+    name: 'RANGE', crcValid: false, receivedAt: '2026-10-23T00:00:02.000Z',
+    data: { observations: [{ system: 'GPS', prn: 2 }] },
+  });
+  context.processReceiverLog({
+    name: 'SATVIS2', crcValid: true, receivedAt: '2026-10-23T00:00:03.000Z',
+    header: { utc: '2026-10-23T00:00:04.000Z' },
+    data: { system: 'GPS', visibilityValid: true, satellites: [] },
+  });
+  assert.deepEqual(recorded.map((row) => row[0]), ['range', 'view']);
+  assert.equal(recorded[0][2], Date.parse('2026-10-23T00:00:01.000Z'));
+  assert.equal(recorded[1][1], 'GPS');
+  assert.equal(recorded[1][2], true);
+});
+
+/** Catches a reload that drops saved satellites-tracked samples or the snapshot point. */
+test('saved satellite-view history is merged with the live tail', () => {
+  const context = vm.createContext({
+    MAX_INTERFERENCE_SAMPLES: 100,
+    capSeries: (samples) => samples,
+  });
+  load(browserCode, 'function mergeSavedSatelliteView(', 'function capHistoryWindow(', context);
+  const merged = context.mergeSavedSatelliteView([
+    { t: 1000, tracked: { GPS: 4 }, inView: { GPS: 0, GALILEO: 2 } },
+    { t: 2000, tracked: [], inView: { GPS: 1 } },
+  ], [
+    { t: 1500, tracked: { GPS: 1 }, inView: {} },
+    { t: 5000, tracked: { GPS: 8 }, inView: { GPS: 9 } },
+  ], 4000);
+  assert.equal(merged.length, 2);
+  assert.equal(merged[0].t, 1000);
+  // The objects are created in the vm, so compare their text.
+  assert.equal(JSON.stringify(merged[0].tracked), JSON.stringify({ GPS: 4 }));
+  assert.equal(JSON.stringify(merged[0].inView), JSON.stringify({ GALILEO: 2 }));
+  assert.equal(merged[1].t, 5000);
+  assert.equal(merged[1].tracked.GPS, 8);
+  const kept = context.mergeSavedSatelliteView([], [
+    { t: 1000, tracked: { GPS: 3 }, inView: {} },
+  ], 9000);
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].tracked.GPS, 3);
+});
+
+/** Catches a wall plot that ignores saved samples or draws archive totals over live coverage. */
+test('the satellites-tracked plot draws saved history and archive totals in the gaps', () => {
+  const chart = {
+    children: [],
+    replaceChildren() { this.children = []; },
+    append(child) { this.children.push(child); },
+  };
+  const plotContext = vm.createContext({
+    Date,
+    state: {
+      satelliteViewHistory: [
+        { t: 20000, tracked: { GPS: 4 }, inView: { GPS: 6 } },
+        { t: 30000, tracked: { GPS: 5 }, inView: { GPS: 7 } },
+      ],
+      archive: {
+        shown: true,
+        data: { solution: [
+          { t: 0, end: 15000, tracked: 20, used: 10 },
+          { t: 20000, end: 40000, tracked: 99, used: 10 },
+        ] },
+      },
+    },
+    $: () => chart,
+    timelineViewport: () => ({ start: 0, windowMs: 100000 }),
+    timelineAxis: (start, _window, width) => ({
+      start, dataEnd: 100000, plotWidth: width, x: (time) => time / 100000 * width,
+    }),
+    appendTimeAxis() {},
+    constellationColor: () => '#00f',
+    svg: (tag, attributes, text) => ({ tag, attributes, text, children: [], append(child) { this.children.push(child); } }),
+  });
+  load(browserCode, 'const SATELLITE_VIEW =', 'function renderCounts(', plotContext);
+  plotContext.sumCounts = (counts) => Object.values(counts || {}).reduce((sum, count) => sum + count, 0);
+  plotContext.renderSatelliteViewPlot();
+  const lines = chart.children.filter((element) => element.tag === 'polyline');
+  const totals = lines.filter((line) => /satellite-view-total-line/.test(line.attributes.class));
+  const constellation = lines.filter((line) => line.attributes.stroke === '#00f');
+  assert.equal(constellation.length, 1);
+  assert.ok(constellation[0].attributes.points.startsWith('212.0'), 'constellation line starts at the saved sample');
+  assert.ok(totals.some((line) => line.attributes.points.startsWith('44.0,22.0')));
+  const labels = chart.children.filter((element) => element.tag === 'text').map((element) => element.text);
+  assert.ok(labels.includes('20'));
+  assert.ok(!labels.includes('100'), 'archive totals under live coverage do not rescale the plot');
+});
+
+/** Catches a reconnect that leaves the wall plot on the samples from this page only. */
+test('a reopened live stream reloads history', () => {
+  let loads = 0;
+  const created = [];
+  /**
+   * Minimal EventSource. Records listeners and instances.
+   */
+  class EventSource {
+    constructor() {
+      created.push(this);
+      this.listeners = {};
+    }
+
+    /**
+     * @param {string} name Event name.
+     * @param {Function} handler Listener.
+     * @returns {void}
+     */
+    addEventListener(name, handler) { this.listeners[name] = handler; }
+
+    /** @returns {void} */
+    close() { this.closed = true; }
+  }
+  const context = vm.createContext({
+    source: null,
+    streamHasOpened: false,
+    streamRetryMs: 1000,
+    streamRetryTimer: null,
+    document: { hidden: false },
+    connection: { offline: false },
+    EventSource,
+    renderConnectionBar() {},
+    loadHistory() { loads += 1; },
+  });
+  load(browserCode, 'function connectStream()', 'function renderStatus(', context);
+  context.connectStream();
+  created[0].listeners.open();
+  assert.equal(loads, 0, 'startup already loads history');
+  context.source = null;
+  context.connectStream();
+  created[1].listeners.open();
+  assert.equal(loads, 1);
+});
+
 /** Catches the thread-pool size being set after the server module loads. */
 test('the start wrapper sets the libuv pool size before loading the server', () => {
   const start = fs.readFileSync(path.join(__dirname, '..', 'src', 'start.js'), 'utf8');

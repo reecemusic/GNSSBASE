@@ -475,6 +475,8 @@ loadConnectionSettings();
 // --- stream -----------------------------------------------------------------
 
 let source = null;
+// False until the live stream has opened once. Later opens reload history.
+let streamHasOpened = false;
 
 /**
  * Parses one EventSource message and passes the object to handler.
@@ -519,6 +521,12 @@ function connectStream() {
       streamRetryTimer = null;
     }
     renderConnectionBar();
+    // The first open is paired with the startup loadHistory() call. A later open
+    // is a reconnect, including after the server restarts. Reload history so the
+    // wall satellites-tracked plot is not limited to reports since this page loaded.
+    // Sliced tests do not define loadHistory.
+    if (streamHasOpened && typeof loadHistory === 'function') loadHistory();
+    streamHasOpened = true;
   });
   // error marks the page offline. CONNECTING (0) still retries inside this EventSource.
   // CLOSED (2) does not. Drop it and open a new one after a backoff.
@@ -1092,7 +1100,7 @@ let historyController = null;
 /**
  * GET /api/history for the selected window and merges it with samples that arrived during the request.
  * @returns {Promise<void>}
- * Side effects: aborts the previous history fetch. Replaces tracks. Merges interference and, when data.solution is an array, solution history. A stale generation or a hidden tab returns before applying. Other failures are reported and existing samples stay. events: none.
+ * Side effects: aborts the previous history fetch. Replaces tracks. Merges interference and, when present, solution and satellite-view history. A stale generation or a hidden tab returns before applying. Other failures are reported and existing samples stay. events: none.
  */
 async function loadHistory() {
   const generation = ++historyRequest;
@@ -1132,6 +1140,13 @@ async function loadHistory() {
       const solutionDuringRequest = (state.solutionHistory || []).filter((sample) => sample.t >= requestedAt && sample.t > lastSaved);
       state.solutionHistory = [...savedSolution, ...solutionDuringRequest];
     }
+    // Absent on a server that does not store this series yet. An empty array is a
+    // real answer and still keeps live points that arrived with this page.
+    if (Array.isArray(data.satelliteView)) {
+      state.satelliteViewHistory = mergeSavedSatelliteView(
+        data.satelliteView, state.satelliteViewHistory, requestedAt,
+      );
+    }
     pruneClientHistory();
     capHistoryWindow(data.retentionMinutes);
     clearClientError();
@@ -1140,6 +1155,56 @@ async function loadHistory() {
   }
   timelineDirty = true;
   flushUpdates(true);
+}
+
+/**
+ * Merges saved satellites-tracked samples with the live tail already on the page.
+ * Saved samples are capped the same way as interference. Live points newer than the
+ * last saved sample are kept. When the file has no samples yet, every live point is
+ * kept, including the one snapshot taken as the page opened. A bad count map is dropped.
+ * @param {object[]} saved satelliteView from /api/history.
+ * @param {object[]} live state.satelliteViewHistory before the response is applied.
+ * @param {number} requestedAt Date.now() from the start of the request.
+ * @returns {object[]} Time-ordered samples.
+ * Side effects: none.
+ * events: none.
+ */
+function mergeSavedSatelliteView(saved, live, requestedAt) {
+  /**
+   * One stored sample, or null when the time or a count map is unusable.
+   * @param {object} sample Candidate from the server or the page.
+   * @returns {object|null}
+   * Side effects: none. events: none.
+   */
+  const clean = (sample) => {
+    if (!sample || !Number.isFinite(sample.t)) return null;
+    if (sample.tracked !== undefined && (typeof sample.tracked !== 'object' || Array.isArray(sample.tracked))) return null;
+    if (sample.inView !== undefined && (typeof sample.inView !== 'object' || Array.isArray(sample.inView))) return null;
+    /**
+     * Copies positive integer counts. Zero and junk are omitted, matching the live plot.
+     * @param {object} counts
+     * @returns {object}
+     * Side effects: none. events: none.
+     */
+    const counts = (counts) => {
+      const copy = {};
+      for (const system of Object.keys(counts || {}).sort()) {
+        const count = counts[system];
+        if (!system || !Number.isInteger(count) || count <= 0 || count > 10000) continue;
+        copy[system] = count;
+      }
+      return copy;
+    };
+    return { t: sample.t, tracked: counts(sample.tracked), inView: counts(sample.inView) };
+  };
+  const savedView = capSeries(
+    (Array.isArray(saved) ? saved : []).map(clean).filter(Boolean).sort((a, b) => a.t - b.t),
+    MAX_INTERFERENCE_SAMPLES, () => '', (previous, sample) => sample,
+  );
+  const lastSaved = savedView.length ? savedView[savedView.length - 1].t : -Infinity;
+  const during = (Array.isArray(live) ? live : []).filter((sample) => sample && Number.isFinite(sample.t)
+    && sample.t > lastSaved && (savedView.length === 0 || sample.t >= requestedAt));
+  return [...savedView, ...during];
 }
 
 /** The server cannot serve more than it retains, so hide unusable options. */
@@ -4318,6 +4383,10 @@ const SATELLITE_VIEW = { width: 900, height: 180, left: 44, right: 16, top: 22, 
 
 /**
  * Draws tracked and in-view counts on the same time axis as the interference timeline.
+ * Samples come from state.satelliteViewHistory, which loadHistory fills from the server
+ * (data/history.json) and which live RANGE and SATVIS2 reports extend. Archived BESTPOS
+ * supplies the total-tracked line only, in gaps the saved series does not already cover.
+ * Per-constellation and in-view lines are not invented from BESTPOS, which has no breakdown.
  * @returns {void}
  * Side effects: DOM #satellite-view-chart. Samples after axis.dataEnd are omitted. events: none.
  */
@@ -4333,7 +4402,60 @@ function renderSatelliteViewPlot() {
     .sort((a, b) => a.t - b.t);
   const systems = [...new Set(samples.flatMap((sample) => Object.keys(sample.tracked || {})))]
     .sort((a, b) => a.localeCompare(b));
-  const peak = Math.max(0, ...samples.map((sample) => Math.max(sumCounts(sample.tracked), sumCounts(sample.inView))));
+  /**
+   * Total-tracked segments from archived BESTPOS, clipped to gaps in the saved series.
+   * A live sample covers until the next sample when they are within 30 s, otherwise for
+   * 30 s, matching the break in the live lines. Archive does not replace that coverage.
+   * @returns {object[][]} Each segment is { t, total } points with the same total.
+   * Side effects: none. events: none.
+   */
+  const archiveTrackedSegments = () => {
+    const solution = state.archive && state.archive.shown && state.archive.data
+      && Array.isArray(state.archive.data.solution) ? state.archive.data.solution : null;
+    if (!solution || !solution.length) return [];
+    const covered = [];
+    for (let index = 0; index < samples.length; index++) {
+      const sample = samples[index];
+      const next = samples[index + 1];
+      const coverEnd = next && next.t - sample.t <= 30000 ? next.t : sample.t + 30000;
+      covered.push([sample.t, coverEnd]);
+    }
+    const segments = [];
+    for (const interval of solution) {
+      if (!Number.isInteger(interval?.tracked)) continue;
+      let cursor = Math.max(axis.start, interval.t);
+      const stop = Math.min(axis.dataEnd, Number.isFinite(interval.end) ? interval.end : interval.t);
+      if (!(stop > cursor)) continue;
+      let segment = [];
+      /**
+       * Keeps the current uncovered span when it has both ends.
+       * @returns {void}
+       * Side effects: pushes onto segments. events: none.
+       */
+      const flush = () => {
+        if (segment.length > 1) segments.push(segment);
+        segment = [];
+      };
+      for (const [coverStart, coverEnd] of covered) {
+        if (coverEnd <= cursor) continue;
+        if (coverStart >= stop) break;
+        if (coverStart > cursor) {
+          segment.push({ t: cursor, total: interval.tracked }, { t: Math.min(coverStart, stop), total: interval.tracked });
+        }
+        flush();
+        cursor = Math.max(cursor, coverEnd);
+        if (cursor >= stop) break;
+      }
+      if (cursor < stop) {
+        segment.push({ t: cursor, total: interval.tracked }, { t: stop, total: interval.tracked });
+        flush();
+      }
+    }
+    return segments;
+  };
+  const archiveSegments = archiveTrackedSegments();
+  const archivePeak = archiveSegments.reduce((max, segment) => Math.max(max, ...segment.map((point) => point.total)), 0);
+  const peak = Math.max(archivePeak, 0, ...samples.map((sample) => Math.max(sumCounts(sample.tracked), sumCounts(sample.inView))));
   const maxCount = Math.max(8, Math.ceil(peak / 10) * 10);
   /** @param {number} count @returns {number} Y in the satellite-view plot. Side effects: none. Events: none. */
   const y = (count) => bottom - count / maxCount * (bottom - SATELLITE_VIEW.top);
@@ -4376,18 +4498,29 @@ function renderSatelliteViewPlot() {
     flush();
   };
 
-  if (!samples.length) {
+  if (!samples.length && !archiveSegments.length) {
     chart.append(svg('text', {
       x: SATELLITE_VIEW.left + plotWidth / 2, y: (SATELLITE_VIEW.top + bottom) / 2,
       class: 'tl-axis', style: 'text-anchor:middle',
     }, 'Waiting for satellite reports'));
   } else {
-    drawSeries((sample) => sumCounts(sample.inView), { class: 'satellite-view-line satellite-view-in-view' });
-    for (const system of systems) {
-      drawSeries((sample) => sample.tracked?.[system] || 0,
-        { stroke: constellationColor(system), class: 'satellite-view-line' });
+    if (samples.length) {
+      drawSeries((sample) => sumCounts(sample.inView), { class: 'satellite-view-line satellite-view-in-view' });
+      for (const system of systems) {
+        drawSeries((sample) => sample.tracked?.[system] || 0,
+          { stroke: constellationColor(system), class: 'satellite-view-line' });
+      }
+      drawSeries((sample) => sumCounts(sample.tracked), { class: 'satellite-view-line satellite-view-total-line' });
     }
-    drawSeries((sample) => sumCounts(sample.tracked), { class: 'satellite-view-line satellite-view-total-line' });
+    // Same stroke as the live total. BESTPOS has only the total, so constellation
+    // lines stay blank across the archive gap instead of dropping to zero.
+    for (const segment of archiveSegments) {
+      chart.append(svg('polyline', {
+        points: segment.map((point) => `${(SATELLITE_VIEW.left + axis.x(point.t)).toFixed(1)},${y(point.total).toFixed(1)}`).join(' '),
+        fill: 'none',
+        class: 'satellite-view-line satellite-view-total-line',
+      }));
+    }
   }
   appendTimeAxis(chart, axis, {
     left: SATELLITE_VIEW.left,
