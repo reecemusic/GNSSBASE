@@ -288,8 +288,11 @@
       <div class="banner-copy">
         <div id="it-verdict" class="banner-title">Waiting for ITDETECTSTATUS</div>
         <div id="it-detail" class="banner-detail">No interference data received yet.</div>
-        <div id="it-freshness" class="banner-detail">Waiting for data &middot; Status messages: 0</div>
-        <div id="it-health-line" class="banner-detail" hidden></div>
+        <!-- Freshness and the antenna warning share one row on the wall so the banner stays two lines under the verdict. -->
+        <div class="banner-meta">
+          <div id="it-freshness" class="banner-detail">Waiting for data &middot; Status messages: 0</div>
+          <div id="it-health-line" class="banner-detail" hidden></div>
+        </div>
       </div>
       <div id="wall-position" class="banner-block wall-position">
         <span class="banner-block-label">Position</span>
@@ -304,8 +307,11 @@
       <div class="banner-block banner-clock" aria-live="off">
         <span id="it-clock" class="banner-clock-time">--:--:--</span>
         <span id="it-clock-date" class="banner-block-detail"></span>
-        <span id="it-clock-utc" class="banner-block-detail"></span>
-        <span id="it-receiver-clock" class="banner-block-detail"></span>
+        <!-- UTC and receiver time share one short line on the wall, under the clock. -->
+        <span class="banner-clock-extra">
+          <span id="it-clock-utc" class="banner-block-detail"></span>
+          <span id="it-receiver-clock" class="banner-block-detail"></span>
+        </span>
       </div>
     </div>
 

@@ -685,10 +685,17 @@ button:hover { background: #3a4353; }
 .wall-toggle { margin-left: 0; min-height: 1.9rem; font-size: .8rem; border: 1px solid var(--accent); color: var(--accent-hover); background: transparent; }
 .wall-toggle:hover { background: rgba(245, 94, 47, .12); }
 
-/* Root size follows the screen width so a 2560 or 3840 wall uses the extra pixels.
-   1.15vw is about 22px at 1920, 29px at 2560 and the 40px cap at 3840. */
-html.wall { font-size: clamp(18px, 1.15vw, 40px); }
-html.wall body { font-size: 1rem; height: 100vh; overflow: hidden; display: flex; flex-direction: column; padding: .6rem 1rem .8rem; }
+/* Width may raise the size on a wide wall. Height caps it: a 1080-tall screen
+   stays near 22px at 1920 and about 24px at 2560/3840, not the 40px that pushed
+   the plots off the page. 1.15vw is the width term; 2.25vh is the height cap. */
+html.wall { font-size: clamp(16px, min(1.15vw, 2.25vh), 28px); }
+html.wall body { position: relative; font-size: 1rem; height: 100vh; overflow: hidden; display: flex; flex-direction: column; padding: .6rem 1rem .8rem; }
+/* The banner and the position tile already say interference, fix, and health.
+   The main-view status pills and the full-width warning bar would stack above the plots. */
+html.wall #status-row,
+html.wall #health-warning { display: none !important; }
+/* Antenna warning is the header bar on the main view and one banner line on the wall. */
+html:not(.wall) #it-health-line { display: none !important; }
 html.wall-idle, html.wall-idle * { cursor: none !important; }
 html.wall.wall-idle .history-control,
 html.wall.wall-idle #wall-toggle,
@@ -698,9 +705,9 @@ html.wall.wall-idle #display-info {
   pointer-events: none;
 }
 
-.wall body > header { margin-bottom: .5rem; flex: none; }
-.wall h1 { font-size: 1.5rem; }
-.wall .subtitle { font-size: 1.1rem; }
+.wall body > header { margin-bottom: .35rem; flex: none; }
+.wall h1 { font-size: 1.35rem; line-height: 1.15; }
+.wall .subtitle { font-size: .8rem; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70vw; }
 .wall .history-control { font-size: .75rem; }
 .wall .history-control select { font-size: .85rem; }
 .wall .status { font-size: 1.1rem; }
@@ -711,36 +718,45 @@ html.wall.wall-idle #display-info {
 .wall #tab-interference.active {
   display: grid; flex: 1 1 auto; min-height: 0; gap: 0 .9rem;
   grid-template-columns: minmax(0, 1fr) minmax(19rem, 27%);
-  grid-template-rows: auto auto minmax(0, 1.4fr) minmax(11.5rem, .7fr);
+  /* Power plot takes the larger share. The satellite row stays tall enough for its table at 1.1rem. */
+  grid-template-rows: auto auto minmax(0, 1.25fr) minmax(0, 1fr);
 }
 .wall #tab-interference > :not(#it-banner):not(#bands):not(#timeline-heading):not(#timeline):not(#satellite-view-panel) { display: none; }
 .wall #it-banner { grid-column: 1 / -1; grid-row: 1; }
-.wall #timeline-heading { grid-column: 1; grid-row: 2; }
+.wall #timeline-heading { grid-column: 1; grid-row: 2; min-height: 0; }
 .wall #timeline { grid-column: 1; grid-row: 3; height: 100%; min-height: 0; }
-.wall #satellite-view-panel { grid-column: 1; grid-row: 4; }
-.wall #bands { grid-column: 2; grid-row: 2 / 5; }
+.wall #satellite-view-panel { grid-column: 1; grid-row: 4; min-height: 0; }
+.wall #bands { grid-column: 2; grid-row: 2 / 5; min-height: 0; }
 
-.wall .banner { padding: .55rem 1.25rem; gap: .8rem 1.2rem; margin-bottom: .55rem; border-width: 3px; flex: none; }
-.wall .banner-icon { width: 2.2rem; height: 2.2rem; }
-.wall .banner-title { font-size: 2.3rem; line-height: 1.15; font-weight: 700; }
-.wall .banner-detail { font-size: 1.1rem; line-height: 1.2; margin-top: .08rem; }
-.wall .banner-copy { flex: 1 1 auto; }
-.wall .banner-block-label { font-size: .75rem; }
-.wall .banner-block-value { font-size: 1.05rem; line-height: 1.25; }
-.wall .banner-block-detail { font-size: 1.1rem; }
+.wall .banner { padding: .4rem 1rem; gap: .45rem 1rem; margin-bottom: .35rem; border-width: 3px; flex: none; align-items: center; }
+.wall .banner-icon { width: 1.6rem; height: 1.6rem; }
+.wall .banner-title { font-size: 1.7rem; line-height: 1.1; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall .banner-detail { font-size: .95rem; line-height: 1.2; margin-top: .05rem; }
+.wall #it-detail { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall .banner-meta { display: flex; gap: .75rem; min-width: 0; align-items: baseline; }
+.wall .banner-meta .banner-detail { margin-top: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall #it-freshness { flex: 1 1 auto; min-width: 0; }
+.wall #it-health-line { flex: 0 1 auto; max-width: 46%; color: var(--warn); }
+.wall .banner-copy { flex: 1 1 auto; min-width: 0; }
+.wall .banner-block-label { font-size: .68rem; }
+.wall .banner-block-value { font-size: .95rem; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall .banner-block-detail { font-size: .8rem; line-height: 1.15; }
+.wall .banner-clock-extra { display: flex; gap: .55rem; justify-content: flex-end; max-width: 100%; }
+.wall .banner-clock-extra .banner-block-detail { font-size: .72rem; white-space: nowrap; }
 .wall #wall-position { display: flex; }
 .wall .banner-last-detection { flex-basis: 30rem; }
-.wall .banner-clock-time { font-size: 2.6rem; }
+.wall .banner-clock-time { font-size: 1.85rem; line-height: 1; }
+html.wall #display-info { position: absolute; z-index: 4; top: .4rem; right: 1rem; margin: 0; max-width: 34rem; }
 .wall #timeline-heading #timeline-live { flex: none; font-size: .78rem; padding: .2rem .55rem; margin: 0; }
 .wall #satellite-view-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(19rem, 40%); min-height: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
 .wall .satellite-view-plot { display: flex; min-width: 0; min-height: 0; flex-direction: column; padding: .2rem .65rem .1rem; }
 .wall .satellite-view-plot h2 { flex: none; margin: 0; font-size: 1.1rem; }
-.wall #satellite-view-chart { display: block; width: 100%; height: 100%; min-height: 0; }
+.wall #satellite-view-chart { display: block; width: 100%; height: auto; flex: 1 1 auto; min-height: 0; }
 .wall .satellite-view-line { stroke-width: 2.5; vector-effect: non-scaling-stroke; }
 .wall .satellite-view-total-line { stroke: var(--text); stroke-width: 3.5; }
 .wall .satellite-view-in-view { stroke: var(--muted); stroke-width: 2; stroke-dasharray: 6 5; }
-.wall .satellite-signal-table { align-self: center; width: 100%; min-width: 0; border-collapse: collapse; border-left: 1px solid var(--line); font-size: 1.1rem; line-height: 1.2; font-variant-numeric: tabular-nums; }
-.wall .satellite-signal-table th, .wall .satellite-signal-table td { padding: .14rem .5rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.wall .satellite-signal-table { align-self: stretch; width: 100%; min-width: 0; border-collapse: collapse; border-left: 1px solid var(--line); font-size: 1.1rem; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.wall .satellite-signal-table th, .wall .satellite-signal-table td { padding: .04rem .4rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
 .wall .satellite-signal-table thead th { color: var(--muted); font-size: .65rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
 .wall .satellite-signal-table tbody th, .wall .satellite-signal-table tbody td:first-child { white-space: nowrap; font-weight: 600; }
 .wall .satellite-signal-table .satellite-counts { white-space: nowrap; }

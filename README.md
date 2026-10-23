@@ -285,8 +285,7 @@ plot rows. Other bands (L6, SBAS, …) appear only while they have detections.
 - To open it directly on the TV browser, bookmark `http://<server>:8080/?wall=1`
   (press F11 for full screen when opening from a bookmark). The button removes the
   parameter and returns to the normal page; Esc does not exit wall mode.
-- Text scales with the screen width (about 22 px at 1920, 29 px at 2560, 40 px at 3840).
-  Secondary lines stay at least 1.1 rem. History and Exit wall display stay hidden until the mouse moves.
+- Text scales with spare width and is capped by screen height, so a 1080-tall wall stays about 22 px at 1920 and about 24 px at 2560 or 3840 rather than growing to 40 px and pushing the plots off the screen. The satellite table and band pills stay at 1.1 rem. History and Exit wall display stay hidden until the mouse moves. The antenna warning is one line in the banner, and the main-view status pills are not repeated on the wall.
 - The plot opens on the live view (the same as **View → Live**), following current time
   over the history window, including any loaded archive.
 - The banner shows seconds since the last status update and the status-message counter,
