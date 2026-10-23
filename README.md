@@ -124,7 +124,10 @@ parsed is left in place and is not overwritten. Both memory and file size
 are bounded by `HISTORY_RETENTION_MIN` (24 h by default), `TRACK_SAMPLE_SEC` and `MAX_IT_SAMPLES`.
 When a window holds more samples than the browser asks for, the newest half is sent as
 recorded and older samples are merged into time buckets (strongest report per band;
-latest solution), so a 24 h window always reaches back 24 h.
+latest solution and satellites-tracked sample), so a 24 h window always reaches back 24 h.
+The wall **Satellites tracked** plot is stored in the same file: per-constellation
+tracked counts from RANGE and in-view counts from SATVIS2, thinned to a change or
+one sample every 10 seconds.
 
 For long-running sessions, the browser retains at most 40,000 interference samples (and
 re-requests long windows every 30 minutes),
@@ -294,6 +297,11 @@ plot rows. Other bands (L6, SBAS, …) appear only while they have detections.
 - To keep the plot as large as possible, wall mode hides the satellites-used and fix-type
   rows, the frequency plots, connection settings, archive panel, navigation controls and
   the recent changes list.
+- **Satellites tracked** (under the power plot) is per constellation, plus a total tracked
+  line and a dashed total in view. It is filled from `data/history.json`, not only from
+  reports since the page opened, including after a heap reload or a stream reconnect.
+  Where that series has a gap, archived BESTPOS draws the total tracked line. BESTPOS
+  does not say which constellation, so those lines stay blank across the gap.
 - The mouse pointer hides after 4 s without movement. The browser is asked to keep the
   screen awake; this needs HTTPS or `localhost`, so over plain HTTP on the LAN also turn
   off the TV/PC sleep timer.

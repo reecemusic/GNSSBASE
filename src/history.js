@@ -271,7 +271,8 @@ function isBlankHistory(text) {
 }
 
 /**
- * Time-bounded history of satellite positions, interference detections, and solution heartbeats.
+ * Time-bounded history of satellite positions, interference detections, solution heartbeats,
+ * and the wall satellites-tracked series (per constellation tracked and in view).
  * prune() drops samples older than retentionMs. Tracks are also thinned to one sample
  * per trackSampleMs per satellite, and new track keys stop at MAX_TRACKS.
  * A file that fails the size, JSON, or version check disables saves when it is the
@@ -299,6 +300,12 @@ class History {
     this.tracks = new Map();
     this.interference = [];
     this.solution = [];
+    // Wall "Satellites tracked" plot. Each sample is { t, tracked, inView } with
+    // constellation counts. viewTracked and viewInView are the latest counts, including
+    // a change that the 10 s heartbeat has not stored yet. They are not written to disk.
+    this.satelliteView = [];
+    this.viewTracked = {};
+    this.viewInView = {};
     // Last kept interference sample per signal, so unchanged reports can be thinned.
     this.lastInterference = new Map();
     this.trackCapWarned = false;
@@ -351,6 +358,77 @@ class History {
     this.markDirty();
     if (this.solution.length > this.maxInterferenceSamples) {
       this.solution.splice(0, this.solution.length - this.maxInterferenceSamples);
+    }
+  }
+
+  /**
+   * Records per-constellation tracked counts from one RANGE observation list.
+   * RANGE replaces the previous tracked map. The in-view map is left as it was,
+   * which is how the browser plot snapshots both series together. Unique PRNs
+   * follow the same rules as the page: GLONASS above 37 is a slot plus 37, and
+   * OTHER is ignored. RESERVED is NavIC.
+   * @param {object[]} observations RANGE observations with system and prn.
+   * @param {number} [timestamp=Date.now()] Sample time in milliseconds.
+   * @returns {void}
+   * Side effects: viewTracked, and satelliteView when the counts are new. No I/O.
+   * @emits none
+   */
+  addTrackedObservations(observations, timestamp = Date.now()) {
+    this.viewTracked = trackedCounts(observations);
+    this.addSatelliteView(timestamp);
+  }
+
+  /**
+   * Records one constellation's in-view count from SATVIS2.
+   * visibilityValid === false clears that constellation, matching the skyplot,
+   * which ignores a report whose visibility flag is false. Other constellations
+   * stay. A satellite counts only with a usable PRN and a sky position.
+   * @param {string} system Constellation name. RESERVED is stored as NAVIC.
+   * @param {object[]} satellites SATVIS2 satellites with prn, elevation, and azimuth.
+   * @param {boolean} visibilityValid False clears this constellation's in-view count.
+   * @param {number} [timestamp=Date.now()] Sample time in milliseconds.
+   * @returns {void} Returns immediately when system is missing or OTHER.
+   * Side effects: viewInView, and satelliteView when the counts are new. No I/O.
+   * @emits none
+   */
+  addVisibleSatellites(system, satellites, visibilityValid, timestamp = Date.now()) {
+    const name = system === 'RESERVED' ? 'NAVIC' : system;
+    if (!name || name === 'OTHER') return;
+    const next = { ...this.viewInView };
+    if (visibilityValid === false) delete next[name];
+    else {
+      const count = visibleCount(name, satellites);
+      if (count > 0) next[name] = count;
+      else delete next[name];
+    }
+    this.viewInView = next;
+    this.addSatelliteView(timestamp);
+  }
+
+  /**
+   * Appends one satellites-tracked sample from the current tracked and in-view maps.
+   * An equal or older timestamp is dropped, including a repeated snapshot. Unchanged
+   * counts inside SOLUTION_HEARTBEAT_MS (10 s) are dropped. A change is stored at once.
+   * Past maxInterferenceSamples, a span of two hours or less keeps the newest samples.
+   * A longer span is downsampled so a 24 h window still reaches its start.
+   * @param {number} timestamp Sample time in milliseconds. A non-finite value is ignored.
+   * @returns {void}
+   * Side effects: may push onto satelliteView and markDirty. No I/O.
+   * @emits none
+   */
+  addSatelliteView(timestamp) {
+    if (!Number.isFinite(timestamp)) return;
+    const tracked = copyCounts(this.viewTracked);
+    const inView = copyCounts(this.viewInView);
+    const last = this.satelliteView[this.satelliteView.length - 1];
+    const same = last && sameCounts(last.tracked, tracked) && sameCounts(last.inView, inView);
+    // Same rule as recordSatelliteView in the browser. timestamp <= last.t drops a
+    // replay of the snapshot. Unchanged counts inside the heartbeat stay one point.
+    if (last && (timestamp <= last.t || (same && timestamp - last.t < SOLUTION_HEARTBEAT_MS))) return;
+    this.satelliteView.push({ t: timestamp, tracked, inView });
+    this.markDirty();
+    if (this.satelliteView.length > this.maxInterferenceSamples) {
+      this.satelliteView = capCountHistory(this.satelliteView, this.maxInterferenceSamples);
     }
   }
 
@@ -474,6 +552,9 @@ class History {
     const keptSolution = (Array.isArray(this.solution) ? this.solution : [])
       .filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff);
     this.solution = reduceLatest(keptSolution, this.maxInterferenceSamples);
+    const keptView = (Array.isArray(this.satelliteView) ? this.satelliteView : [])
+      .filter((s) => s && Number.isFinite(s.t) && s.t >= cutoff);
+    this.satelliteView = capCountHistory(keptView, this.maxInterferenceSamples);
   }
 
   /**
@@ -485,7 +566,7 @@ class History {
    * @param {number} windowMs Requested look-back. The cutoff uses the smaller of windowMs and retentionMs.
    * @param {number} [now=Date.now()]
    * @param {number} [limit=this.maxInterferenceSamples]
-   * @returns {object} retentionMinutes, tracks, interference, and solution.
+   * @returns {object} retentionMinutes, tracks, interference, solution, and satelliteView.
    * Side effects: none. The filters allocate new arrays. prune is not called.
    * @emits none
    */
@@ -501,6 +582,28 @@ class History {
       tracks,
       interference: reduceInterference(this.interference.filter((s) => s.t >= cutoff), limit),
       solution: reduceLatest(this.solution.filter((s) => s.t >= cutoff), limit),
+      satelliteView: capCountHistory(
+        (Array.isArray(this.satelliteView) ? this.satelliteView : []).filter((s) => s && s.t >= cutoff),
+        limit,
+      ),
+    };
+  }
+
+  /**
+   * Version-1 history document. satelliteView is omitted by older files and loaded as empty.
+   * @returns {object}
+   * Side effects: none. savedAt is Date.now().
+   * @emits none
+   */
+  document() {
+    return {
+      version: 1,
+      satvisFieldLayout: 2,
+      savedAt: Date.now(),
+      tracks: Object.fromEntries(this.tracks),
+      interference: this.interference,
+      solution: this.solution,
+      satelliteView: this.satelliteView,
     };
   }
 
@@ -512,14 +615,7 @@ class History {
    */
   serialize() {
     this.prune();
-    return JSON.stringify({
-      version: 1,
-      satvisFieldLayout: 2,
-      savedAt: Date.now(),
-      tracks: Object.fromEntries(this.tracks),
-      interference: this.interference,
-      solution: this.solution,
-    });
+    return JSON.stringify(this.document());
   }
 
   /**
@@ -539,14 +635,7 @@ class History {
     // Each pass halves the largest list. Forty passes is enough to empty every list.
     for (let guard = 0; Buffer.byteLength(payload) > limit && guard < 40; guard++) {
       if (!this.shrinkForBudget()) break;
-      payload = JSON.stringify({
-        version: 1,
-        satvisFieldLayout: 2,
-        savedAt: Date.now(),
-        tracks: Object.fromEntries(this.tracks),
-        interference: this.interference,
-        solution: this.solution,
-      });
+      payload = JSON.stringify(this.document());
     }
     if (Buffer.byteLength(payload) > limit) {
       console.warn(`[history] ${this.filePath} is still over the ${limit} byte load limit after downsampling; this save was skipped`);
@@ -570,6 +659,10 @@ class History {
     }
     if (this.solution.length > 1) {
       this.solution = reduceLatest(this.solution, Math.max(1, Math.floor(this.solution.length / 2)));
+      return true;
+    }
+    if (this.satelliteView.length > 1) {
+      this.satelliteView = reduceLatest(this.satelliteView, Math.max(1, Math.floor(this.satelliteView.length / 2)));
       return true;
     }
     let longestKey = null;
@@ -599,6 +692,12 @@ class History {
     }
     if (this.solution.length === 1) {
       this.solution = [];
+      return true;
+    }
+    if (this.satelliteView.length === 1) {
+      this.satelliteView = [];
+      this.viewTracked = {};
+      this.viewInView = {};
       return true;
     }
     return false;
@@ -797,7 +896,8 @@ class History {
    * @emits none
    */
   hasSamples() {
-    return this.tracks.size > 0 || this.interference.length > 0 || this.solution.length > 0;
+    return this.tracks.size > 0 || this.interference.length > 0 || this.solution.length > 0
+      || this.satelliteView.length > 0;
   }
 
   /**
@@ -894,6 +994,9 @@ class History {
         this.tracks = new Map();
         this.interference = [];
         this.solution = [];
+        this.satelliteView = [];
+        this.viewTracked = {};
+        this.viewInView = {};
       }
       console.warn(`[history] ${this.filePath} is empty and has no usable backup; starting a new history and saving stays enabled`);
       this.markDirty();
@@ -942,6 +1045,9 @@ class History {
       this.tracks = new Map();
       this.interference = [];
       this.solution = [];
+      this.satelliteView = [];
+      this.viewTracked = {};
+      this.viewInView = {};
     }
     // A readable .bak is applied in memory and saves stay disabled.
     if (this.restoreBackup('invalid')) this.savesDisabled = true;
@@ -1059,9 +1165,12 @@ class History {
    *   is 2. Any other layout uses an empty track map and still loads interference and solution.
    * @param {boolean} merge When true, incoming samples are merged with memory and deduped.
    *   Track identity is t:el:az. Interference identity is t:signal:count:maxPower.
-   *   Solution identity is t:used:tracked:status:type. When false, parsed data replaces memory.
+   *   Solution identity is t:used:tracked:status:type. Satellite-view identity is the time
+   *   plus the tracked and in-view maps. When false, parsed data replaces memory.
+   *   A file written before satelliteView existed loads an empty series.
    * @returns {void}
-   * Side effects: mutates tracks, interference, and solution, then prune(). console.log of the counts.
+   * Side effects: mutates tracks, interference, solution, and satelliteView, then prune().
+   *   Seeds viewTracked and viewInView from the newest satellite-view sample. console.log of the counts.
    * @emits none
    */
   applyParsed(parsed, merge) {
@@ -1071,6 +1180,7 @@ class History {
       : new Map();
     const interference = Array.isArray(parsed.interference) ? parsed.interference : [];
     const solution = Array.isArray(parsed.solution) ? parsed.solution : [];
+    const satelliteView = sanitizeSatelliteView(parsed.satelliteView);
     if (merge) {
       for (const [key, samples] of tracks) {
         const existing = this.tracks.get(key);
@@ -1084,14 +1194,19 @@ class History {
       this.solution = mergeSamples(this.solution, solution, (sample) => (
         `${sample.t}:${sample.used}:${sample.tracked}:${sample.status}:${sample.type}`
       ));
+      this.satelliteView = mergeSamples(this.satelliteView, satelliteView, satelliteViewKey);
     } else {
       this.tracks = tracks;
       this.interference = interference;
       this.solution = solution;
+      this.satelliteView = satelliteView;
     }
     this.prune();
+    const latestView = this.satelliteView[this.satelliteView.length - 1];
+    this.viewTracked = latestView ? copyCounts(latestView.tracked) : {};
+    this.viewInView = latestView ? copyCounts(latestView.inView) : {};
     console.log(`[history] restored ${this.tracks.size} satellite tracks, ${this.interference.length} interference samples, `
-      + `${this.solution.length} solution samples`);
+      + `${this.solution.length} solution samples, ${this.satelliteView.length} satellite-view samples`);
   }
 }
 
@@ -1221,6 +1336,153 @@ function reduceInterference(samples, limit) {
  */
 function reduceLatest(samples, limit) {
   return reduceSamples(samples, limit, () => '', (previous, sample) => sample);
+}
+
+/**
+ * Caps the satellites-tracked series the same way the browser caps it.
+ * A span of two hours or less keeps the newest `limit` samples. A longer span
+ * downsamples the older half (latest sample per bucket) so 24 h still starts
+ * near the beginning of the day. The input is not mutated when it is already short.
+ * @param {object[]} samples Time-sorted satellite-view samples.
+ * @param {number} limit Maximum length.
+ * @returns {object[]}
+ * Side effects: none. slice and reduceLatest allocate new arrays.
+ * @emits none
+ */
+function capCountHistory(samples, limit) {
+  if (!Array.isArray(samples) || samples.length <= limit) return samples;
+  const first = samples[0] && samples[0].t;
+  const last = samples[samples.length - 1] && samples[samples.length - 1].t;
+  const span = last - first;
+  const reduced = Number.isFinite(span) && span > 2 * 60 * 60 * 1000
+    ? reduceLatest(samples, limit) : samples;
+  if (reduced.length <= limit) return reduced;
+  return reduced.slice(-limit);
+}
+
+/**
+ * Copies constellation counts, dropping empty names, OTHER, and non-positive integers.
+ * Keys are sorted so a later equality check does not depend on insertion order.
+ * @param {object} counts Map of constellation to count.
+ * @returns {object}
+ * Side effects: none.
+ * @emits none
+ */
+function copyCounts(counts) {
+  const copy = {};
+  if (!counts || typeof counts !== 'object') return copy;
+  for (const system of Object.keys(counts).sort()) {
+    const count = counts[system];
+    if (!system || system === 'OTHER') continue;
+    if (!Number.isInteger(count) || count <= 0 || count > 10000) continue;
+    copy[system] = count;
+  }
+  return copy;
+}
+
+/**
+ * True when two count maps have the same constellations and the same counts.
+ * @param {object} left
+ * @param {object} right
+ * @returns {boolean}
+ * Side effects: none.
+ * @emits none
+ */
+function sameCounts(left, right) {
+  const keys = Object.keys(left);
+  if (keys.length !== Object.keys(right).length) return false;
+  return keys.every((key) => left[key] === right[key]);
+}
+
+/**
+ * Dedup key for one satellites-tracked sample.
+ * @param {object} sample Sample with t, tracked, and inView.
+ * @returns {string}
+ * Side effects: none.
+ * @emits none
+ */
+function satelliteViewKey(sample) {
+  return `${sample.t}:${JSON.stringify(sample.tracked)}:${JSON.stringify(sample.inView)}`;
+}
+
+/**
+ * Keeps finite-time satellite-view samples and drops bad count maps.
+ * @param {*} list Parsed satelliteView array. A non-array is empty.
+ * @returns {object[]} Time-sorted samples.
+ * Side effects: none.
+ * @emits none
+ */
+function sanitizeSatelliteView(list) {
+  if (!Array.isArray(list)) return [];
+  const samples = [];
+  for (const sample of list) {
+    if (!sample || !Number.isFinite(sample.t)) continue;
+    if (sample.tracked !== undefined && (typeof sample.tracked !== 'object' || Array.isArray(sample.tracked))) continue;
+    if (sample.inView !== undefined && (typeof sample.inView !== 'object' || Array.isArray(sample.inView))) continue;
+    samples.push({ t: sample.t, tracked: copyCounts(sample.tracked), inView: copyCounts(sample.inView) });
+  }
+  samples.sort((a, b) => a.t - b.t);
+  return samples;
+}
+
+/**
+ * Unique tracked satellites per constellation from RANGE observations.
+ * GLONASS PRNs above 37 are slot numbers plus 37, matching the browser.
+ * RESERVED is NavIC. OTHER and unusable PRNs are skipped.
+ * @param {object[]} observations
+ * @returns {object} Constellation to count. Zero counts are omitted.
+ * Side effects: none.
+ * @emits none
+ */
+function trackedCounts(observations) {
+  const systems = new Map();
+  for (const observation of observations || []) {
+    const system = observation && observation.system === 'RESERVED' ? 'NAVIC' : observation && observation.system;
+    if (!system || system === 'OTHER') continue;
+    const prn = satelliteViewPrn(system, observation.prn);
+    if (prn === null) continue;
+    if (!systems.has(system)) systems.set(system, new Set());
+    systems.get(system).add(prn);
+  }
+  const counts = {};
+  for (const [system, prns] of systems) counts[system] = prns.size;
+  return counts;
+}
+
+/**
+ * Satellites in view for one constellation. Duplicates and bad sky positions are skipped.
+ * @param {string} system Constellation name, already normalised.
+ * @param {object[]} satellites
+ * @returns {number}
+ * Side effects: none.
+ * @emits none
+ */
+function visibleCount(system, satellites) {
+  const seen = new Set();
+  for (const sat of satellites || []) {
+    const prn = satelliteViewPrn(system, sat && sat.prn);
+    if (prn === null || !isValidSkyPosition(sat.elevation, sat.azimuth)) continue;
+    seen.add(prn);
+  }
+  return seen.size;
+}
+
+/**
+ * PRN used by the satellites-tracked plot. Same rules as normalisePrn in the browser.
+ * @param {string} system Constellation name.
+ * @param {*} prn Raw PRN. GLONASS may be a slot, a slot plus 37, or a slot with a frequency channel.
+ * @returns {number|null}
+ * Side effects: none.
+ * @emits none
+ */
+function satelliteViewPrn(system, prn) {
+  const text = String(prn ?? '').trim();
+  const match = text.match(system === 'GLONASS' ? /^(\d+)(?:[+-]\d+)?$/ : /^(\d+)$/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isSafeInteger(value) || value <= 0) return null;
+  if (system === 'GLONASS' && value > 37) return value - 37;
+  return value;
 }
 
 /**
