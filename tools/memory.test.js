@@ -627,11 +627,7 @@ test('timeline controls support wheel zoom, dragging, selection mode and live re
   get('timeline-zoom-in').handlers.click();
   assert.equal(context.state.timelineView.windowMs, 1800000);
   let prevented = false;
-  const beforeWheel = context.state.timelineView.windowMs;
   chart.handlers.wheel({ clientX: 489, clientY: 50, deltaY: -1, preventDefault() { prevented = true; } });
-  assert.equal(prevented, false, 'a plain wheel scrolls the page');
-  assert.equal(context.state.timelineView.windowMs, beforeWheel);
-  chart.handlers.wheel({ clientX: 489, clientY: 50, deltaY: -1, ctrlKey: true, preventDefault() { prevented = true; } });
   assert(prevented);
   assert.equal(context.state.timelineView.windowMs, 1440000);
   const beforeDrag = context.state.timelineView.end;
@@ -933,9 +929,6 @@ test('linked plot navigation clamps history and zoom and handles drag cancellati
   const anchor = before.start + axisMs(before.windowMs) / 4;
   let prevented = false;
   chart.handlers.wheel({ clientX: 273, deltaY: -1, preventDefault() { prevented = true; } });
-  assert.equal(prevented, false, 'a plain wheel scrolls the page');
-  assert.equal(context.timelineViewport().windowMs, before.windowMs);
-  chart.handlers.wheel({ clientX: 273, deltaY: -1, ctrlKey: true, preventDefault() { prevented = true; } });
   assert(prevented);
   const after = context.timelineViewport();
   assert.equal(after.windowMs, 1440000);

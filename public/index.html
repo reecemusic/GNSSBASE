@@ -36,24 +36,10 @@
         <span class="dot" aria-hidden="true"></span>
         <span id="status-text">Connecting...</span>
       </div>
-      <button id="display-info-toggle" type="button" class="display-info-link" aria-expanded="false"
-              title="Kiosk address, heap reload, and when this page loaded">Display info</button>
       <button id="wall-toggle" type="button" class="wall-toggle" aria-pressed="false"
               title="Full-screen view of the interference status, band summaries and live L1/L2/L5 plot for a large display. Bookmark with ?wall=1 to open directly.">&#9974; Wall display</button>
     </div>
   </header>
-  <div id="display-info" class="display-info" hidden>
-    <p><span class="label">Kiosk URL</span> <code id="display-info-url"></code></p>
-    <p><span class="label">Heap reload</span> <span id="display-info-heap"></span></p>
-    <p><span class="label">This page</span> <span id="display-info-loaded"></span></p>
-  </div>
-  <div id="health-warning" class="health-warning" role="status" hidden></div>
-  <div id="status-row" class="status-row" role="status" aria-label="Receiver, interference, position and health">
-    <span id="status-receiver" class="status-chip idle">Receiver</span>
-    <span id="status-interference" class="status-chip idle">Interference</span>
-    <span id="status-position" class="status-chip idle">Position</span>
-    <span id="status-health" class="status-chip idle">Health</span>
-  </div>
     <div class="client-notice">
       <span id="client-error" role="alert" hidden></span>
       <button id="retry-display" type="button" class="secondary">Retry display</button>
@@ -67,9 +53,6 @@
         <span id="connection-state-detail">Waiting for the monitor server</span>
       </span>
     </div>
-    <button id="connection-settings-toggle" type="button" class="secondary" aria-expanded="false" aria-controls="connection-settings">Connection settings</button>
-    <div id="connection-settings" hidden>
-    <p id="connection-remote-note" class="connection-note" hidden>Connection changes are only available on the computer running the monitor. These values are read-only on this screen.</p>
     <label>
       Connection
       <select id="connection-transport">
@@ -101,21 +84,30 @@
       <button id="connect" type="submit" disabled>Connect</button>
       <button id="disconnect" type="button" class="secondary" disabled>Disconnect</button>
     </div>
-    </div>
     <span id="connection-message" aria-live="polite"></span>
   </form>
 
-  <nav class="tabs" role="tablist" aria-label="Monitor sections">
-    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-position" data-tab="position">Position <span class="tab-dot" hidden></span></button>
-    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-satellites" data-tab="satellites">Satellites <span class="tab-dot" hidden></span></button>
-    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-ephemeris" data-tab="ephemeris">Ephemeris and Iono</button>
-    <button class="tab active" role="tab" aria-selected="true" aria-controls="tab-interference" data-tab="interference">Interference <span class="tab-dot" hidden></span></button>
-    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-health" data-tab="health">Receiver health <span class="tab-dot" hidden></span></button>
-    <button class="tab" role="tab" aria-selected="false" aria-controls="tab-raw" data-tab="raw">Raw stream</button>
+  <nav class="tabs">
+    <button class="tab active" data-tab="overview">Overview</button>
+    <button class="tab" data-tab="position">Position</button>
+    <button class="tab" data-tab="satellites">Satellites</button>
+    <button class="tab" data-tab="ephemeris">Ephemeris and Iono</button>
+    <button class="tab" data-tab="interference">Interference</button>
+    <button class="tab" data-tab="health">Receiver health</button>
+    <button class="tab" data-tab="raw">Raw stream</button>
   </nav>
 
+  <!-- Overview ------------------------------------------------------------->
+  <section id="tab-overview" class="panel active">
+    <h2>Message flow</h2>
+    <table id="counts">
+      <thead><tr><th>Log</th><th>Format</th><th>Count</th><th>Last seen</th><th>CRC</th></tr></thead>
+      <tbody><tr class="empty"><td colspan="5">No messages received yet.</td></tr></tbody>
+    </table>
+  </section>
+
   <!-- Position ------------------------------------------------------------->
-  <section id="tab-position" class="panel" role="tabpanel">
+  <section id="tab-position" class="panel">
     <h2>
       Antenna position
       <a id="gmaps-link" class="ext-link" href="#" target="_blank" rel="noopener noreferrer" hidden>Open in Google Maps</a>
@@ -124,12 +116,11 @@
     <div id="map-fallback" class="map-fallback">Loading map…</div>
 
     <h2>BESTPOS</h2>
-    <div id="pos-cards" class="summary">
+    <div class="summary">
       <div class="card wide">
         <span class="label">Solution</span>
-        <span id="pos-type" class="value" title="NovAtel solution status / position type">&mdash;</span>
+        <span id="pos-type" class="value">&mdash;</span>
         <span id="pos-status-hint" class="hint"></span>
-        <span id="pos-last" class="hint">Last BESTPOS: —</span>
         <span id="pos-quality" class="quality" hidden></span>
       </div>
       <div class="card"><span class="label">Latitude</span><span id="pos-lat" class="value">&mdash;</span></div>
@@ -147,7 +138,7 @@
       </div>
       <div class="card"><span class="label">Std dev (lat/lon/hgt)</span><span id="pos-sigma" class="value">&mdash;</span></div>
       <div class="card"><span class="label">SVs used / tracked</span><span id="pos-svs" class="value">&mdash;</span></div>
-      <div class="card"><span class="label" title="NovAtel differential age / solution age">Correction age</span><span id="pos-age" class="value">&mdash;</span></div>
+      <div class="card"><span class="label">Diff age / sol age</span><span id="pos-age" class="value">&mdash;</span></div>
       <div class="card"><span class="label">Station ID</span><span id="pos-stn" class="value">&mdash;</span></div>
     </div>
     <h2>BESTGNSSPOS</h2>
@@ -169,15 +160,14 @@
   </section>
 
   <!-- Satellites ----------------------------------------------------------->
-  <section id="tab-satellites" class="panel" role="tabpanel">
+  <section id="tab-satellites" class="panel">
     <div class="summary">
       <div class="card"><span class="label">Used in solution</span><span id="sv-used" class="value">&mdash;</span></div>
       <div class="card"><span class="label" title="Unique satellites in RANGE, including those used in solution; unaffected by skyplot filters">Tracked (including used)</span><span id="sv-tracked" class="value">&mdash;</span></div>
-      <div class="card"><span class="label" title="NovAtel TRACKSTAT: visible assigned channels above the cutoff with no RANGE observation">Missing observations</span><span id="sv-missing" class="value">&mdash;</span></div>
+      <div class="card"><span class="label" title="Visible assigned TRACKSTAT channels above the reported cutoff without a RANGE observation">Missing (assigned channels)</span><span id="sv-missing" class="value">&mdash;</span></div>
       <div class="card"><span class="label">Unhealthy</span><span id="sv-unhealthy" class="value">&mdash;</span></div>
     </div>
     <p id="sv-status-note" class="muted">Waiting for satellite status reports.</p>
-    <div id="sv-warnings" class="sv-warnings" hidden></div>
 
     <h2>
       Skyplot <span id="sky-count" class="muted"></span>
@@ -221,7 +211,7 @@
   </section>
 
   <!-- Ephemeris ----------------------------------------------------------->
-  <section id="tab-ephemeris" class="panel" role="tabpanel">
+  <section id="tab-ephemeris" class="panel">
     <div class="summary">
       <div class="card"><span class="label">Constellations</span><span id="eph-systems" class="value">&mdash;</span></div>
       <div class="card"><span class="label">Satellites decoded</span><span id="eph-satellites" class="value">&mdash;</span></div>
@@ -234,7 +224,7 @@
   </section>
 
   <!-- Interference --------------------------------------------------------->
-  <section id="tab-interference" class="panel active" role="tabpanel">
+  <section id="tab-interference" class="panel">
     <details id="archive-panel" class="archive-panel">
       <summary title="Show or hide the archive settings">
         <span class="archive-title">Historic archive</span>
@@ -288,16 +278,7 @@
       <div class="banner-copy">
         <div id="it-verdict" class="banner-title">Waiting for ITDETECTSTATUS</div>
         <div id="it-detail" class="banner-detail">No interference data received yet.</div>
-        <!-- Freshness and the antenna warning share one row on the wall so the banner stays two lines under the verdict. -->
-        <div class="banner-meta">
-          <div id="it-freshness" class="banner-detail">Waiting for data &middot; Status messages: 0</div>
-          <div id="it-health-line" class="banner-detail" hidden></div>
-        </div>
-      </div>
-      <div id="wall-position" class="banner-block wall-position">
-        <span class="banner-block-label">Position</span>
-        <span id="wall-position-value" class="banner-block-value">Waiting for BESTPOS</span>
-        <span id="wall-position-detail" class="banner-block-detail"></span>
+        <div id="it-freshness" class="banner-detail">Waiting for data &middot; Status messages: 0</div>
       </div>
       <div class="banner-block banner-last-detection">
         <span class="banner-block-label">Last interference detected</span>
@@ -307,11 +288,6 @@
       <div class="banner-block banner-clock" aria-live="off">
         <span id="it-clock" class="banner-clock-time">--:--:--</span>
         <span id="it-clock-date" class="banner-block-detail"></span>
-        <!-- UTC and receiver time share one short line on the wall, under the clock. -->
-        <span class="banner-clock-extra">
-          <span id="it-clock-utc" class="banner-block-detail"></span>
-          <span id="it-receiver-clock" class="banner-block-detail"></span>
-        </span>
       </div>
     </div>
 
@@ -382,12 +358,11 @@
     </div>
     <details class="help-details">
       <summary>How to use these plots</summary>
-    <p class="plot-help">Use <b>View</b> to jump to a time range; the arrows pan and &minus;/+ zoom. Drag any plot to pan; hold Ctrl (or ⌘) and scroll to zoom around the pointer. A plain scroll moves the page. Turn on <b>Select point</b> to click a data point and pin its details instead of panning; press Esc or the button again to go back to panning. All plots share the same time window and selected time zone.
+    <p class="plot-help">Use <b>View</b> to jump to a time range; the arrows pan and &minus;/+ zoom. Drag any plot to pan; scroll to zoom around the pointer. Turn on <b>Select point</b> to click a data point and pin its details instead of panning; press Esc or the button again to go back to panning. All plots share the same time window and selected time zone.
       Signal buttons toggle frequency overlays only; detected energy remains visible in red.
       Overlapping allocations use alternating colour stripes; hover for full signal bounds.
       The bottom two rows show satellites used in the BESTPOS solution and its fix type (live and saved history only).</p>
     </details>
-    <p id="zoom-hint" class="plot-help zoom-hint" hidden>Ctrl + scroll to zoom</p>
     <svg id="timeline" viewBox="0 0 900 680" role="img" aria-label="Interference power, satellites used and fix type over time"></svg>
     <h2>Current band status</h2>
     <div id="bands" class="bands"></div>
@@ -398,9 +373,8 @@
   </section>
 
   <!-- Health --------------------------------------------------------------->
-  <section id="tab-health" class="panel" role="tabpanel">
+  <section id="tab-health" class="panel">
     <h2>RXSTATUS</h2>
-    <p id="rx-age" class="muted">Last RXSTATUS: never</p>
     <div class="summary">
       <div class="card"><span class="label">Error word</span><span id="rx-error" class="value">&mdash;</span></div>
       <div class="card"><span class="label">Receiver status word</span><span id="rx-status" class="value">&mdash;</span></div>
@@ -417,13 +391,7 @@
   </section>
 
   <!-- Raw ------------------------------------------------------------------>
-  <section id="tab-raw" class="panel" role="tabpanel">
-    <h2>Message flow</h2>
-    <p class="muted">Counts of logs this monitor has decoded. This table used to be the page that opened first.</p>
-    <table id="counts">
-      <thead><tr><th>Log</th><th>Format</th><th>Count</th><th>Last seen</th><th>CRC</th></tr></thead>
-      <tbody><tr class="empty"><td colspan="5">No messages received yet.</td></tr></tbody>
-    </table>
+  <section id="tab-raw" class="panel">
     <h2>
       Raw stream
       <select id="raw-filter"><option value="">All logs</option></select>

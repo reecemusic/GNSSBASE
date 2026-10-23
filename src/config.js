@@ -294,18 +294,6 @@ const config = {
   connectionSettingsFile: process.env.CONNECTION_SETTINGS_FILE === undefined
     ? path.join(__dirname, '..', 'data', 'connection-settings.json')
     : process.env.CONNECTION_SETTINGS_FILE || null,
-
-  // How long the interference banner stays red after the last detection, so a
-  // 1 Hz clear report between bursts does not flip the wall to green.
-  // INTERFERENCE_HOLD_SEC defaults to 30. 0 shows the latest report immediately.
-  interferenceHoldSeconds: integerSetting('INTERFERENCE_HOLD_SEC', 30, 0, 3600),
-  // Connect, disconnect, and apply are accepted from 127.0.0.1 and ::1 only,
-  // unless ALLOW_REMOTE_CONTROL is the string 'true'. The page itself stays
-  // readable from the LAN. This does not change receiver baud or send SAVECONFIG.
-  allowRemoteControl: process.env.ALLOW_REMOTE_CONTROL === 'true',
-  // After a manual Disconnect, start the receiver again after this many minutes.
-  // MONITOR_RESUME_MIN defaults to 0, which leaves monitoring stopped.
-  monitorResumeMinutes: integerSetting('MONITOR_RESUME_MIN', 0, 0, 1440),
 };
 
 config.loadConnectionOverrides = loadConnectionOverrides;
