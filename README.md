@@ -2,13 +2,34 @@
 
 Connects to a NovAtel PwrPak over USB serial (COM11 @ 9600 by default), falling back to TCP
 when serial does not connect, decodes the core logs used by the `GNSSBASE`
-profile and displays them live in a browser. No npm dependencies — Node 18+ only.
+profile and displays them live in a browser. Node 22 or newer (current LTS). The only npm dependency is `serialport`, used for the USB/RS-232 port.
 
 ## Run
 
 ```bash
-npm start                       # tries COM11 @ 9600, then 20.20.20.50:3001; UI at http://127.0.0.1:8080
+npm start                       # tries COM11 @ 9600, then 20.20.20.50:3001; UI listens on all interfaces, still at http://127.0.0.1:8080
 ```
+
+`npm start` runs `node src/start.js`, which sets `UV_THREADPOOL_SIZE` to 16 when the variable is not already set, then loads the server. Set the variable in the service environment if you want a different pool size. It has to be set before the process uses the filesystem; changing it later does nothing.
+
+Other devices on the same network can open `http://<PC IP>:8080`. Windows Firewall will prompt to allow Node on private networks. The UI has no authentication, and the settings panel can change the receiver connection, so anyone on the network can do that. Set `WEB_HOST=127.0.0.1` to restrict the page to this PC.
+
+## Running always-on
+
+The monitor is meant to stay up on the PC beside the receiver. A browser reload cannot re-enter the Fullscreen API without a click, and the page does not shift pixels (that would change the picture). Use the display's own pixel-shift, and start Chrome in kiosk mode so a heap reload stays full screen.
+
+- Run Node as a Windows service with [NSSM](https://nssm.cc/) or [WinSW](https://github.com/winsw/winsw). Set the service to restart on failure, and rotate its stdout/stderr logs.
+- Set `UV_THREADPOOL_SIZE=16` on the service if you do not start through `src/start.js`. A stuck NAS read holds one libuv worker; the default pool of 4 can then stall history saves and the web UI.
+- Turn off sleep, hibernate, and USB selective suspend so COM11 and the PC stay awake.
+- Put the PC on a UPS. A power cut during a history write is recovered from `data/history.json.bak` when that backup is intact, but the UPS is what keeps the receiver and the PC up.
+- At logon, start Chrome with `chrome --kiosk --app=http://127.0.0.1:8080/?wall=1`. Kiosk fullscreen is the browser window, not the Fullscreen API, so it survives the heap reload.
+- In Chrome, add `127.0.0.1` to Memory Saver's always-active list so the wall tab is not discarded.
+- Exclude `data\` from Microsoft Defender real-time scanning so history and archive-cache writes are not locked.
+- Use the display's pixel-shift or orbit feature. This app does not move the picture.
+
+`data/history.json` is not tracked in git. A `git pull` on the PC will not replace the live history file. Keep the PC's copy; do not commit it.
+
+History is written at most every `HISTORY_SAVE_SEC` seconds (default 5 minutes), and only when something changed. A service stop (SIGINT/SIGTERM) still flushes. The process force-exits after 5 seconds if that flush does not finish.
 
 ## What is displayed
 
@@ -38,9 +59,12 @@ logs without restoring the monitor's periodic interference-log request.
 
 Both ASCII (`#...*crc`) and binary (`0xAA 0x44 0x12`) framings are decoded, and the two
 may be interleaved on the same port. CRC is verified on every log.
-Malformed checksums are marked failed, rather than treated as unchecked. CRC-failed
-reports remain visible for diagnosis but do not enter live/saved interference,
-position or sky-track history. SATVIS2 with invalid visibility does not create tracks.
+Malformed checksums are marked failed, rather than treated as unchecked. Reports
+without a checksum stay unchecked. Only CRC-valid reports update the live position,
+health and sky displays, or enter live/saved interference, position or sky-track
+history. CRC-failed and unchecked reports remain visible in the raw log for diagnosis.
+Abbreviated archive logs without a checksum are still decoded. SATVIS2 with invalid
+visibility does not create tracks.
 Incomplete RANGE, SATVIS2 and ITDETECTSTATUS payloads are rejected explicitly instead
 of becoming partial counts or false clear interference reports. Archive scans count
 malformed reports in their error counter and continue with subsequent valid records.
@@ -92,7 +116,11 @@ Skyplot traces and the interference timeline are backed by a time-bounded store 
 options longer than the server's retention are disabled automatically.
 
 History is written to `data/history.json` periodically and on shutdown, then restored at
-startup, so traces and interference records survive a restart. Both memory and file size
+startup, so traces and interference records survive a restart. Samples use the receiver's
+GPS time only when that time is after 2020 and within five minutes of the computer clock;
+otherwise they use the time the report was received, so a receiver that has not set GPS
+week yet still appears on the live chart. A history file that is too large or cannot be
+parsed is left in place and is not overwritten. Both memory and file size
 are bounded by `HISTORY_RETENTION_MIN` (24 h by default), `TRACK_SAMPLE_SEC` and `MAX_IT_SAMPLES`.
 When a window holds more samples than the browser asks for, the newest half is sent as
 recorded and older samples are merged into time buckets (strongest report per band;
@@ -348,16 +376,21 @@ Band cards and statistics remain live-only.
 | `NOVATEL_SERIAL_PATH` / `NOVATEL_SERIAL_BAUD` | `COM11` / `9600` | USB serial port and baud rate |
 | `NOVATEL_SERIAL_PROBE_MS` | `5000` | In `auto` mode, how long an open serial port may go without a decodable log before falling back to TCP |
 | `NOVATEL_HOST` / `NOVATEL_PORT` | `20.20.20.50` / `3001` | Receiver ICOM endpoint (TCP) |
+| `CONNECTION_SETTINGS_FILE` | `data/connection-settings.json` | **Apply & reconnect** writes here. On the next start this file overrides the transport variables above, and the server logs which file it used. Set to an empty string to ignore it. |
 | `NOVATEL_SEND_LOG_CMD` | `false` | When `true`, sends `UNLOGALL THISPORT` plus its own `LOG ...A` requests on connect. Leave `false` when the receiver is running [profiles/GNSSBASE.txt](profiles/GNSSBASE.txt), which already pushes these logs to ICOM1 — `UNLOGALL THISPORT` would remove them. |
 | `NOVATEL_RECONNECT_MS` | `3000` | Reconnect delay |
 | `NOVATEL_IDLE_MS` | `30000` | Reconnect serial or TCP if no valid ITDETECTSTATUS logs arrive for this long; TCP also times out when no bytes arrive |
-| `WEB_HOST` / `WEB_PORT` | `127.0.0.1` / `8080` | Web UI bind address. Localhost by default; the UI has no authentication. |
+| `WEB_HOST` / `WEB_PORT` | `0.0.0.0` / `8080` | Web UI bind address. `0.0.0.0` accepts connections from other devices. The UI has no authentication. Set `WEB_HOST=127.0.0.1` to listen on localhost only. |
 | `HISTORY_SIZE` / `RAW_LOG_SIZE` | `50` / `200` | Replay buffers sent to a newly opened browser |
 | `HISTORY_RETENTION_MIN` | `1440` | How far back skyplot traces and the interference timeline are kept. This is the longest window a browser can select. |
 | `TRACK_SAMPLE_SEC` | `20` | Minimum spacing between skyplot trace samples per satellite |
 | `MAX_IT_SAMPLES` | `100000` | Hard cap on stored interference samples (about 24 h at typical report rates) |
 | `HISTORY_FILE` | `data/history.json` | Where history is persisted. Set to an empty string for memory-only. |
-| `HISTORY_SAVE_SEC` | `60` | How often history is written to disk |
+| `HISTORY_SAVE_SEC` | `300` | How often a changed history is written. Unchanged history is not rewritten. Shutdown still flushes. |
+| `BESTSATS_LOG_SEC` | `1` | `LOG BESTSATSA ONTIME` period sent on connect. Does not change baud or the receiver's saved configuration. |
+| `TRACKSTAT_LOG_SEC` | `5` | `LOG TRACKSTATA ONTIME` period sent on connect. Same constraint as `BESTSATS_LOG_SEC`. |
+| `NOVATEL_LEAP_SECONDS` | `18` | GPS-UTC offset used when converting GPS time. No log this app already decodes carries the offset. |
+| `UV_THREADPOOL_SIZE` | `16` via `src/start.js` | Libuv worker threads. Set before the process starts if you launch `src/server.js` directly. |
 | `NOVATEL_ARCHIVE_ROOT` | `\\20.20.20.1\novatel\pwrpak1` | Default historic archive folder (`YYYY\DDD\*.LOG`). The folder chosen in the UI is saved in `data/archive-settings.json` and takes precedence. |
 | `ARCHIVE_DAYS` / `ARCHIVE_MAX_DAYS` | `1` / `31` | Default and maximum number of days the UI may load |
 | `ARCHIVE_MAX_SAMPLES` | `300000` | Separate memory caps for detection seconds, BESTPOS intervals and BESTSATS count intervals before their resolution is coarsened |
@@ -365,7 +398,7 @@ Band cards and statistics remain live-only.
 | `ARCHIVE_SETTINGS_FILE` | `data/archive-settings.json` | Where the chosen folder, days and Keep-loaded choice are remembered. Empty string disables saving. |
 | `ARCHIVE_AUTO` | `true` | Default for **Keep loaded** when no choice has been saved; `false` disables automatic loading |
 | `ARCHIVE_REFRESH_MIN` | `15` | Minutes between automatic background refreshes |
-| `ARCHIVE_TIMEOUT_SEC` | `20` | NAS calls slower than this are abandoned (stalled reads after 6×, minimum 60 s) |
+| `ARCHIVE_TIMEOUT_SEC` | `20` | NAS calls slower than this are abandoned (stalled reads after 6×, minimum 60 s). A handle that never closes is released after three times the 10 minute reset so a later scan can start. The stuck read itself is not cancelled. |
 
 The requested logs are listed in [src/config.js](src/config.js). They are requested in
 ASCII on this tool's own port only — the profile's binary `LOG FILE ...` recording is
@@ -397,7 +430,9 @@ ITDETECTSTATUS and all seven ephemeris logs.
 - [src/novatel.js](src/novatel.js) — ASCII and binary framing, CRC32, GPS-time conversion, message-ID table
 - [src/messages.js](src/messages.js) — per-log decoders and receiver-status bit names
 - [src/receiver.js](src/receiver.js) — TCP client, stream framing, auto-reconnect
+- [src/start.js](src/start.js) — sets `UV_THREADPOOL_SIZE`, then loads the server
 - [src/server.js](src/server.js) — state store, Server-Sent Events, `/api/snapshot`, `/api/archive/*`
+- [src/loglimit.js](src/loglimit.js) — first line, then a once-per-minute count for repeated logs
 - [src/archive.js](src/archive.js) — historic `.LOG` scanner, per-file cache and archive queries
 - [public/](public/) — browser UI
 

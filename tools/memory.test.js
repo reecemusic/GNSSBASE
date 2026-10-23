@@ -1,3 +1,8 @@
+/**
+ * Locks in browser memory and rendering bounds: history caps, coalesced
+ * updates, timeline and spectrum drawing limits, and interference rows
+ * that stay bounded while live data keeps moving.
+ */
 'use strict';
 
 const assert = require('node:assert/strict');
@@ -10,6 +15,7 @@ const { History } = require('../src/history');
 const browserCode = fs.readFileSync(path.join(__dirname, '../public/app.js'), 'utf8');
 const serverCode = fs.readFileSync(path.join(__dirname, '../src/server.js'), 'utf8');
 
+/** Catches spectrum detection CSS that loses the shared red fill or gives archive hits a different colour. */
 test('live and archive frequency interference overlays share an opaque red fill and contrasting outline', () => {
   const css = fs.readFileSync(path.join(__dirname, '..', 'public', 'style.css'), 'utf8');
   const detection = css.match(/\.spectrum-detection\s*\{([^}]+)\}/)?.[1];
@@ -23,18 +29,20 @@ test('live and archive frequency interference overlays share an opaque red fill 
   assert.match(swatch, /background:\s*#ff2020;/);
 });
 
-test('profile-managed TCP connections request usage and interference reports every second on each connection', () => {
+/** Catches a TCP connect that skips BESTSATS, TRACKSTAT, or ITDETECTSTATUS, or that sends UNLOGALL. */
+test('profile-managed TCP connections request usage and interference reports every second on each connection', (t) => {
   const { EventEmitter } = require('node:events');
   const writes = [];
   const socket = new EventEmitter();
   socket.setKeepAlive = () => {};
   socket.setTimeout = () => {};
+  socket.destroy = () => {};
   socket.write = (command) => writes.push(command);
   const context = vm.createContext({
     Buffer, clearTimeout, setTimeout, module: { exports: {} },
     require: (name) => name === 'node:net'
       ? { createConnection: () => socket }
-      : name === './novatel' ? require('../src/novatel') : require(name),
+      : name === './novatel' ? require('../src/novatel') : name === './loglimit' ? require('../src/loglimit') : require(name),
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/receiver.js'), 'utf8'), context);
   const receiver = new context.module.exports.ReceiverClient({
@@ -42,6 +50,7 @@ test('profile-managed TCP connections request usage and interference reports eve
     idleTimeoutMs: 30000, sendLogCommands: false,
     ephemerisLogCommands: ['LOG GPSEPHEMA ONALL'],
   });
+  t.after(() => receiver.stop());
   for (let connection = 0; connection < 2; connection++) {
     receiver.connect();
     socket.emit('connect');
@@ -53,6 +62,14 @@ test('profile-managed TCP connections request usage and interference reports eve
   assert(!writes.some((command) => command.includes('UNLOGALL')));
 });
 
+/**
+ * Evaluates a source slice inside a vm context.
+ * @param {string} code Full source text.
+ * @param {string} start First source substring. The slice begins at this match.
+ * @param {string} end Source substring that ends the slice, exclusive.
+ * @param {object} context vm context that receives the slice.
+ * @returns {void}
+ */
 function loadFunctions(code, start, end, context) {
   const first = code.indexOf(start);
   const last = code.indexOf(end, first + start.length);
@@ -60,6 +77,7 @@ function loadFunctions(code, start, end, context) {
   vm.runInContext(code.slice(first, last), context);
 }
 
+/** Catches premature connection status before a valid log, or a disconnect that leaves retries running. */
 test('receiver phases track connecting, connected, retrying and manual disconnect', async () => {
   const { EventEmitter } = require('node:events');
   const timers = new Set();
@@ -70,13 +88,14 @@ test('receiver phases track connecting, connected, retrying and manual disconnec
     setTimeout: (callback) => { timers.add(callback); return callback; },
     clearTimeout: (callback) => timers.delete(callback),
     require: (name) => name === 'node:net' ? {
+      /** @returns {EventEmitter} A socket with no-op writes. Side effects: assigns the outer `socket`. Events: none until the test emits them. */
       createConnection() {
         socket = new EventEmitter();
         socket.setKeepAlive = socket.setTimeout = socket.write = () => {};
         socket.destroy = () => { socket.destroyed = true; };
         return socket;
       },
-    } : name === './novatel' ? require('../src/novatel') : require(name),
+    } : name === './novatel' ? require('../src/novatel') : name === './loglimit' ? require('../src/loglimit') : require(name),
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../src/receiver.js'), 'utf8'), context);
   const receiver = new context.module.exports.ReceiverClient({
@@ -90,6 +109,12 @@ test('receiver phases track connecting, connected, retrying and manual disconnec
   receiver.start();
   assert.equal(receiver.state.phase, 'connecting');
   socket.emit('connect');
+  assert.equal(receiver.state.phase, 'connecting', 'An open socket alone does not prove receiver health');
+  socket.emit('data', Buffer.from('%ITDETECTSTATUSA,2200,1;0\n'));
+  assert.equal(receiver.state.phase, 'connecting', 'Unchecked logs cannot establish receiver health');
+  const body = 'ITDETECTSTATUSA,2200,1;0';
+  const { novatelCrc32 } = require('../src/novatel');
+  socket.emit('data', Buffer.from(`%${body}*${novatelCrc32(body).toString(16).padStart(8, '0')}\n`));
   assert.equal(receiver.state.phase, 'connected');
   socket.emit('close');
   assert.equal(receiver.state.phase, 'waiting');
@@ -109,6 +134,10 @@ test('receiver phases track connecting, connected, retrying and manual disconnec
   await receiver.disconnect();
 });
 
+/**
+ * Builds a vm context with stubbed connection controls and loads the connection UI slices.
+ * @returns {object} Context with renderStatus and renderConnectionBar.
+ */
 function connectionContext() {
   const elements = new Map();
   const context = vm.createContext({
@@ -132,6 +161,7 @@ function connectionContext() {
   return context;
 }
 
+/** Catches connection controls that use the same label for connected, retrying, connecting, and stopped. */
 test('connection controls distinguish startup, connected, retrying and stopped states', () => {
   const context = connectionContext();
   const $ = context.$;
@@ -167,6 +197,7 @@ test('connection controls distinguish startup, connected, retrying and stopped s
   assert.equal($('disconnect').disabled, true);
 });
 
+/** Catches a dirty form, an in-flight command, or a lost server that leaves the buttons enabled. */
 test('connection controls explain pending edits, command progress and server loss consistently', () => {
   const context = connectionContext();
   const $ = context.$;
@@ -195,6 +226,10 @@ test('connection controls explain pending edits, command progress and server los
   assert.equal($('connection-form')['aria-busy'], 'false');
 });
 
+/**
+ * Builds a vm context and loads client history pruning from public/app.js.
+ * @returns {object} Context with recordLiveHistory and pruneClientHistory.
+ */
 function historyContext() {
   const context = vm.createContext({
     Date,
@@ -204,10 +239,11 @@ function historyContext() {
     state: { windowMinutes: 60, interferenceHistory: [], tracks: {} },
     isValidSkyPosition: () => true,
   });
-  loadFunctions(browserCode, 'function pruneClientHistory()', '// --- interference timeline', context);
+  loadFunctions(browserCode, 'function boundSeries(', '// --- interference timeline', context);
   return context;
 }
 
+/** Catches client history that grows past the cap or that keeps a sample older than the window. */
 test('browser history stays bounded under sustained input and expires old samples', () => {
   const context = historyContext();
   const now = Date.now();
@@ -216,7 +252,7 @@ test('browser history stays bounded under sustained input and expires old sample
   assert.equal(context.state.interferenceHistory.length, 10000);
   assert.equal(context.state.interferenceHistory[0].index, 90000);
   for (let index = 0; index < 25000; index++) {
-    context.recordLiveHistory({ name: 'ITDETECTSTATUS', data: { detections: [] } });
+    context.recordLiveHistory({ name: 'ITDETECTSTATUS', crcValid: true, data: { detections: [] } });
   }
   assert.equal(context.state.interferenceHistory.length, 10000);
   context.state.interferenceHistory[0].t = now - 7200000;
@@ -224,9 +260,10 @@ test('browser history stays bounded under sustained input and expires old sample
   assert.equal(context.state.interferenceHistory.length, 9999);
 });
 
+/** Catches a repeated SATVIS2 that appends another point, or a loaded track kept past the cap. */
 test('satellite history retains its seed and limits loaded tracks', () => {
   const context = historyContext();
-  const record = { name: 'SATVIS2', data: { system: 'GPS', satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } };
+  const record = { name: 'SATVIS2', crcValid: true, data: { system: 'GPS', satellites: [{ prn: 1, elevation: 20, azimuth: 30 }] } };
   context.recordLiveHistory(record);
   context.pruneClientHistory();
   context.recordLiveHistory(record);
@@ -236,6 +273,87 @@ test('satellite history retains its seed and limits loaded tracks', () => {
   assert.equal(context.state.tracks['GPS:1'].length, 1081);
 });
 
+/** Catches a 24 h series that keeps every 1 Hz point, or a downsample that drops a detection or the newest samples. */
+test('a long interference history is downsampled without dropping a detection or the newest half', () => {
+  const context = historyContext();
+  context.state.windowMinutes = 1440;
+  const now = Date.now();
+  const count = 80000;
+  const span = 20 * 60 * 60 * 1000;
+  context.state.interferenceHistory = Array.from({ length: count }, (_, index) => ({
+    t: now - span + Math.floor((index / (count - 1)) * span),
+    signal: 'L1',
+    count: index === 1000 ? 2 : 0,
+    maxPower: index === 1000 ? -35 : null,
+    index,
+  }));
+  context.pruneClientHistory();
+  const kept = context.state.interferenceHistory;
+  assert.ok(kept.length <= 10000);
+  assert.ok(kept.length < count);
+  assert.equal(kept[kept.length - 1].index, count - 1);
+  assert.equal(kept[kept.length - 5000].index, count - 5000, 'newest half stays sample for sample');
+  assert.ok(kept.some((sample) => sample.index === 1000 && sample.count === 2 && sample.maxPower === -35));
+});
+
+/** Catches a second snapshot of the same satellite report appending another point. */
+test('replaying a snapshot satellite report does not append a second point', () => {
+  const context = vm.createContext({
+    MAX_INTERFERENCE_SAMPLES: 100,
+    SOLUTION_HEARTBEAT_MS: 10000,
+    state: { satelliteViewHistory: [] },
+    trackedSatelliteSummary: () => [],
+    satellitesInViewBySystem: () => ({}),
+  });
+  loadFunctions(browserCode, 'function recordSatelliteView(', 'const SATELLITE_VIEW =', context);
+  const record = { name: 'RANGE', crcValid: true, receivedAt: '2026-10-22T12:00:00.000Z' };
+  context.recordSatelliteView(record);
+  context.recordSatelliteView(record);
+  assert.equal(context.state.satelliteViewHistory.length, 1);
+  context.recordSatelliteView({ ...record, receivedAt: '2026-10-22T12:00:05.000Z' });
+  assert.equal(context.state.satelliteViewHistory.length, 1, 'unchanged counts inside the heartbeat are one point');
+});
+
+/** Catches a heap safety net that reloads immediately, reloads twice, or ignores heapmb=0. */
+test('a high heap reloads once, and heapmb=0 does not reload', () => {
+  let reloaded = 0;
+  const store = new Map();
+  const context = vm.createContext({
+    URLSearchParams,
+    location: { search: '', reload() { reloaded += 1; } },
+    performance: { memory: { usedJSHeapSize: 900 * 1024 * 1024 } },
+    sessionStorage: {
+      getItem: (key) => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => store.set(key, value),
+    },
+    console: { warn() {} },
+    liveStatusStartedAt: Date.now(),
+    Date,
+  });
+  loadFunctions(browserCode, 'const HEAP_RELOAD_DEFAULT_MB =', 'setInterval(() => flushUpdates()', context);
+  assert.equal(context.heapReloadLimitMb(), 768);
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 0, 'a page younger than 10 minutes stays up');
+  context.liveStatusStartedAt = Date.now() - 11 * 60 * 1000;
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 1);
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 1, 'the cooldown blocks a second reload');
+  context.location.search = '?wall=1&heapmb=0';
+  store.clear();
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 1, 'heapmb=0 disables the reload');
+  assert.equal(context.heapReloadLimitMb(), 0);
+  context.location.search = '?heapmb=100';
+  context.performance.memory.usedJSHeapSize = 50 * 1024 * 1024;
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 1, 'an override below the heap does not reload');
+  context.performance.memory.usedJSHeapSize = 150 * 1024 * 1024;
+  context.maybeReloadForHeap();
+  assert.equal(reloaded, 2);
+});
+
+/** Catches a flush that renders a hidden tab, or queues that grow without the stated caps. */
 test('rendering coalesces input, bounds queues and skips inactive panels', () => {
   const renders = [];
   let tab = 'overview';
@@ -253,13 +371,16 @@ test('rendering coalesces input, bounds queues and skips inactive panels', () =>
   loadFunctions(browserCode, 'function queueRecord(', 'function renderStatus(', context);
   loadFunctions(browserCode, 'function applyRecord(', '// --- renderers', context);
   for (let index = 0; index < 100000; index++) {
-    context.applyRecord({ name: 'BESTPOS', data: { index } });
+    context.applyRecord({ name: 'BESTPOS', crcValid: true, data: { index } });
     context.queueRecord(context.pendingRaw, { name: 'BESTPOS' }, 300);
     context.queueRecord(context.pendingInterference, { name: 'ITDETECTSTATUS' }, 50);
   }
   assert.equal(context.pendingRaw.length, 300);
   assert.equal(context.pendingInterference.length, 50);
   assert.equal(context.dirtyRecords.size, 1);
+  context.applyRecord({ name: 'BESTPOS', crcValid: true, raw: 'z'.repeat(100000), data: {} });
+  assert.ok(context.latestByName.BESTPOS.raw.length < 16420);
+  assert.match(context.latestByName.BESTPOS.raw, /display truncated/);
   context.flushUpdates();
   assert(!renders.includes('renderBestPos'));
   tab = 'position';
@@ -270,6 +391,7 @@ test('rendering coalesces input, bounds queues and skips inactive panels', () =>
   assert.equal(renders.filter((name) => name === 'renderBestPos').length, 1);
 });
 
+/** Catches a broadcast that keeps a backed-up client or that skips a client that can still write. */
 test('slow stream clients are evicted without affecting healthy clients', () => {
   const slow = { writableLength: 300000, destroy() { this.destroyed = true; } };
   const fast = { writableLength: 0, write() { this.wrote = true; } };
@@ -281,6 +403,7 @@ test('slow stream clients are evicted without affecting healthy clients', () => 
   assert.equal(context.clients.size, 1);
 });
 
+/** Catches a VERSION record that never reaches the header summary. */
 test('receiver identity updates without rendering the hidden health table', () => {
   const header = { textContent: '' };
   const context = vm.createContext({
@@ -290,11 +413,12 @@ test('receiver identity updates without rendering the hidden health table', () =
   });
   loadFunctions(browserCode, 'function applyRecord(', '// --- renderers', context);
   loadFunctions(browserCode, 'function renderVersionSummary(', '// --- interference bands', context);
-  context.applyRecord({ name: 'VERSION', data: { components: [{ model: 'PwrPak', softwareVersion: '1', serialNumber: '123' }] } });
+  context.applyRecord({ name: 'VERSION', crcValid: true, data: { components: [{ model: 'PwrPak', softwareVersion: '1', serialNumber: '123' }] } });
   assert(header.textContent.includes('PwrPak'));
   assert(header.textContent.includes('123'));
 });
 
+/** Catches server prune that keeps a restored interference array past the configured cap. */
 test('server pruning enforces the sample limit on restored history', () => {
   const history = new History({ retentionMs: 3600000, trackSampleMs: 20000, maxInterferenceSamples: 50 });
   history.interference = Array.from({ length: 500 }, (_, index) => ({ t: Date.now(), index }));
@@ -303,6 +427,7 @@ test('server pruning enforces the sample limit on restored history', () => {
   assert.equal(history.interference[0].index, 450);
 });
 
+/** Catches power placement that is non-linear, unbounded, or that plots a null or NaN measurement. */
 test('timeline displacement is linear in dBm, bounded, and excludes unknown power', () => {
   const context = vm.createContext({ TIMELINE: { top: 12, minPower: -130, maxPower: -70 } });
   loadFunctions(browserCode, 'function timelinePowerY(', 'function renderTimeline(', context);
@@ -318,6 +443,7 @@ test('timeline displacement is linear in dBm, bounded, and excludes unknown powe
   assert(Math.abs(context.timelinePowerY(-100, 1, 120) - medium - 120) < 1e-9);
 });
 
+/** Catches power colours that collapse weak, moderate, and strong readings into one value. */
 test('timeline power colours distinguish weak, moderate, strong and unknown measurements', () => {
   const context = vm.createContext({});
   loadFunctions(browserCode, 'function powerColour(', 'function formatWindow(', context);
@@ -327,6 +453,7 @@ test('timeline power colours distinguish weak, moderate, strong and unknown meas
   ]) assert.equal(context.powerColour(power), colour);
 });
 
+/** Catches a dense timeline that draws one point per sample or that keeps the weaker power in a pixel. */
 test('dense power chart bounds rendered points while preserving the strongest measurement per pixel', () => {
   const now = 100000;
   const chart = {
@@ -353,8 +480,13 @@ test('dense power chart bounds rendered points while preserving the strongest me
   assert(points.every((point) => point.attributes.fill === '#ff5f56'));
 });
 
+/** Catches band names or frequency ranges drawn outside the left gutter. */
 test('timeline places band names and frequency coverage in the left axis gutter', () => {
   const elements = new Map();
+  /**
+   * Builds a stub DOM or SVG node with the methods this test calls.
+   * @returns {object} Stub element.
+   */
   const element = () => ({
     children: [], attributes: {}, textContent: '',
     append(...children) { this.children.push(...children); },
@@ -362,6 +494,11 @@ test('timeline places band names and frequency coverage in the left axis gutter'
     setAttribute(name, value) { this.attributes[name] = value; },
     getBoundingClientRect: () => ({ width: 900 }),
   });
+  /**
+   * Returns the stub element for an id, creating it on first use.
+   * @param {string} id Element id.
+   * @returns {object} Cached stub element.
+   */
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, element());
     return elements.get(id);
@@ -393,6 +530,7 @@ test('timeline places band names and frequency coverage in the left axis gutter'
   assert.equal(labels.filter((label) => label.textContent === 'Power (dBm)').length, 3);
 });
 
+/** Catches a zoom or pan that leaves the retained window, or a follow mode that stays on the old end. */
 test('timeline zoom and pan stay within retained history and can follow live time', () => {
   const now = 10000000;
   const context = vm.createContext({
@@ -415,8 +553,13 @@ test('timeline zoom and pan stay within retained history and can follow live tim
   assert.equal(context.state.timelineView.windowMs, 1800000);
 });
 
+/** Catches wheel, drag, select, or live-reset input that leaves the timeline view unchanged. */
 test('timeline controls support wheel zoom, dragging, selection mode and live reset', () => {
   const elements = new Map();
+  /**
+   * Builds a stub DOM or SVG node with the methods this test calls.
+   * @returns {object} Stub element.
+   */
   const element = () => ({
     handlers: {}, children: [], style: {}, attributes: {}, textContent: '',
     classList: { add() {}, remove() {}, toggle() {} },
@@ -429,6 +572,11 @@ test('timeline controls support wheel zoom, dragging, selection mode and live re
     setPointerCapture() {},
     hasPointerCapture() { return false; },
   });
+  /**
+   * Returns the stub element for an id, creating it on first use.
+   * @param {string} id Element id.
+   * @returns {object} Cached stub element.
+   */
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, element());
     return elements.get(id);
@@ -494,6 +642,7 @@ test('timeline controls support wheel zoom, dragging, selection mode and live re
   assert.equal(get('timeline-mode').textContent, 'Live');
 });
 
+/** Catches a UAE label that stays on the UTC day, or a New York label that ignores daylight saving. */
 test('selected time zone formats UAE rollover, UTC and daylight saving consistently', () => {
   const context = vm.createContext({ state: { timeZone: 'Asia/Dubai' } });
   loadFunctions(browserCode, 'function timelineTimeLabel(', 'function powerColour(', context);
@@ -511,6 +660,7 @@ test('selected time zone formats UAE rollover, UTC and daylight saving consisten
   assert.match(context.formatTimestamp('2026-12-01T12:00:00Z'), /07:00:00 GMT-5/);
 });
 
+/** Catches a time-zone control that does not start on Asia/Dubai or that forgets a change. */
 test('time zone selector defaults to UAE and persists changes', () => {
   assert.match(browserCode, /timeZone: readPreference\('timeZone', 'Asia\/Dubai'/);
   const select = {
@@ -537,7 +687,12 @@ test('time zone selector defaults to UAE and persists changes', () => {
   assert.match(row.textContent, /12:00:00 GMT/);
 });
 
+/** Catches spectrum plots that use a different window than the timeline, or detections clipped to the latest 400 hits. */
 test('GNSS frequency plots share the timeline window and show horizontal allocations and timed detections', () => {
+  /**
+   * Builds a stub DOM or SVG node with the methods this test calls.
+   * @returns {object} Stub element.
+   */
   const element = () => ({
     children: [], style: { properties: {}, setProperty(name, value) { this.properties[name] = value; } },
     attributes: {}, handlers: {}, className: '', textContent: '',
@@ -594,6 +749,11 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
   assert(legendNames.includes('GPS L1 C/A'));
   assert(legendNames.includes('GPS L1C'));
   assert(legendNames.includes('Galileo E1'));
+  /**
+   * Reads the CSS colour variable from the legend button of that name.
+   * @param {string} name Legend label.
+   * @returns {string} Colour value.
+   */
   const legendColor = (name) => buttons.find((item) => item.children[1]?.textContent === name)
     .style.properties['--signal-color'];
   for (const section of sections) {
@@ -686,9 +846,19 @@ test('GNSS frequency plots share the timeline window and show horizontal allocat
   assert.doesNotMatch(sections[2].children[0].children[0].textContent, /latest|showing/);
 });
 
+/** Catches markers that merge different frequencies or bandwidths, or that keep a weaker power. */
 test('frequency markers group only matching pixel-level detections and preserve coverage and peak power', () => {
   const context = vm.createContext({});
   loadFunctions(browserCode, 'function spectrumMarkers(', 'function renderSpectrumPlots(', context);
+  /**
+   * Builds one spectrum hit for spectrumMarkers.
+   * @param {number} t Sample time.
+   * @param {number|null} power Power in dBm, or null.
+   * @param {number} [freq=1176.45e6] Centre frequency in Hz.
+   * @param {number} [bandwidth=20.46e6] Bandwidth in Hz.
+   * @param {string} [signal='L5'] Signal name.
+   * @returns {{sample: object, detection: object}}
+   */
   const hit = (t, power, freq = 1176.45e6, bandwidth = 20.46e6, signal = 'L5') => ({
     sample: { t, signal }, detection: { freq, bandwidth, power },
   });
@@ -704,12 +874,26 @@ test('frequency markers group only matching pixel-level detections and preserve 
   assert.equal(markers[0].sample.t, 101);
   assert.equal(context.spectrumMarkers(hits, (t) => t).length, 7, 'Zoom separates distinct times');
   assert.equal(context.spectrumMarkers([], (t) => t).length, 0);
+  const pixelY = (mhz) => mhz;
+  const overlapped = context.spectrumMarkers([
+    hit(100, -100, 1176.1e6),
+    hit(100, -70, 1176.4e6),
+    hit(100, -90, 1207.14e6),
+  ], () => 10, pixelY);
+  assert.equal(overlapped.length, 2, 'frequencies on one pixel collapse; a distant frequency stays');
+  assert.equal(overlapped[0].detection.power, -70);
 });
 
+/** Catches a wheel zoom that moves the time under the cursor, or a cancelled drag that keeps panning. */
 test('linked plot navigation clamps history and zoom and handles drag cancellation', () => {
   const now = Date.now();
   let renders = 0;
   const elements = new Map();
+  /**
+   * Returns the stub element for an id, creating it on first use.
+   * @param {string} id Element id.
+   * @returns {object} Cached stub element.
+   */
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, {
       handlers: {}, viewBox: { baseVal: { width: 900 } }, classList: { add() {}, remove() {} },
@@ -733,6 +917,11 @@ test('linked plot navigation clamps history and zoom and handles drag cancellati
   get('timeline-zoom-in').handlers.click();
   assert.equal(context.timelineViewport().windowMs, 1800000);
   const before = context.timelineViewport();
+  /**
+   * Converts a viewport window into the wider axis span used by wheel zoom.
+   * @param {number} windowMs Visible window in milliseconds.
+   * @returns {number} windowMs / 0.9.
+   */
   const axisMs = (windowMs) => windowMs / 0.9;
   const anchor = before.start + axisMs(before.windowMs) / 4;
   let prevented = false;
@@ -763,8 +952,16 @@ test('linked plot navigation clamps history and zoom and handles drag cancellati
   assert(renders > 0);
 });
 
+/** Catches clear, unknown, expired, or future reports drawn as measured points, or a trace drawn across a gap. */
 test('power chart plots measured power only, preserves gaps and shares its exact viewport', () => {
   const now = Date.now();
+  /**
+   * Builds a stub SVG node that records tag, attributes, text, and children.
+   * @param {string} tag Element name.
+   * @param {object} [attributes] Initial attributes.
+   * @param {string} [textContent] Initial text.
+   * @returns {object} Stub node with append and setAttribute.
+   */
   const element = (tag, attributes = {}, textContent = '') => ({
     tag, attributes, textContent, children: [],
     append(...children) { this.children.push(...children); },
@@ -773,6 +970,11 @@ test('power chart plots measured power only, preserves gaps and shares its exact
     getBoundingClientRect: () => ({ width: 900 }),
   });
   const elements = new Map();
+  /**
+   * Returns the stub element for an id, creating it on first use.
+   * @param {string} id Element id.
+   * @returns {object} Cached stub element.
+   */
   const get = (id) => {
     if (!elements.has(id)) elements.set(id, element('svg'));
     return elements.get(id);
@@ -827,6 +1029,7 @@ test('power chart plots measured power only, preserves gaps and shares its exact
   assert(titles.some((title) => title.includes('Power unknown')));
 });
 
+/** Catches a zoom that moves the time at the middle of the axis. */
 test('zoom keeps the selected time anchored on the shared axis', () => {
   const now = 10000000;
   const context = vm.createContext({
@@ -842,14 +1045,17 @@ test('zoom keeps the selected time anchored on the shared axis', () => {
   assert.equal(view.start + context.timelineAxisMs(view.windowMs) / 2, anchor);
 });
 
+/** Catches interference marked live when the CRC failed, the report is 5 s old, or the link is down. */
 test('wall display does not treat stale or disconnected interference data as live', () => {
   const context = vm.createContext({
     connection: { status: { connected: true }, offline: false }, INTERFERENCE_STALE_MS: 5000,
   });
   loadFunctions(browserCode, 'function interferenceIsLive(', 'function renderVerdict(', context);
   const now = Date.now();
-  const record = { receivedAt: new Date(now).toISOString(), data: { detections: [] } };
+  const record = { crcValid: true, receivedAt: new Date(now).toISOString(), data: { detections: [] } };
   assert.equal(context.interferenceIsLive(record, now), true);
+  assert.equal(context.interferenceIsLive({ ...record, crcValid: false }, now), false);
+  assert.equal(context.interferenceIsLive({ ...record, crcValid: null }, now), false);
   assert.equal(context.interferenceIsLive(record, now + 4999), true);
   assert.equal(context.interferenceIsLive(record, now + 5000), false);
   assert.equal(context.interferenceIsLive(null, now), false);
@@ -861,6 +1067,7 @@ test('wall display does not treat stale or disconnected interference data as liv
   assert.equal(context.interferenceIsLive(record, now), false);
 });
 
+/** Catches band status markup that is no longer between the timeline and the spectrum plots. */
 test('band status sits below power over time and above frequency overlays', () => {
   const html = fs.readFileSync(path.join(__dirname, '../public/index.html'), 'utf8');
   assert(html.indexOf('id="timeline"') < html.indexOf('Current band status'));
@@ -868,6 +1075,7 @@ test('band status sits below power over time and above frequency overlays', () =
   assert(html.indexOf('id="bands"') < html.indexOf('id="spectrum-plots"'));
 });
 
+/** Catches a band card that disappears when status is missing, clear, or jammed. */
 test('every band remains visible without data, when clear and during detections', () => {
   const cards = [];
   const context = vm.createContext({
@@ -900,6 +1108,7 @@ test('every band remains visible without data, when clear and during detections'
   }
 });
 
+/** Catches an ALL clear report that is counted for one band only. */
 test('all-band clear reports contribute to statistics for every band', () => {
   const now = Date.now();
   const context = vm.createContext({
@@ -924,6 +1133,7 @@ test('all-band clear reports contribute to statistics for every band', () => {
   }
 });
 
+/** Catches band cards that reorder or drop out between clear, jammed, and unmonitored. */
 test('all band cards remain in the same order through clear, detection and stale reports', () => {
   const cards = [];
   const container = {
@@ -962,6 +1172,7 @@ test('all band cards remain in the same order through clear, detection and stale
   assert(cards.every((card) => card.status === 'unmonitored'));
 });
 
+/** Catches a repeated clear report that skips the history update or that adds another recent row. */
 test('unchanged clear reports refresh live history, time and counters without repeating recent rows', () => {
   const context = historyContext();
   const handlers = {};
@@ -1022,6 +1233,7 @@ test('unchanged clear reports refresh live history, time and counters without re
   assert.equal(timelineRenders, 10);
 });
 
+/** Catches a clear row shown before any detection, or a CRC-failed detection that opens a clear row. */
 test('recent status reports show clear only after detections and suppress repeated clear rows', () => {
   const rows = [];
   const log = {
