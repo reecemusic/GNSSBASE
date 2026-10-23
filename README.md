@@ -251,6 +251,14 @@ changes are handled according to the selected zone.
 there are no detections, keeping the band order consistent as status changes.
 Each card shows its frequency range and related signals. All-band clear reports
 contribute to the history statistics for every card, not just L1 and L2.
+Spectrum detections are assigned by measured centre frequency and bandwidth, not
+solely by the receiver's RF-path label. For example, an `L2`-labelled detection
+near 1207 MHz affects **L5 / E5 / B2**, including BeiDou B2I/B2b. A detection
+spanning a band boundary appears in every affected band. Cards, power timelines
+and live-history statistics use these same rules; detections without a measured
+frequency fall back to their signal label. Stored receiver labels are unchanged.
+The cards show the latest live report, whereas the frequency plots can also show
+earlier or archived detections; a later clear report does not erase those past hits.
 
 Disconnected streams or status reports older than 60 seconds show an unavailable
 warning rather than a live clear indication.

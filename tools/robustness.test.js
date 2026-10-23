@@ -129,6 +129,7 @@ test('interference banner ages clear reports, errors after five seconds, and rec
     BANDS: [{ id: 'L1' }, { id: 'L2' }],
     SIGNAL_BANDS: ['L1', 'L2', 'L5'],
     classifyBand: (signal) => signal,
+    detectionBands: (signal) => [signal],
     buildSatelliteList: () => context.state.testSatellites,
     signalBand: (_system, status) => status,
     normalisePrn: (_system, prn) => prn,

@@ -218,6 +218,7 @@ test('a report with interference in one band shows clear status in the other ban
   const context = vm.createContext({
     classifyBand: (signal) => (/L2/.test(signal) ? 'L2' : /L5/.test(signal) ? 'L5' : /L1/.test(signal) ? 'L1' : 'OTHER'),
   });
+  loadFunctions(browserCode, 'const BANDS =', 'function renderBands()', context);
   loadFunctions(browserCode, 'const TIMELINE_REPORT_MS =', 'function formatSpan(', context);
   const samples = [
     { t: 0, signal: 'ALL', count: 0, maxPower: null },

@@ -1838,8 +1838,9 @@ function timelineBandSamples(samples, band) {
     for (; index < samples.length && samples[index].signal !== 'ALL'
       && samples[index].t - first.t <= TIMELINE_REPORT_MS; index++) {
       const sample = samples[index];
-      if (sample.count > 0 && classifyBand(sample.signal, []) === band) {
-        result.push(sample);
+      const bandSample = sample.count > 0 ? interferenceSampleForBand(sample, band) : null;
+      if (bandSample) {
+        result.push(bandSample);
         hit = true;
       }
     }
@@ -1894,12 +1895,14 @@ function drawArchiveTimeline(chart, axis, archive, bandIds, rowHeight, width) {
     }
     const pixels = new Map();
     for (const sample of archive.samples) {
-      if (sample.count <= 0 || classifyBand(sample.signal, []) !== band) continue;
+      if (sample.count <= 0) continue;
+      const bandSample = interferenceSampleForBand(sample, band);
+      if (!bandSample) continue;
       const pixel = Math.round(axis.x(sample.t));
       const previous = pixels.get(pixel);
-      if (!previous || (Number.isFinite(sample.maxPower)
-        && (!Number.isFinite(previous.maxPower) || sample.maxPower > previous.maxPower))) {
-        pixels.set(pixel, sample);
+      if (!previous || (Number.isFinite(bandSample.maxPower)
+        && (!Number.isFinite(previous.maxPower) || bandSample.maxPower > previous.maxPower))) {
+        pixels.set(pixel, bandSample);
       }
     }
     let previous = null;
@@ -3696,18 +3699,24 @@ function renderItDetect(record) {
 // --- interference bands -----------------------------------------------------
 
 const BANDS = [
-  { id: 'L1', title: 'L1 / E1 / B1 / G1', range: '1559 – 1610 MHz', note: 'GPS/QZSS L1, Galileo E1, BeiDou B1, GLONASS G1' },
-  { id: 'L2', title: 'L2 / G2', range: '1215 – 1260 MHz', note: 'GPS/QZSS L2, GLONASS G2' },
-  { id: 'L5', title: 'L5 / E5 / B2', range: '1164 – 1215 MHz', note: 'GPS L5, GAL E5a/E5b, BDS B2a, NavIC L5' },
-  { id: 'L6', title: 'L6 / E6 / B3', range: '1260 – 1300 MHz', note: 'GAL E6, QZSS L6, BDS B3' },
+  { id: 'L1', minHz: 1559e6, maxHz: 1610e6, title: 'L1 / E1 / B1 / G1', range: '1559 – 1610 MHz', note: 'GPS/QZSS L1, Galileo E1, BeiDou B1, GLONASS G1' },
+  { id: 'L2', minHz: 1215e6, maxHz: 1260e6, title: 'L2 / G2', range: '1215 – 1260 MHz', note: 'GPS/QZSS L2, GLONASS G2' },
+  { id: 'L5', minHz: 1164e6, maxHz: 1215e6, title: 'L5 / E5 / B2', range: '1164 – 1215 MHz', note: 'GPS L5, GAL E5a/E5b, BDS B2a/B2b/B2I, NavIC L5' },
+  { id: 'L6', minHz: 1260e6, maxHz: 1300e6, title: 'L6 / E6 / B3', range: '1260 – 1300 MHz', note: 'GAL E6, QZSS L6, BDS B3' },
   { id: 'SBAS', title: 'SBAS', range: 'L1 / L5 overlay', note: 'WAAS, EGNOS, MSAS, GAGAN' },
-  { id: 'SBAND', title: 'S-Band', range: '2483 – 2500 MHz', note: 'NavIC S' },
-  { id: 'LBAND', title: 'L-Band', range: '1525 – 1560 MHz', note: 'TerraStar corrections' },
+  { id: 'SBAND', minHz: 2483e6, maxHz: 2500e6, title: 'S-Band', range: '2483 – 2500 MHz', note: 'NavIC S' },
+  { id: 'LBAND', minHz: 1525e6, maxHz: 1559e6, title: 'L-Band', range: '1525 – 1560 MHz', note: 'TerraStar corrections' },
   { id: 'OTHER', title: 'Unclassified', range: '—', note: 'Signal type not recognised' },
 ];
 
-/** Maps an ITDETECTSTATUS signal type onto a band, falling back to detection frequency. */
+/** Maps an ITDETECTSTATUS detection by measured frequency before its receiver RF-path label. */
 function classifyBand(signalType, detections) {
+  const freq = detections.map((d) => d.centerFrequencyHz ?? d.freq).find((hz) => Number.isFinite(hz) && hz > 0);
+  if (freq !== undefined) {
+    const band = BANDS.find((band) => freq >= band.minHz && freq < band.maxHz)
+      || BANDS.find((band) => freq === band.maxHz);
+    return band?.id || 'OTHER';
+  }
   const s = (signalType || '').toUpperCase();
 
   if (s.includes('SBAS') || s.includes('WAAS') || s.includes('EGNOS')) return 'SBAS';
@@ -3718,17 +3727,33 @@ function classifyBand(signalType, detections) {
   if (/L2|G2/.test(s)) return 'L2';
   if (/L1|E1|B1|G1/.test(s)) return 'L1';
 
-  const freq = detections.map((d) => d.centerFrequencyHz).find(Number.isFinite);
-  if (freq) {
-    const mhz = freq / 1e6;
-    if (mhz >= 2483 && mhz <= 2500) return 'SBAND';
-    if (mhz >= 1559 && mhz <= 1610) return 'L1';
-    if (mhz >= 1525 && mhz < 1559) return 'LBAND';
-    if (mhz >= 1260 && mhz <= 1300) return 'L6';
-    if (mhz >= 1215 && mhz < 1260) return 'L2';
-    if (mhz >= 1164 && mhz < 1215) return 'L5';
-  }
   return 'OTHER';
+}
+
+function detectionBands(signalType, detection) {
+  const freq = detection.centerFrequencyHz ?? detection.freq;
+  const bandwidth = detection.bandwidthHz ?? detection.bandwidth;
+  if (Number.isFinite(freq) && freq > 0 && Number.isFinite(bandwidth) && bandwidth > 0) {
+    const bands = BANDS.filter((band) => freq + bandwidth / 2 > band.minHz && freq - bandwidth / 2 < band.maxHz);
+    return bands.length ? bands.map((band) => band.id) : ['OTHER'];
+  }
+  return [classifyBand(signalType, [detection])];
+}
+
+function interferenceSampleForBand(sample, band) {
+  if (!Array.isArray(sample.detections) || !sample.detections.length) {
+    return detectionBands(sample.signal, { freq: sample.freq }).includes(band) ? sample : null;
+  }
+  const detections = sample.detections.filter((detection) => detectionBands(sample.signal, detection).includes(band));
+  if (!detections.length) return null;
+  const powers = detections.map((detection) => detection.power).filter(Number.isFinite);
+  return {
+    ...sample,
+    count: sample.count > 0 ? detections.length : 0,
+    maxPower: powers.length ? Math.max(...powers) : null,
+    freq: detections[0].freq,
+    detections,
+  };
 }
 
 /**
@@ -3744,10 +3769,11 @@ function renderBands() {
   const detections = (record && record.data && record.data.detections) || [];
 
   for (const detection of detections) {
-    const band = classifyBand(detection.signalType, [detection]);
-    const group = groups[band] || (groups[band] = { signals: new Map(), detections: [] });
-    group.signals.set(detection.signalType, (group.signals.get(detection.signalType) || 0) + 1);
-    group.detections.push(detection);
+    for (const band of detectionBands(detection.signalType, detection)) {
+      const group = groups[band] || (groups[band] = { signals: new Map(), detections: [] });
+      group.signals.set(detection.signalType, (group.signals.get(detection.signalType) || 0) + 1);
+      group.detections.push(detection);
+    }
   }
 
   const container = $('bands');
@@ -3771,17 +3797,16 @@ function bandStats(now) {
 
   for (const sample of state.interferenceHistory) {
     if (sample.t < cutoff) continue;
-    const bands = sample.signal === 'ALL'
-      ? BANDS.map((band) => band.id)
-      : [classifyBand(sample.signal, [])];
-    for (const band of bands) {
+    for (const { id: band } of BANDS) {
+      const bandSample = sample.signal === 'ALL' ? sample : interferenceSampleForBand(sample, band);
+      if (!bandSample) continue;
       const entry = stats[band] || (stats[band] = { samples: 0, hits: 0, peak: null, lastHit: null });
       entry.samples++;
       if (sample.count > 0) {
         entry.hits++;
         entry.lastHit = Math.max(entry.lastHit || 0, sample.t);
-        if (Number.isFinite(sample.maxPower)) {
-          entry.peak = entry.peak === null ? sample.maxPower : Math.max(entry.peak, sample.maxPower);
+        if (Number.isFinite(bandSample.maxPower)) {
+          entry.peak = entry.peak === null ? bandSample.maxPower : Math.max(entry.peak, bandSample.maxPower);
         }
       }
     }
@@ -3975,7 +4000,7 @@ function renderVerdict() {
   const age = Number.isFinite(receivedAt) ? Math.max(0, now - receivedAt) : null;
   const detections = record?.data?.detections || [];
   const jammedBands = BANDS.map((band) => band.id)
-    .filter((band) => detections.some((detection) => classifyBand(detection.signalType, [detection]) === band));
+    .filter((band) => detections.some((detection) => detectionBands(detection.signalType, detection).includes(band)));
   const totalDetections = detections.length;
   const banner = $('it-banner');
   const verdict = $('it-verdict');

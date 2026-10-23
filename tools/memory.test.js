@@ -474,6 +474,7 @@ test('dense power chart bounds rendered points while preserving the strongest me
   });
   loadFunctions(browserCode, 'const TIMELINE =', 'const SPECTRUM_PLOTS =', context);
   loadFunctions(browserCode, 'function powerColour(', 'function formatWindow(', context);
+  loadFunctions(browserCode, 'const BANDS =', 'function renderBands()', context);
   context.renderTimeline();
   const points = chart.children.filter((child) => child.tag === 'circle');
   assert(points.length > 100 && points.length <= 661, 'bounded by the 660-unit plot width');
@@ -514,6 +515,7 @@ test('timeline places band names and frequency coverage in the left axis gutter'
   loadFunctions(browserCode, 'const TIMELINE =', 'function timelineViewport(', context);
   loadFunctions(browserCode, 'const TIMELINE_NOW_INSET =', 'function setTimelineView(', context);
   loadFunctions(browserCode, 'function timelinePowerY(', 'const SPECTRUM_PLOTS =', context);
+  loadFunctions(browserCode, 'const BANDS =', 'function renderBands()', context);
   context.renderTimeline();
 
   const labels = get('timeline').children.filter((child) => child.tag === 'text');
@@ -596,6 +598,7 @@ test('timeline controls support wheel zoom, dragging, selection mode and live re
   loadFunctions(browserCode, 'function timelineViewport(', 'const SPECTRUM_PLOTS =', context);
   loadFunctions(browserCode, 'function utcLabel(', 'function powerColour(', context);
   loadFunctions(browserCode, 'function formatTimestamp(', 'function initTimeZone(', context);
+  loadFunctions(browserCode, 'const BANDS =', 'function renderBands()', context);
   context.initTimelineControls();
   context.renderTimeline();
   const chart = get('timeline');
@@ -1007,6 +1010,7 @@ test('power chart plots measured power only, preserves gaps and shares its exact
   });
   loadFunctions(browserCode, 'const TIMELINE =', 'const SPECTRUM_PLOTS =', context);
   loadFunctions(browserCode, 'function powerColour(', 'function formatWindow(', context);
+  loadFunctions(browserCode, 'const BANDS =', 'function renderBands()', context);
   context.renderTimeline();
   assert.deepEqual(spectrumView, [now - 60000, now, 60000]);
   const chart = get('timeline');
@@ -1109,6 +1113,81 @@ test('every band remains visible without data, when clear and during detections'
 });
 
 /** Catches an ALL clear report that is counted for one band only. */
+test('measured BeiDou B2 interference agrees across cards, power history and statistics despite an L2 RF label', () => {
+  const now = Date.now();
+  const cards = [];
+  const sample = {
+    t: now, signal: 'L2', count: 2, maxPower: -75, freq: 1227.52e6,
+    detections: [
+      { freq: 1227.52e6, bandwidth: 2.563e6, power: -75 },
+      { freq: 1207.202e6, bandwidth: 1.465e6, power: -87 },
+    ],
+  };
+  const context = vm.createContext({
+    state: { windowMinutes: 60, interferenceHistory: [sample] },
+    latestByName: { ITDETECTSTATUS: {
+      data: { detections: sample.detections.map((detection) => ({
+        signalType: 'L2', centerFrequencyHz: detection.freq,
+        bandwidthHz: detection.bandwidth, powerDbm: detection.power,
+      })) },
+    } },
+    $: () => ({ replaceChildren: () => { cards.length = 0; }, append: (card) => cards.push(card) }),
+    interferenceIsLive: () => true, renderVerdict() {},
+    buildBandCard: (band, group, detections, status, stats) => ({
+      dataset: {}, band: band.id, status, detections, stats,
+    }),
+  });
+  loadFunctions(browserCode, 'const BANDS =', 'function buildBandCard(', context);
+  loadFunctions(browserCode, 'const TIMELINE_REPORT_MS =', 'function formatSpan(', context);
+  context.renderBands();
+  for (const [band, frequency, power] of [['L2', 1227.52e6, -75], ['L5', 1207.202e6, -87]]) {
+    const card = cards.find((item) => item.band === band);
+    assert.equal(card.status, 'jammed');
+    assert.equal(card.detections.length, 1);
+    assert.equal(card.detections[0].centerFrequencyHz, frequency);
+    assert.equal(card.stats.hits, 1);
+    assert.equal(card.stats.peak, power);
+    const timeline = context.timelineBandSamples([sample], band);
+    assert.equal(timeline.length, 1);
+    assert.equal(timeline[0].count, 1);
+    assert.equal(timeline[0].maxPower, power);
+    assert.equal(timeline[0].freq, frequency);
+    assert.equal(timeline[0].detections.length, 1);
+  }
+  assert.equal(cards.find((item) => item.band === 'L1').status, 'clear');
+  assert.equal(sample.signal, 'L2', 'Receiver RF labels are preserved in stored data');
+  assert.equal(sample.count, 2);
+  assert.equal(sample.detections.length, 2);
+  context.latestByName.ITDETECTSTATUS.data.detections = [{
+    signalType: 'L2', centerFrequencyHz: 1215e6, bandwidthHz: 2e6, powerDbm: -88,
+  }];
+  context.renderBands();
+  assert.deepEqual(cards.filter((card) => card.status === 'jammed').map((card) => card.band), ['L2', 'L5']);
+  context.latestByName.ITDETECTSTATUS.data.detections = [];
+  context.renderBands();
+  assert(cards.every((card) => card.status === 'clear'), 'Historical hits do not keep a current clear report jammed');
+});
+
+test('measured bandwidth can affect multiple bands, while frequency-free detections retain signal classification', () => {
+  const context = vm.createContext({});
+  loadFunctions(browserCode, 'const BANDS =', 'function renderBands()', context);
+  const bands = (signal, detection) => Array.from(context.detectionBands(signal, detection));
+  assert.deepEqual(bands('L2', { centerFrequencyHz: 1207.14e6, bandwidthHz: 2e6 }), ['L5']);
+  assert.deepEqual(bands('L2', { centerFrequencyHz: 1215e6, bandwidthHz: 2e6 }), ['L2', 'L5']);
+  assert.deepEqual(bands('L5', { freq: 1215e6, bandwidth: 0 }), ['L2']);
+  assert.deepEqual(bands('L2', { freq: 1260e6 }), ['L6']);
+  assert.deepEqual(bands('L2', { freq: 1300e6 }), ['L6']);
+  assert.deepEqual(bands('UNKNOWN', { freq: 1610e6 }), ['L1']);
+  assert.deepEqual(bands('UNKNOWN', { freq: 1207.14e6 }), ['L5']);
+  assert.deepEqual(bands('L2', { freq: 1400e6 }), ['OTHER']);
+  for (const [signal, band] of [['B2I', 'L5'], ['B2a', 'L5'], ['B2b', 'L5'], ['L2', 'L2'], ['SBAS', 'SBAS']]) {
+    assert.deepEqual(bands(signal, { centerFrequencyHz: null, bandwidthHz: null }), [band]);
+  }
+  const legacy = { t: 1000, signal: 'L2', count: 1, freq: 1207.14e6, maxPower: -88 };
+  assert.equal(context.interferenceSampleForBand(legacy, 'L5'), legacy);
+  assert.equal(context.interferenceSampleForBand(legacy, 'L2'), null);
+});
+
 test('all-band clear reports contribute to statistics for every band', () => {
   const now = Date.now();
   const context = vm.createContext({
