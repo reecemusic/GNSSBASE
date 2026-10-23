@@ -21,6 +21,7 @@ class ReceiverClient extends EventEmitter {
     this.buffer = Buffer.alloc(0);
     this.reconnectTimer = null;
     this.probeTimer = null;
+    this.logTimer = null;
     this.stopped = true;
     // In 'auto' mode each connection cycle tries serial first, then falls back to TCP.
     this.autoTarget = 'serial';
@@ -88,6 +89,8 @@ class ReceiverClient extends EventEmitter {
   closeCurrentTransport() {
     clearTimeout(this.probeTimer);
     this.probeTimer = null;
+    clearTimeout(this.logTimer);
+    this.logTimer = null;
     const socket = this.socket;
     const port = this.port;
     this.socket = null;
@@ -110,7 +113,7 @@ class ReceiverClient extends EventEmitter {
     clearTimeout(this.reconnectTimer);
     this.reconnectTimer = null;
     this.buffer = Buffer.alloc(0);
-    this.updateState({ transport: this.activeTransport(), phase: 'connecting', retryAt: null });
+    this.updateState({ connected: false, transport: this.activeTransport(), phase: 'connecting', retryAt: null });
     try {
       if (this.state.transport === 'serial') this.connectSerial();
       else this.connectTcp();
@@ -205,11 +208,35 @@ class ReceiverClient extends EventEmitter {
   }
 
   emitLog(message) {
-    if (this.probeTimer) {
-      clearTimeout(this.probeTimer);
-      this.probeTimer = null;
+    if (message.crcValid !== false) {
+      if (this.probeTimer) {
+        clearTimeout(this.probeTimer);
+        this.probeTimer = null;
+      }
+      const transport = this.socket || this.port;
+      if (transport && !this.stopped) {
+        // Other profile logs may resume after reboot without restoring our ONTIME requests.
+        if (message.header.messageName === 'ITDETECTSTATUS') this.startLogWatchdog(transport);
+        if (!this.state.connected) {
+          this.updateState({ connected: true, phase: 'connected', lastError: null });
+        }
+      }
     }
     this.emit('log', message);
+  }
+
+  startLogWatchdog(transport) {
+    clearTimeout(this.logTimer);
+    this.logTimer = null;
+    const timeoutMs = this.options.idleTimeoutMs;
+    if (!(timeoutMs > 0)) return;
+    this.logTimer = setTimeout(() => {
+      this.logTimer = null;
+      if (this.stopped || transport !== (this.socket || this.port)) return;
+      this.closeCurrentTransport();
+      this.updateState({ connected: false, phase: 'waiting', retryAt: null });
+      this.onAttemptFailed(new Error(`No valid ITDETECTSTATUS logs received for ${timeoutMs} ms`));
+    }, timeoutMs);
   }
 
   sendConfiguredCommands(transport) {
@@ -236,8 +263,8 @@ class ReceiverClient extends EventEmitter {
 
   onConnected() {
     this.updateState({
-      connected: true,
-      phase: 'connected',
+      connected: false,
+      phase: 'connecting',
       retryAt: null,
       mode: this.options.transport || 'tcp',
       transport: this.activeTransport(),
@@ -247,6 +274,7 @@ class ReceiverClient extends EventEmitter {
       baudRate: this.options.serialBaudRate,
       lastError: null,
     });
+    this.startLogWatchdog(this.socket || this.port);
   }
 
   onData(chunk) {
@@ -260,6 +288,8 @@ class ReceiverClient extends EventEmitter {
     if (transport === this.port) this.port = null;
     clearTimeout(this.probeTimer);
     this.probeTimer = null;
+    clearTimeout(this.logTimer);
+    this.logTimer = null;
     this.autoTarget = 'serial';
     this.updateState({ connected: false, phase: this.stopped ? 'stopped' : 'waiting', retryAt: null });
     this.scheduleReconnect();

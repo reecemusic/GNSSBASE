@@ -894,7 +894,7 @@ test('auto transport tries serial first and falls back to TCP when serial does n
 
   ports[1].isOpen = true;
   ports[1].openCallback(null);
-  assert.equal(receiver.state.connected, true);
+  assert.equal(receiver.state.connected, false, 'An open port is not proof of a live receiver');
   const probe = timers.filter((timer) => !timer.cleared && timer.ms === 5000).pop();
   probe.callback();
   assert.equal(sockets.length, 2, 'A silent serial port falls back to TCP');
@@ -907,10 +907,126 @@ test('auto transport tries serial first and falls back to TCP when serial does n
   ports[2].openCallback(null);
   const healthyProbe = timers.filter((timer) => !timer.cleared && timer.ms === 5000).pop();
   ports[2].emit('data', Buffer.from('%ITDETECTSTATUSA,2200,1;0\n'));
+  assert.equal(receiver.state.connected, true);
   assert(healthyProbe.cleared, 'A decodable log keeps the serial connection');
   assert.equal(sockets.length, 2);
   assert.equal(receiver.state.transport, 'serial');
   receiver.stop();
+});
+
+test('silent receivers recover after a power cycle even when the transport stays open', async (t) => {
+  for (const mode of ['serial', 'tcp', 'auto']) {
+    await t.test(mode, () => {
+      const ports = [];
+      const sockets = [];
+      const timers = [];
+      class FakePort extends EventEmitter {
+        constructor() {
+          super();
+          this.commands = [];
+          ports.push(this);
+        }
+        open(callback) { this.openCallback = callback; }
+        write(command) { this.commands.push(command); }
+        close(callback) { this.isOpen = false; callback(); }
+      }
+      const context = vm.createContext({
+        Buffer, module: { exports: {} }, console: { warn() {} },
+        setTimeout(callback, ms) {
+          const timer = { callback, ms, cleared: false };
+          timers.push(timer);
+          return timer;
+        },
+        clearTimeout(timer) { if (timer) timer.cleared = true; },
+        require: (name) => name === 'serialport' ? { SerialPort: FakePort }
+          : name === 'node:net' ? {
+            createConnection() {
+              const socket = Object.assign(new EventEmitter(), {
+                commands: [], destroyed: false,
+                setKeepAlive() {}, setTimeout() {},
+                write(command) { this.commands.push(command); },
+                destroy() { this.destroyed = true; },
+              });
+              sockets.push(socket);
+              return socket;
+            },
+          } : name === './novatel' ? require('../src/novatel') : require(name),
+      });
+      vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'src', 'receiver.js'), 'utf8'), context);
+      const receiver = new context.module.exports.ReceiverClient({
+        transport: mode, serialPath: 'COM11', serialBaudRate: 9600, serialProbeMs: 5000,
+        receiverHost: '127.0.0.1', receiverPort: 3001, reconnectDelayMs: 3000, idleTimeoutMs: 30000,
+      });
+      const statuses = [];
+      receiver.on('status', (status) => statuses.push(status));
+      const open = () => {
+        const transport = receiver.port || receiver.socket;
+        if (receiver.port) {
+          transport.isOpen = true;
+          transport.openCallback(null);
+        } else {
+          transport.emit('connect');
+        }
+        assert.equal(receiver.state.connected, false, 'Opening a port must not claim receiver health');
+        return transport;
+      };
+      const report = Buffer.from('%ITDETECTSTATUSA,2200,1;0\n');
+      const latestTimer = (ms) => timers.filter((timer) => !timer.cleared && timer.ms === ms).pop();
+      receiver.start();
+      const original = open();
+      original.emit('data', report);
+      assert.equal(receiver.state.connected, true);
+      const firstWatchdog = latestTimer(30000);
+      original.emit('data', report);
+      assert(firstWatchdog.cleared, 'Fresh logs reset the idle deadline');
+      const watchdog = latestTimer(30000);
+      original.emit('data', Buffer.from('receiver booting\n%ITDETECTSTATUSA,2200,1;0*invalid\n'));
+      assert.equal(latestTimer(30000), watchdog, 'Boot chatter and CRC failures cannot keep a dead stream connected');
+      original.emit('data', Buffer.from('%BESTSATSA,2200,1;0\n'));
+      assert.equal(latestTimer(30000), watchdog, 'Other profile logs cannot mask a lost periodic interference request');
+      assert.equal(watchdog.ms, 30000);
+      watchdog.callback();
+      assert(statuses.some((status) => !status.connected && /No valid ITDETECTSTATUS logs/.test(status.lastError)));
+      assert.equal(receiver.state.connected, false);
+      if (mode === 'auto') {
+        assert.equal(receiver.state.transport, 'tcp', 'Silent USB falls back to TCP');
+        assert.equal(original.isOpen, false);
+        const fallback = open();
+        fallback.emit('data', report);
+        assert.equal(receiver.state.connected, true);
+        latestTimer(30000).callback();
+        assert(fallback.destroyed);
+      } else if (mode === 'serial') {
+        assert.equal(original.isOpen, false);
+      } else {
+        assert(original.destroyed);
+      }
+      assert.equal(receiver.state.phase, 'waiting');
+      assert.equal(latestTimer(3000).ms, 3000);
+      latestTimer(3000).callback();
+      assert.equal(receiver.state.transport, mode === 'tcp' ? 'tcp' : 'serial');
+      const recovered = open();
+      assert.notEqual(recovered, original);
+      assert.equal(recovered.commands.filter((command) => command === 'LOG ITDETECTSTATUSA ONTIME 1\r\n').length, 1,
+        'Reconnect restores the periodic interference log lost on reboot');
+      assert(recovered.commands.includes('LOG BESTSATSA ONTIME 1\r\n'));
+      assert(recovered.commands.includes('LOG TRACKSTATA ONTIME 5\r\n'));
+      original.emit('close');
+      original.emit('data', report);
+      assert.equal(receiver.state.connected, false, 'Late events from an old transport cannot mark the new one connected');
+      recovered.emit('data', report);
+      assert.equal(receiver.state.connected, true);
+      assert.equal(receiver.state.lastError, null);
+      const activeWatchdog = latestTimer(30000);
+      receiver.disconnect();
+      assert(activeWatchdog.cleared, 'Manual disconnect cancels monitoring');
+      activeWatchdog.callback();
+      assert.equal(receiver.state.phase, 'stopped');
+      assert.equal(receiver.state.connected, false);
+      assert.equal(receiver.reconnectTimer, null);
+      assert.equal(ports.length + sockets.length, mode === 'auto' ? 3 : 2);
+    });
+  }
 });
 
 test('receiver isolates valid logs, reports connection state and disconnects cleanly', async () => {

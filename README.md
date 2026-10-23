@@ -12,12 +12,19 @@ npm start                       # tries COM11 @ 9600, then 20.20.20.50:3001; UI 
 
 ## What is displayed
 
-The connection box is green when the receiver port is open, amber while connecting,
+The connection box is green once receiver logs arrive, amber while connecting,
 retrying or processing a connection command, and red when disconnected or the monitor
 server is unreachable. Its label explains the current state, active serial/TCP target,
 automatic TCP fallback and retry countdown. **Disconnect** stops automatic retries;
 **Connect** starts them again. Editing connection settings shows **Apply & reconnect**;
 changes only take effect when that button is pressed.
+An open port alone does not count as connected. If valid periodic ITDETECTSTATUS logs stop for
+`NOVATEL_IDLE_MS` (30 seconds by default), the monitor closes the stale serial or TCP
+connection and reconnects automatically, requesting the live logs again. In auto
+mode a silent serial connection falls back to TCP; subsequent retry cycles try
+serial first again. This also recovers when a receiver power cycle leaves its USB
+serial port open without emitting a disconnect event, or resumes other profile
+logs without restoring the monitor's periodic interference-log request.
 
 | Tab | Logs |
 | --- | --- |
@@ -343,7 +350,7 @@ Band cards and statistics remain live-only.
 | `NOVATEL_HOST` / `NOVATEL_PORT` | `20.20.20.50` / `3001` | Receiver ICOM endpoint (TCP) |
 | `NOVATEL_SEND_LOG_CMD` | `false` | When `true`, sends `UNLOGALL THISPORT` plus its own `LOG ...A` requests on connect. Leave `false` when the receiver is running [profiles/GNSSBASE.txt](profiles/GNSSBASE.txt), which already pushes these logs to ICOM1 — `UNLOGALL THISPORT` would remove them. |
 | `NOVATEL_RECONNECT_MS` | `3000` | Reconnect delay |
-| `NOVATEL_IDLE_MS` | `30000` | Recycle the socket if no data arrives for this long |
+| `NOVATEL_IDLE_MS` | `30000` | Reconnect serial or TCP if no valid ITDETECTSTATUS logs arrive for this long; TCP also times out when no bytes arrive |
 | `WEB_HOST` / `WEB_PORT` | `127.0.0.1` / `8080` | Web UI bind address. Localhost by default; the UI has no authentication. |
 | `HISTORY_SIZE` / `RAW_LOG_SIZE` | `50` / `200` | Replay buffers sent to a newly opened browser |
 | `HISTORY_RETENTION_MIN` | `1440` | How far back skyplot traces and the interference timeline are kept. This is the longest window a browser can select. |

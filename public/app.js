@@ -251,7 +251,7 @@ function renderConnectionBar() {
     detail = 'This page lost contact with the local server — retrying…';
   } else if (phase === 'connected') {
     title = 'Connected';
-    detail = `Receiver port open via ${connectionTarget(status)}`
+    detail = `Receiving receiver logs via ${connectionTarget(status)}`
       + (auto && status.transport === 'tcp' ? ' · USB serial unavailable, using TCP fallback' : '');
   } else if (phase === 'stopped') {
     title = 'Disconnected';

@@ -58,7 +58,8 @@ const config = {
   idleTimeoutMs: integerSetting('NOVATEL_IDLE_MS', 30000, 1),
 
   // Local web UI.
-  webHost: process.env.WEB_HOST || '127.0.0.1',
+ // webHost: process.env.WEB_HOST || '127.0.0.1',
+  webHost: process.env.WEB_HOST || '0.0.0.0',
   webPort: integerSetting('WEB_PORT', 8080, 0, 65535),
 
   // How many recent ITDETECTSTATUS messages to replay to a newly opened browser.
