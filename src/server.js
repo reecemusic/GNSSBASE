@@ -146,7 +146,10 @@ let lastStatusLog = '';
  * @emits none
  */
 receiver.on('status', (state) => {
-  latestStatus = state;
+  // A live link clears a manual stop. Disconnect publishes connected false, so
+  // the stop record set just before disconnect() survives that event.
+  if (state.connected) clearManualStop();
+  latestStatus = withMonitorFields(state);
   const target = state.transport === 'serial'
     ? `${state.serialPath} @ ${state.baudRate}`
     : `${state.host}:${state.port}`;
@@ -155,7 +158,7 @@ receiver.on('status', (state) => {
   // check and print on every reconnect. Those changes share one rate-limit bucket.
   if (line !== lastStatusLog) logLimited('log', 'receiver-status', line);
   lastStatusLog = line;
-  broadcast('status', state);
+  broadcast('status', latestStatus);
 });
 
 /**
@@ -445,6 +448,7 @@ function snapshot() {
     satvisBySystem: store.satvisBySystem,
     rawLog: store.rawLog,
     historyRetentionMinutes: config.historyRetentionMinutes,
+    interferenceHoldSec: config.interferenceHoldSeconds,
     archive: archive.status(),
   };
 }
@@ -682,6 +686,98 @@ function connectionSettings() {
   };
 }
 
+// Set by POST /api/disconnect and cleared when the receiver connects again
+// or when POST /api/connection starts a new session. resumeAt is null unless
+// MONITOR_RESUME_MIN is greater than 0.
+let manualStop = null;
+let manualResumeTimer = null;
+
+/**
+ * Drops a pending auto-resume and forgets the manual stop.
+ * @returns {void}
+ * Side effects: manualStop and manualResumeTimer. events: none.
+ */
+function clearManualStop() {
+  manualStop = null;
+  if (manualResumeTimer) {
+    clearTimeout(manualResumeTimer);
+    manualResumeTimer = null;
+  }
+}
+
+/**
+ * Starts the receiver after MONITOR_RESUME_MIN when that setting is on.
+ * @returns {void}
+ * Side effects: manualResumeTimer. The timer calls receiver.start and clears the stop. events: none.
+ */
+function armManualResume() {
+  if (manualResumeTimer) {
+    clearTimeout(manualResumeTimer);
+    manualResumeTimer = null;
+  }
+  if (!manualStop || !Number.isFinite(manualStop.resumeAt)) return;
+  const delay = Math.max(0, manualStop.resumeAt - Date.now());
+  manualResumeTimer = setTimeout(() => {
+    manualResumeTimer = null;
+    manualStop = null;
+    receiver.start();
+  }, delay);
+  if (typeof manualResumeTimer.unref === 'function') manualResumeTimer.unref();
+}
+
+/**
+ * Copies receiver status and adds the manual-stop record and the hold setting.
+ * The receiver's own object is not modified.
+ * @param {object} state Status emitted by the receiver.
+ * @returns {object}
+ * Side effects: none. events: none.
+ */
+function withMonitorFields(state) {
+  return {
+    ...state,
+    manualStop: manualStop ? { ...manualStop } : null,
+    interferenceHoldSec: config.interferenceHoldSeconds,
+  };
+}
+
+/**
+ * Client address without the IPv4-mapped IPv6 prefix.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {string} Empty when the socket has no remote address.
+ * Side effects: none. events: none.
+ */
+function clientAddress(req) {
+  const raw = req && req.socket && req.socket.remoteAddress ? String(req.socket.remoteAddress) : '';
+  return raw.startsWith('::ffff:') ? raw.slice(7) : raw;
+}
+
+/**
+ * True when this request may change the receiver connection.
+ * Loopback is always allowed. Other addresses need ALLOW_REMOTE_CONTROL=true.
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {boolean}
+ * Side effects: none. events: none.
+ */
+function controlAllowed(req) {
+  if (config.allowRemoteControl) return true;
+  const address = clientAddress(req);
+  return address === '127.0.0.1' || address === '::1';
+}
+
+/**
+ * Finishes a 403 when the client may not change the connection.
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @returns {boolean} True when the caller must return without doing the action.
+ * Side effects: writes 403 when control is refused. events: none.
+ */
+function rejectRemoteControl(req, res) {
+  if (controlAllowed(req)) return false;
+  res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('Connection changes are only accepted from this computer.');
+  return true;
+}
+
 /**
  * Writes the current connection fields through config.saveConnectionSettings.
  * @returns {string|null} Null when the save returns. On throw, the string
@@ -749,11 +845,26 @@ function handleRequest(req, res) {
   const route = (req.url || '/').split('?')[0];
   if (route === '/api/connection' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(connectionSettings()));
+    // control is per request. A LAN viewer gets the same host and port but
+    // control false, so the page can show the values without offering Disconnect.
+    res.end(JSON.stringify({
+      ...connectionSettings(),
+      control: controlAllowed(req),
+      interferenceHoldSec: config.interferenceHoldSeconds,
+      monitorResumeMin: config.monitorResumeMinutes,
+    }));
     return;
   }
 
   if (route === '/api/disconnect' && req.method === 'POST') {
+    if (rejectRemoteControl(req, res)) return;
+    const at = Date.now();
+    manualStop = {
+      at,
+      clientIp: clientAddress(req) || 'unknown',
+      resumeAt: config.monitorResumeMinutes > 0 ? at + config.monitorResumeMinutes * 60000 : null,
+    };
+    armManualResume();
     /**
      * Answers 200 after receiver.disconnect resolves.
      * @returns {void}
@@ -778,6 +889,9 @@ function handleRequest(req, res) {
   }
 
   if (route === '/api/connection' && req.method === 'POST') {
+    if (rejectRemoteControl(req, res)) return;
+    // Applying settings is an intentional start, so a previous manual stop ends.
+    clearManualStop();
     /**
      * Applies a connection change. Invalid fields answer 400 before reconfigure.
      * @param {object} settings Body from readJsonBody.
@@ -862,6 +976,8 @@ function handleRequest(req, res) {
    * @emits none
    */
   if (route === '/api/serial-ports' && req.method === 'GET') {
+    // Listing ports is part of connection settings. Remote viewers do not need it.
+    if (rejectRemoteControl(req, res)) return;
     /**
      * Writes the port list. The map keeps path and manufacturer.
      * @param {object[]} ports

@@ -807,6 +807,9 @@ class InterferenceArchive extends EventEmitter {
     this.stuckHandles = 0;
     this.autoTimer = null;
     this.autoState = { lastRunAt: null, nextRunAt: null, lastError: null };
+    // Clock time of the last listing or scan that reached the share. An error
+    // leaves this alone so the page can say when the NAS was last reachable.
+    this.lastReachableAt = null;
     this.stream = null;
     this.cancelScan = null;
     this.lastProgressAt = 0;
@@ -966,6 +969,7 @@ class InterferenceArchive extends EventEmitter {
         refreshMs: this.options.refreshMs,
         ...this.autoState,
       },
+      lastReachableAt: this.lastReachableAt,
     };
   }
 
@@ -1005,6 +1009,11 @@ class InterferenceArchive extends EventEmitter {
    */
   update(patch, force = false) {
     Object.assign(this.state, patch);
+    // Listing the folder or finishing a scan means the share answered. A later
+    // error keeps this timestamp. idle and error do not move it.
+    if (patch.state === 'ready' || patch.state === 'scanning' || patch.state === 'cancelled') {
+      this.lastReachableAt = this.options.now();
+    }
     const now = Date.now();
     if (!force && now - this.lastProgressAt < PROGRESS_INTERVAL_MS) return;
     this.lastProgressAt = now;
