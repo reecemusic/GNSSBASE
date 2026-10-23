@@ -478,18 +478,19 @@ test('BESTSATS freshness and same-epoch disagreement are visible without alterin
   context.latestByName.BESTPOS = { header: { utc }, data: { satellitesUsed: 2 } };
   context.renderSkyplot();
   assert.equal(context.elements.get('sv-used').textContent, 1, 'do not fabricate identities to match BESTPOS');
-  assert.match(context.elements.get('sv-status-note').textContent, /old.*not live/);
-  assert.match(context.elements.get('sv-status-note').textContent, /same-epoch BESTPOS reports 2/);
+  assert.match(context.elements.get('sv-warnings').textContent, /old.*not live/);
+  assert.match(context.elements.get('sv-warnings').textContent, /same-epoch BESTPOS reports 2/i);
+  assert.doesNotMatch(context.elements.get('sv-status-note').textContent, /WARNING|s old/);
   context.latestByName.BESTPOS.header.utc = new Date(now - 1000).toISOString();
   context.latestByName.BESTSATS.receivedAt = utc;
   context.renderSkyplot();
-  assert.doesNotMatch(context.elements.get('sv-status-note').textContent, /WARNING/);
+  assert.doesNotMatch(context.elements.get('sv-warnings').textContent, /old|BESTPOS reports/);
   clock = now + 4999;
   context.renderSkyplot();
-  assert.doesNotMatch(context.elements.get('sv-status-note').textContent, /WARNING/);
+  assert.doesNotMatch(context.elements.get('sv-warnings').textContent, /s old/);
   clock = now + 5000;
   context.renderSkyplot();
-  assert.match(context.elements.get('sv-status-note').textContent, /5 s old/);
+  assert.match(context.elements.get('sv-warnings').textContent, /5 s old/);
 });
 
 /** Catches a split BESTSATSA frame that is emitted early or that drops the valid frame after it. */

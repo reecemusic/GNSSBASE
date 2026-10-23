@@ -12,7 +12,7 @@ npm start                       # tries COM11 @ 9600, then 20.20.20.50:3001; UI 
 
 `npm start` runs `node src/start.js`, which sets `UV_THREADPOOL_SIZE` to 16 when the variable is not already set, then loads the server. Set the variable in the service environment if you want a different pool size. It has to be set before the process uses the filesystem; changing it later does nothing.
 
-Other devices on the same network can open `http://<PC IP>:8080`. Windows Firewall will prompt to allow Node on private networks. The UI has no authentication, and the settings panel can change the receiver connection, so anyone on the network can do that. Set `WEB_HOST=127.0.0.1` to restrict the page to this PC.
+Other devices on the same network can open `http://<PC IP>:8080`. Windows Firewall will prompt to allow Node on private networks. The page is readable from the LAN. Connect, disconnect, and apply are accepted only from this PC (`127.0.0.1` / `::1`) unless `ALLOW_REMOTE_CONTROL=true`. Set `WEB_HOST=127.0.0.1` to keep the page on this PC as well.
 
 ## Running always-on
 
@@ -285,18 +285,21 @@ plot rows. Other bands (L6, SBAS, …) appear only while they have detections.
 - To open it directly on the TV browser, bookmark `http://<server>:8080/?wall=1`
   (press F11 for full screen when opening from a bookmark). The button removes the
   parameter and returns to the normal page; Esc does not exit wall mode.
-- Text and plots scale with the screen (about 20 px base text at 1080p, 40 px at 4K), so
-  the page fits one screen with no scrolling. Use the TV at 100 % browser zoom.
+- Text scales with spare width and is capped by screen height, so a 1080-tall wall stays about 22 px at 1920 and about 24 px at 2560 or 3840 rather than growing to 40 px and pushing the plots off the screen. The satellite table and band pills stay at 1.1 rem. History and Exit wall display stay hidden until the mouse moves. The antenna warning is one line in the banner, and the main-view status pills are not repeated on the wall.
 - The plot opens on the live view (the same as **View → Live**), following current time
   over the history window, including any loaded archive.
 - The banner shows seconds since the last status update and the status-message counter,
-  even when every report is clear. It checks freshness every second: after more than
-  5 seconds without a fresh valid ITDETECTSTATUS report, the green verdict is replaced
-  by a device error and the band cards stop claiming to be clear. A known receiver or
-  live-server disconnection also shows an error. Fresh reports restore the live verdict.
-- To keep the plot as large as possible, wall mode hides the satellites-used and fix-type
-  rows, the frequency plots, connection settings, archive panel, navigation controls and
-  the recent changes list.
+  even when every report is clear. Freshness is checked every second on every tab.
+  After more than 5 seconds without a fresh valid ITDETECTSTATUS report, the green
+  verdict is replaced by a device error and the band cards stop claiming to be clear.
+  A detection is held red for `INTERFERENCE_HOLD_SEC` (default 30 s) so a clear report
+  between bursts does not flip the banner. After the hold, hits in the last 5 minutes
+  show as intermittent. A manual Disconnect says monitoring was stopped, which is
+  separate from a receiver fault. A known receiver or live-server disconnection still
+  shows an error. Fresh reports restore the live verdict.
+- The wall banner includes one position tile (RTK fixed, degraded, or stale). The big
+  satellites-used and fix-type plot rows stay hidden, as do the frequency plots,
+  connection settings, archive panel, navigation controls and the recent changes list.
 - **Satellites tracked** (under the power plot) is per constellation, plus a total tracked
   line and a dashed total in view. It is filled from `data/history.json`, not only from
   reports since the page opened, including after a heap reload or a stream reconnect.
@@ -396,7 +399,10 @@ Band cards and statistics remain live-only.
 | `NOVATEL_SEND_LOG_CMD` | `false` | When `true`, sends `UNLOGALL THISPORT` plus its own `LOG ...A` requests on connect. Leave `false` when the receiver is running [profiles/GNSSBASE.txt](profiles/GNSSBASE.txt), which already pushes these logs to ICOM1 — `UNLOGALL THISPORT` would remove them. |
 | `NOVATEL_RECONNECT_MS` | `3000` | Reconnect delay |
 | `NOVATEL_IDLE_MS` | `30000` | Reconnect serial or TCP if no valid ITDETECTSTATUS logs arrive for this long; TCP also times out when no bytes arrive |
-| `WEB_HOST` / `WEB_PORT` | `0.0.0.0` / `8080` | Web UI bind address. `0.0.0.0` accepts connections from other devices. The UI has no authentication. Set `WEB_HOST=127.0.0.1` to listen on localhost only. |
+| `WEB_HOST` / `WEB_PORT` | `0.0.0.0` / `8080` | Web UI bind address. `0.0.0.0` accepts connections from other devices. The page has no login. Connect, disconnect, and apply are limited to this PC unless `ALLOW_REMOTE_CONTROL=true`. Set `WEB_HOST=127.0.0.1` to listen on localhost only. |
+| `ALLOW_REMOTE_CONTROL` | off | Set to `true` to let a LAN browser change the connection. Default: only `127.0.0.1` and `::1`. |
+| `INTERFERENCE_HOLD_SEC` | `30` | Seconds the interference banner stays red after the last detection. `0` follows the latest report only. |
+| `MONITOR_RESUME_MIN` | `0` | After Disconnect, start monitoring again after this many minutes. `0` leaves it stopped. |
 | `HISTORY_SIZE` / `RAW_LOG_SIZE` | `50` / `200` | Replay buffers sent to a newly opened browser |
 | `HISTORY_RETENTION_MIN` | `1440` | How far back skyplot traces and the interference timeline are kept. This is the longest window a browser can select. |
 | `TRACK_SAMPLE_SEC` | `20` | Minimum spacing between skyplot trace samples per satellite |

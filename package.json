@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/start.js",
     "sim": "node tools/simulator.js",
-    "test": "node --test tools/memory.test.js tools/archive.test.js tools/solution.test.js tools/robustness.test.js tools/uptime.test.js"
+    "test": "node --test tools/memory.test.js tools/archive.test.js tools/solution.test.js tools/robustness.test.js tools/uptime.test.js tools/usability.test.js"
   },
   "engines": {
     "node": ">=22"

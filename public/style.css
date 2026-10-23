@@ -82,8 +82,9 @@ h2:first-child { margin-top: 0; }
   transition: border-color .2s, background .2s;
 }
 .connection-bar.conn-connected { --conn-color: var(--ok); }
-.connection-bar.conn-connecting, .connection-bar.conn-waiting, .connection-bar.conn-disconnecting { --conn-color: var(--warn); }
-.connection-bar.conn-stopped, .connection-bar.conn-offline { --conn-color: var(--bad); }
+.connection-bar.conn-connecting, .connection-bar.conn-disconnecting { --conn-color: var(--warn); }
+.connection-bar.conn-waiting, .connection-bar.conn-stopped, .connection-bar.conn-offline { --conn-color: var(--bad); }
+.connection-bar.conn-manual-stop { --conn-color: #7aa2ff; }
 .connection-state { display: flex; align-items: center; gap: .6rem; min-width: 15rem; max-width: 26rem; align-self: center; }
 .conn-light { flex: none; width: .85rem; height: .85rem; border-radius: 50%; background: var(--conn-color); box-shadow: 0 0 10px var(--conn-color); }
 .conn-stopped .conn-light { box-shadow: none; background: transparent; border: 2px solid var(--conn-color); }
@@ -122,7 +123,42 @@ h2:first-child { margin-top: 0; }
 .connection-bar button:disabled { cursor: not-allowed; opacity: .75; }
 .connection-bar button:not(:disabled):hover { filter: brightness(1.12); }
 #connection-message { min-height: 1.4rem; align-self: center; color: var(--bad); font-size: .78rem; }
-.status.connecting .dot, .status.waiting .dot, .status.disconnecting .dot { background: var(--warn); }
+.status.connecting .dot, .status.disconnecting .dot { background: var(--warn); }
+.status.waiting .dot, .status.stopped .dot, .status.offline .dot { background: var(--bad); box-shadow: 0 0 8px var(--bad); }
+.status.manual-stop .dot { background: #7aa2ff; box-shadow: 0 0 8px #7aa2ff; }
+#connection-settings { display: flex; flex-wrap: wrap; align-items: end; gap: .75rem 1rem; flex: 1 1 100%; }
+#connection-settings[hidden] { display: none; }
+.connection-note { flex: 1 1 100%; margin: 0; color: var(--muted); font-size: .8rem; }
+#connection-settings-toggle { align-self: center; }
+.status-row { display: flex; flex-wrap: wrap; gap: .4rem .6rem; margin: 0 0 .75rem; }
+.status-chip { display: inline-flex; align-items: center; gap: .35rem; padding: .15rem .55rem; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); font-size: .75rem; background: var(--panel); }
+.status-chip::before { content: ''; width: .45rem; height: .45rem; border-radius: 50%; background: currentColor; }
+.status-chip.ok { color: var(--ok); border-color: var(--ok); }
+.status-chip.warn { color: var(--warn); border-color: var(--warn); }
+.status-chip.bad { color: var(--bad); border-color: var(--bad); }
+.status-chip.manual { color: #7aa2ff; border-color: #7aa2ff; }
+.health-warning { margin: 0 0 .6rem; padding: .45rem .75rem; border: 1px solid var(--warn); border-radius: 8px; background: rgba(255, 176, 46, .12); color: var(--warn); font-size: .85rem; }
+.health-warning[hidden] { display: none; }
+.tab-dot { display: inline-block; width: .45rem; height: .45rem; margin-left: .25rem; border-radius: 50%; background: var(--warn); vertical-align: middle; }
+.tab-dot.bad { background: var(--bad); }
+.tab-dot[hidden] { display: none; }
+.display-info-link { background: transparent; color: var(--muted); border: none; font-size: .75rem; padding: .2rem .35rem; }
+.display-info { margin: 0 0 .6rem; padding: .55rem .75rem; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); font-size: .8rem; }
+.display-info[hidden] { display: none; }
+.display-info p { margin: .15rem 0; }
+.display-info .label { color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-size: .68rem; margin-right: .4rem; }
+.display-info code { color: var(--text); }
+.sv-warnings { display: flex; flex-direction: column; gap: .35rem; margin: .4rem 0 .8rem; }
+.sv-warning { margin: 0; padding: .35rem .6rem; border: 1px solid var(--warn); border-radius: 6px; background: rgba(255, 176, 46, .1); color: var(--warn); font-size: .85rem; }
+.quality.stale { border-color: var(--muted); color: var(--muted); background: transparent; }
+.stale-fix .value { color: var(--muted); }
+#satellite-view-panel.stale, #satellite-view-panel.stale .satellite-signal-table { color: var(--muted); }
+.zoom-hint { margin: .2rem 0 .4rem; color: var(--warn); }
+.pill { cursor: default; }
+.pill.active { border-color: var(--bad); color: var(--bad); background: rgba(255, 95, 86, .12); font-weight: 600; }
+.pill.recent { border-color: var(--warn); color: var(--warn); }
+.band.recent { border-top-color: var(--warn); }
+.band.active { border-top-color: var(--bad); }
 .history-control { display: flex; align-items: center; gap: .4rem; color: var(--muted); font-size: .75rem; text-transform: uppercase; letter-spacing: .06em; }
 .checkbox { display: flex; align-items: center; gap: .35rem; color: var(--muted); font-size: .75rem; text-transform: none; letter-spacing: 0; font-weight: 400; cursor: pointer; }
 .checkbox input { accent-color: var(--accent); }
@@ -521,6 +557,8 @@ select {
 .spectrum-detection.archive { stroke-dasharray: 2 1; }
 
 .band-stats { margin-top: .55rem; font-size: .72rem; color: var(--muted); border-top: 1px solid var(--line); padding-top: .45rem; }
+.wall .band-stats { font-size: 1.1rem; }
+.wall .band-range, .wall .pill, .wall .chip { font-size: 1.1rem; }
 .band-stats.has-hits { color: var(--warn); }
 .interference-summary { margin-bottom: .25rem; }
 .interference-summary .value { font-size: 1rem; }
@@ -556,6 +594,13 @@ select {
 .banner.device-error { border-color: var(--bad); background: rgba(255, 95, 86, .1); }
 .banner.device-error .banner-icon { background: var(--bad); }
 .banner.device-error .banner-title { color: var(--bad); }
+.banner.intermittent { border-color: var(--warn); background: rgba(255, 176, 46, .1); }
+.banner.intermittent .banner-icon { background: var(--warn); box-shadow: 0 0 10px var(--warn); }
+.banner.intermittent .banner-title { color: var(--warn); }
+.banner.manual-stop { border-color: #7aa2ff; background: rgba(122, 162, 255, .1); }
+.banner.manual-stop .banner-icon { background: #7aa2ff; }
+.banner.manual-stop .banner-title { color: #7aa2ff; }
+#wall-position { display: none; }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
@@ -640,14 +685,29 @@ button:hover { background: #3a4353; }
 .wall-toggle { margin-left: 0; min-height: 1.9rem; font-size: .8rem; border: 1px solid var(--accent); color: var(--accent-hover); background: transparent; }
 .wall-toggle:hover { background: rgba(245, 94, 47, .12); }
 
-/* Root size follows the screen: ~20px at 1080p, ~40px at 4K, so everything sized in rem scales with it. */
-html.wall { font-size: clamp(14px, min(1.05vw, 1.9vh), 64px); }
-html.wall body { font-size: 1rem; height: 100vh; overflow: hidden; display: flex; flex-direction: column; padding: .6rem 1rem .8rem; }
+/* Width may raise the size on a wide wall. Height caps it: a 1080-tall screen
+   stays near 22px at 1920 and about 24px at 2560/3840, not the 40px that pushed
+   the plots off the page. 1.15vw is the width term; 2.25vh is the height cap. */
+html.wall { font-size: clamp(16px, min(1.15vw, 2.25vh), 28px); }
+html.wall body { position: relative; font-size: 1rem; height: 100vh; overflow: hidden; display: flex; flex-direction: column; padding: .6rem 1rem .8rem; }
+/* The banner and the position tile already say interference, fix, and health.
+   The main-view status pills and the full-width warning bar would stack above the plots. */
+html.wall #status-row,
+html.wall #health-warning { display: none !important; }
+/* Antenna warning is the header bar on the main view and one banner line on the wall. */
+html:not(.wall) #it-health-line { display: none !important; }
 html.wall-idle, html.wall-idle * { cursor: none !important; }
+html.wall.wall-idle .history-control,
+html.wall.wall-idle #wall-toggle,
+html.wall.wall-idle #display-info-toggle,
+html.wall.wall-idle #display-info {
+  opacity: 0;
+  pointer-events: none;
+}
 
-.wall body > header { margin-bottom: .5rem; flex: none; }
-.wall h1 { font-size: 1.5rem; }
-.wall .subtitle { font-size: .75rem; }
+.wall body > header { margin-bottom: .35rem; flex: none; }
+.wall h1 { font-size: 1.35rem; line-height: 1.15; }
+.wall .subtitle { font-size: .8rem; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70vw; }
 .wall .history-control { font-size: .75rem; }
 .wall .history-control select { font-size: .85rem; }
 .wall .status { font-size: 1.1rem; }
@@ -658,35 +718,45 @@ html.wall-idle, html.wall-idle * { cursor: none !important; }
 .wall #tab-interference.active {
   display: grid; flex: 1 1 auto; min-height: 0; gap: 0 .9rem;
   grid-template-columns: minmax(0, 1fr) minmax(19rem, 27%);
-  grid-template-rows: auto auto minmax(0, 1.4fr) minmax(11.5rem, .7fr);
+  /* Power plot takes the larger share. The satellite row stays tall enough for its table at 1.1rem. */
+  grid-template-rows: auto auto minmax(0, 1.25fr) minmax(0, 1fr);
 }
 .wall #tab-interference > :not(#it-banner):not(#bands):not(#timeline-heading):not(#timeline):not(#satellite-view-panel) { display: none; }
 .wall #it-banner { grid-column: 1 / -1; grid-row: 1; }
-.wall #timeline-heading { grid-column: 1; grid-row: 2; }
+.wall #timeline-heading { grid-column: 1; grid-row: 2; min-height: 0; }
 .wall #timeline { grid-column: 1; grid-row: 3; height: 100%; min-height: 0; }
-.wall #satellite-view-panel { grid-column: 1; grid-row: 4; }
-.wall #bands { grid-column: 2; grid-row: 2 / 5; }
+.wall #satellite-view-panel { grid-column: 1; grid-row: 4; min-height: 0; }
+.wall #bands { grid-column: 2; grid-row: 2 / 5; min-height: 0; }
 
-.wall .banner { padding: .55rem 1.25rem; gap: .8rem 1.2rem; margin-bottom: .55rem; border-width: 3px; flex: none; }
-.wall .banner-icon { width: 2.2rem; height: 2.2rem; }
-.wall .banner-title { font-size: 2.3rem; line-height: 1.15; font-weight: 700; }
-.wall .banner-detail { font-size: .9rem; line-height: 1.2; margin-top: .08rem; }
-.wall .banner-copy { flex: 1 1 auto; }
-.wall .banner-block-label { font-size: .75rem; }
-.wall .banner-block-value { font-size: 1.05rem; line-height: 1.25; }
-.wall .banner-block-detail { font-size: .85rem; }
+.wall .banner { padding: .4rem 1rem; gap: .45rem 1rem; margin-bottom: .35rem; border-width: 3px; flex: none; align-items: center; }
+.wall .banner-icon { width: 1.6rem; height: 1.6rem; }
+.wall .banner-title { font-size: 1.7rem; line-height: 1.1; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall .banner-detail { font-size: .95rem; line-height: 1.2; margin-top: .05rem; }
+.wall #it-detail { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall .banner-meta { display: flex; gap: .75rem; min-width: 0; align-items: baseline; }
+.wall .banner-meta .banner-detail { margin-top: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall #it-freshness { flex: 1 1 auto; min-width: 0; }
+.wall #it-health-line { flex: 0 1 auto; max-width: 46%; color: var(--warn); }
+.wall .banner-copy { flex: 1 1 auto; min-width: 0; }
+.wall .banner-block-label { font-size: .68rem; }
+.wall .banner-block-value { font-size: .95rem; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wall .banner-block-detail { font-size: .8rem; line-height: 1.15; }
+.wall .banner-clock-extra { display: flex; gap: .55rem; justify-content: flex-end; max-width: 100%; }
+.wall .banner-clock-extra .banner-block-detail { font-size: .72rem; white-space: nowrap; }
+.wall #wall-position { display: flex; }
 .wall .banner-last-detection { flex-basis: 30rem; }
-.wall .banner-clock-time { font-size: 2.6rem; }
+.wall .banner-clock-time { font-size: 1.85rem; line-height: 1; }
+html.wall #display-info { position: absolute; z-index: 4; top: .4rem; right: 1rem; margin: 0; max-width: 34rem; }
 .wall #timeline-heading #timeline-live { flex: none; font-size: .78rem; padding: .2rem .55rem; margin: 0; }
 .wall #satellite-view-panel { display: grid; grid-template-columns: minmax(0, 1fr) minmax(19rem, 40%); min-height: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
 .wall .satellite-view-plot { display: flex; min-width: 0; min-height: 0; flex-direction: column; padding: .2rem .65rem .1rem; }
-.wall .satellite-view-plot h2 { flex: none; margin: 0; font-size: .85rem; }
-.wall #satellite-view-chart { display: block; width: 100%; height: 100%; min-height: 0; }
+.wall .satellite-view-plot h2 { flex: none; margin: 0; font-size: 1.1rem; }
+.wall #satellite-view-chart { display: block; width: 100%; height: auto; flex: 1 1 auto; min-height: 0; }
 .wall .satellite-view-line { stroke-width: 2.5; vector-effect: non-scaling-stroke; }
 .wall .satellite-view-total-line { stroke: var(--text); stroke-width: 3.5; }
 .wall .satellite-view-in-view { stroke: var(--muted); stroke-width: 2; stroke-dasharray: 6 5; }
-.wall .satellite-signal-table { align-self: center; width: 100%; min-width: 0; border-collapse: collapse; border-left: 1px solid var(--line); font-size: .8rem; line-height: 1.2; font-variant-numeric: tabular-nums; }
-.wall .satellite-signal-table th, .wall .satellite-signal-table td { padding: .14rem .5rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+.wall .satellite-signal-table { align-self: stretch; width: 100%; min-width: 0; border-collapse: collapse; border-left: 1px solid var(--line); font-size: 1.1rem; line-height: 1.15; font-variant-numeric: tabular-nums; }
+.wall .satellite-signal-table th, .wall .satellite-signal-table td { padding: .04rem .4rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
 .wall .satellite-signal-table thead th { color: var(--muted); font-size: .65rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; white-space: nowrap; }
 .wall .satellite-signal-table tbody th, .wall .satellite-signal-table tbody td:first-child { white-space: nowrap; font-weight: 600; }
 .wall .satellite-signal-table .satellite-counts { white-space: nowrap; }
