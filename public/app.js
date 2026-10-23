@@ -21,15 +21,6 @@ const MAX_TRACK_SAMPLES = 1081;
 const MAX_TRACKS = 512;
 const MAX_EVENT_CHARS = 8 * 1024 * 1024;
 const INTERFERENCE_STALE_MS = 5000;
-// Replaced by the server's INTERFERENCE_HOLD_SEC once /api/connection or a
-// status event arrives. Sliced tests do not include this binding; callers use typeof.
-let interferenceHoldMs = 30000;
-// A BESTPOS older than this is drawn grey. Same order as the interference stale limit.
-const POSITION_STALE_MS = 5000;
-// Band pill "Recent" covers a hit in this window but outside the red hold.
-const INTERFERENCE_RECENT_MS = 10 * 60 * 1000;
-// Amber intermittent banner uses the hit rate over this window.
-const INTERFERENCE_BURST_MS = 5 * 60 * 1000;
 const liveStatusStartedAt = Date.now();
 const dirtyRecords = new Set();
 const pendingRaw = [];
@@ -117,68 +108,6 @@ function readPreference(key, fallback, parse = (value) => value) {
  * @returns {void}
  * Side effects: localStorage write. On failure, reportClientError. events: none.
  */
-/**
- * IANA zone of this browser, or UTC when Intl cannot answer.
- * @returns {string}
- * Side effects: none. events: none.
- */
-function browserTimeZone() {
-  try {
-    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    if (zone) return zone;
-  } catch { /* keep UTC */ }
-  return 'UTC';
-}
-
-/**
- * City and offset for a zone, for example "Dubai, UTC+4".
- * The offset comes from Intl, not from a hardcoded table.
- * @param {string} zone IANA time zone.
- * @returns {string}
- * Side effects: none. events: none.
- */
-function zoneLabel(zone) {
-  try {
-    const parts = new Intl.DateTimeFormat('en-GB', { timeZone: zone, timeZoneName: 'longOffset' }).formatToParts(new Date());
-    const raw = parts.find((part) => part.type === 'timeZoneName')?.value || '';
-    const offset = raw.replace('GMT', 'UTC').replace(/([+-])0(\d)/, '$1$2').replace(':00', '');
-    if (zone === 'UTC') return offset || 'UTC';
-    const city = zone.split('/').pop().replace(/_/g, ' ');
-    return offset ? `${city}, ${offset}` : city;
-  } catch {
-    return zone;
-  }
-}
-
-/**
- * Turns a thrown message into a sentence and keeps the raw text for a tooltip.
- * @param {string} message Error text from fetch, the receiver, or the archive.
- * @returns {{text: string, raw: string}}
- * Side effects: none. events: none.
- */
-function plainError(message) {
-  const raw = String(message || '');
-  let text = raw;
-  if (/ECONNREFUSED/i.test(raw)) {
-    text = 'The receiver refused the connection. Check that it is powered on and that the IP address and port are correct.';
-  } else if (/ETIMEDOUT|timed out|Timeout/i.test(raw)) {
-    text = 'The receiver did not answer in time. Check the network path, then try again.';
-  } else if (/ENOTFOUND|EHOSTUNREACH|ENETUNREACH/i.test(raw)) {
-    text = 'That address could not be reached. Check the IP address and the network.';
-  } else if (/ENOENT/i.test(raw)) {
-    text = 'That folder was not found. Check the network path and that the share is available from this PC.';
-  } else if (/EACCES|EPERM/i.test(raw)) {
-    text = 'The monitor could not read that folder. Check the share permissions.';
-  } else if (/serial-ports|Could not list serial ports/i.test(raw)) {
-    text = 'Serial ports could not be listed. If you use USB, check that the receiver is plugged into this computer.';
-  } else if (/Request failed \(403\)/i.test(raw) || /only accepted from this computer/i.test(raw)) {
-    text = 'This screen cannot change the connection. Use the computer that runs the monitor.';
-  } else if (/Request failed \(500\)/i.test(raw)) {
-    text = 'The monitor could not complete that request. Try again, or check the server window for the detail.';
-  }
-  return { text, raw };
-}
-
 function writePreference(key, value) {
   // localStorage setItem. A throw is reported and otherwise ignored.
   try {
@@ -238,8 +167,6 @@ const state = {
   lastDetection: null,
   hiddenSystems: readHiddenPreference('hiddenSystems'),
   hiddenSignals: readHiddenPreference('hiddenSignals'),
-  // Asia/Dubai is the kiosk default. The menu label is still taken from Intl
-  // (zoneLabel), so the offset is not a hardcoded "+04:00" string.
   timeZone: readPreference('timeZone', 'Asia/Dubai', (zone) => {
     new Intl.DateTimeFormat('en-GB', { timeZone: zone });
     return zone;
@@ -256,33 +183,13 @@ const state = {
 
 document.querySelectorAll('.tab').forEach((tab) => {
   tab.addEventListener('click', () => {
-    document.querySelectorAll('.tab').forEach((item) => {
-      item.classList.remove('active');
-      item.setAttribute('aria-selected', 'false');
-    });
-    document.querySelectorAll('.panel').forEach((panel) => panel.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
+    document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
     tab.classList.add('active');
-    tab.setAttribute('aria-selected', 'true');
     $(`tab-${tab.dataset.tab}`).classList.add('active');
-    // Wall mode forces the Interference tab. Remember the tab the operator chose
-    // on the main page, not that temporary switch.
-    if (!state.wall) writePreference('activeTab', tab.dataset.tab);
     // Leaflet mis-sizes tiles when the container was display:none at creation.
     if (tab.dataset.tab === 'position' && map) map.invalidateSize();
     flushUpdates(true);
-  });
-  tab.addEventListener('keydown', (event) => {
-    const tabs = [...document.querySelectorAll('.tab')];
-    const index = tabs.indexOf(tab);
-    let next = null;
-    if (event.key === 'ArrowRight') next = tabs[(index + 1) % tabs.length];
-    else if (event.key === 'ArrowLeft') next = tabs[(index - 1 + tabs.length) % tabs.length];
-    else if (event.key === 'Home') next = tabs[0];
-    else if (event.key === 'End') next = tabs[tabs.length - 1];
-    if (!next) return;
-    event.preventDefault();
-    next.focus();
-    next.click();
   });
 });
 
@@ -347,25 +254,7 @@ for (const eventName of ['input', 'change']) {
   });
 }
 
-/**
- * Asks before Disconnect, Reconnect, or Apply. Connect after a manual stop does not ask.
- * @returns {boolean} False when the operator cancels.
- * Side effects: window.confirm. events: none.
- */
-function confirmMonitorChange() {
-  if (typeof window === 'undefined' || typeof window.confirm !== 'function') return false;
-  return window.confirm('This stops monitoring for all screens.');
-}
-
-$('connection-settings-toggle').addEventListener('click', () => {
-  const panel = $('connection-settings');
-  const open = panel.hidden;
-  panel.hidden = !open;
-  $('connection-settings-toggle').setAttribute('aria-expanded', String(open));
-});
-
 $('disconnect').addEventListener('click', async () => {
-  if (!confirmMonitorChange()) return;
   const message = $('connection-message');
   connection.busy = 'disconnect';
   renderConnectionBar();
@@ -374,9 +263,7 @@ $('disconnect').addEventListener('click', async () => {
     const response = await request('/api/disconnect', { method: 'POST' });
     if (!response.ok) throw new Error(await response.text());
   } catch (error) {
-    const mapped = plainError(error.message);
-    message.textContent = `Disconnect failed: ${mapped.text}`;
-    message.title = mapped.raw;
+    message.textContent = `Disconnect failed: ${error.message}`;
   } finally {
     connection.busy = null;
     renderConnectionBar();
@@ -385,9 +272,6 @@ $('disconnect').addEventListener('click', async () => {
 
 connectionForm.addEventListener('submit', async (event) => {
   event.preventDefault();
-  const label = $('connect').textContent;
-  // "Connect" resumes after a manual stop. The other labels change a live session.
-  if (label !== 'Connect' && !confirmMonitorChange()) return;
   const message = $('connection-message');
   const transport = connectionTransport.value;
   const serial = {
@@ -414,9 +298,7 @@ connectionForm.addEventListener('submit', async (event) => {
     if (!response.ok) throw new Error(await response.text());
     connection.dirty = false;
   } catch (error) {
-    const mapped = plainError(error.message);
-    message.textContent = `Could not apply settings: ${mapped.text}`;
-    message.title = mapped.raw;
+    message.textContent = `Could not apply settings: ${error.message}`;
   } finally {
     connection.busy = null;
     renderConnectionBar();
@@ -465,11 +347,9 @@ function renderConnectionBar() {
   const status = connection.status;
   const phase = connectionPhase();
   const auto = status?.mode === 'auto';
-  const manual = phase === 'stopped' && status?.manualStop && !connection.offline;
   const visualPhase = phase === 'offline' ? phase
     : connection.busy === 'disconnect' ? 'disconnecting'
-      : connection.busy === 'connect' ? 'connecting'
-        : manual ? 'manual-stop' : phase;
+      : connection.busy === 'connect' ? 'connecting' : phase;
   let title;
   let detail;
   if (phase === 'offline') {
@@ -480,9 +360,6 @@ function renderConnectionBar() {
     detail = `Receiving receiver logs via ${connectionTarget(status)}`
       + (auto && status.transport === 'tcp' ? ' · USB serial unavailable, using TCP fallback' : '')
       + (status.lastError ? ` · ${status.lastError}` : '');
-  } else if (phase === 'stopped' && status?.manualStop) {
-    title = 'Monitoring stopped';
-    detail = manualStopDetail(status.manualStop);
   } else if (phase === 'stopped') {
     title = 'Disconnected';
     detail = 'Receiver connection closed. Press Connect to start.';
@@ -496,14 +373,8 @@ function renderConnectionBar() {
   } else {
     const seconds = Number.isFinite(status.retryAt) ? Math.max(0, Math.ceil((status.retryAt - Date.now()) / 1000)) : null;
     title = 'Not connected — retrying';
-    // ECONNREFUSED and the other socket errors are shown as a next step.
-    // The raw text stays on the title so a technician can still read the code.
-    const mapped = status.lastError && typeof plainError === 'function'
-      ? plainError(status.lastError) : { text: status.lastError || '', raw: status.lastError || '' };
-    detail = `${mapped.text || `Lost ${connectionTarget(status)}`}`
+    detail = `${status.lastError || `Lost ${connectionTarget(status)}`}`
       + (seconds !== null ? ` · next attempt in ${seconds} s` : '');
-    const detailNode = $('connection-state-detail');
-    if (detailNode && mapped.raw) detailNode.title = mapped.raw;
   }
 
   if (phase !== 'offline' && connection.busy) {
@@ -528,9 +399,8 @@ function renderConnectionBar() {
 
   const connect = $('connect');
   const disconnect = $('disconnect');
-  const canControl = connection.control !== false;
-  connect.disabled = !canControl || phase === 'offline' || !status || connection.busy !== null;
-  disconnect.disabled = !canControl || phase === 'offline' || !status || connection.busy !== null || phase === 'stopped';
+  connect.disabled = phase === 'offline' || !status || connection.busy !== null;
+  disconnect.disabled = phase === 'offline' || !status || connection.busy !== null || phase === 'stopped';
   connect.textContent = connection.busy === 'connect' ? 'Applying…'
     : connection.dirty ? 'Apply & reconnect'
       : phase === 'connected' ? 'Reconnect'
@@ -542,45 +412,12 @@ function renderConnectionBar() {
       : phase === 'stopped' ? 'Disconnected'
         : 'Stop trying';
 
-  const remoteNote = $('connection-remote-note');
-  if (remoteNote) remoteNote.hidden = canControl;
-  if (!canControl) {
-    for (const id of ['connection-transport', 'serial-path', 'serial-baud-rate', 'receiver-host', 'receiver-port']) {
-      const field = $(id);
-      if (field) field.disabled = true;
-    }
-  }
   const counting = phase === 'waiting' && Number.isFinite(status?.retryAt);
   if (counting && !connectionCountdown) connectionCountdown = setInterval(renderConnectionBar, 1000);
   if (!counting && connectionCountdown) {
     clearInterval(connectionCountdown);
     connectionCountdown = null;
   }
-}
-
-/**
- * Sentence for a manual stop, with the PC clock time and the client address.
- * @param {{at: number, clientIp: string, resumeAt: number|null}} stop
- * @returns {string}
- * Side effects: none. events: none.
- */
-function manualStopDetail(stop) {
-  let when = '';
-  try {
-    const zone = typeof state !== 'undefined' && state.timeZone ? state.timeZone : undefined;
-    when = new Intl.DateTimeFormat('en-GB', {
-      hour: '2-digit', minute: '2-digit', hourCycle: 'h23', timeZone: zone,
-    }).format(new Date(stop.at));
-  } catch {
-    when = '';
-  }
-  const resume = Number.isFinite(stop.resumeAt)
-    ? ` · auto-resume at ${new Intl.DateTimeFormat('en-GB', {
-      hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-      timeZone: typeof state !== 'undefined' && state.timeZone ? state.timeZone : undefined,
-    }).format(new Date(stop.resumeAt))}`
-    : '';
-  return `Monitoring stopped manually at ${when} from ${stop.clientIp} – press Connect${resume}`;
 }
 
 /**
@@ -609,9 +446,7 @@ async function refreshSerialPorts(selectedPath = serialPathSelect.value) {
     serialPathSelect.value = selectedPath || 'COM11';
     if (ports.length === 0) message.textContent = 'No serial ports detected';
   } catch (error) {
-    const mapped = typeof plainError === 'function' ? plainError(error.message) : { text: error.message, raw: error.message };
-    message.textContent = mapped.text;
-    message.title = mapped.raw;
+    message.textContent = error.message;
   }
 }
 
@@ -623,20 +458,14 @@ async function refreshSerialPorts(selectedPath = serialPathSelect.value) {
 async function loadConnectionSettings() {
   try {
     const settings = await request('/api/connection', {}, true);
-    connection.control = settings.control !== false;
-    if (Number.isFinite(settings.interferenceHoldSec)) interferenceHoldMs = settings.interferenceHoldSec * 1000;
     connectionTransport.value = settings.transport;
     $('receiver-host').value = settings.receiverHost;
     $('receiver-port').value = settings.receiverPort;
     $('serial-baud-rate').value = settings.serialBaudRate;
     updateConnectionFields();
-    renderConnectionBar();
-    if (connection.control === false) return;
     await refreshSerialPorts(settings.serialPath);
   } catch (error) {
-    const mapped = plainError(error.message);
-    $('connection-message').textContent = mapped.text;
-    $('connection-message').title = mapped.raw;
+    $('connection-message').textContent = error.message;
   }
 }
 
@@ -736,9 +565,6 @@ function scheduleStreamReconnect() {
  * Side effects: state, latestByName, pending queues, DOM logs, and dirty flags. History copies ITDETECTSTATUS onto latestByName only when crcValid === true, receivedAt is set, and no report is stored yet or this receivedAt is later. events: none.
  */
 function applySnapshot(snap) {
-  if (Number.isFinite(snap.interferenceHoldSec) && typeof interferenceHoldMs !== 'undefined') {
-    interferenceHoldMs = snap.interferenceHoldSec * 1000;
-  }
   if (snap.status) renderStatus(snap.status);
   if (snap.archive) applyArchiveStatus(snap.archive);
   state.counts = snap.counts || {};
@@ -781,12 +607,6 @@ function applySnapshot(snap) {
     const clientNotice = $('client-error');
     if (clientNotice) clientNotice.hidden = true;
   }
-  // Records are stored above. Refresh the banner and the always-visible row now;
-  // renderStatus earlier in this function ran before those records existed.
-  if (typeof renderVerdict === 'function') renderVerdict();
-  if (latestByName.RXSTATUS && typeof publishHealthWarning === 'function') publishHealthWarning(latestByName.RXSTATUS);
-  if (typeof refreshPositionFreshness === 'function') refreshPositionFreshness();
-  if (typeof renderStatusRow === 'function') renderStatusRow();
 }
 
 /**
@@ -940,11 +760,7 @@ function flushUpdates(force = false) {
 function renderStatus(status) {
   connection.status = status;
   connection.offline = false;
-  if (Number.isFinite(status?.interferenceHoldSec) && typeof interferenceHoldMs !== 'undefined') {
-    interferenceHoldMs = status.interferenceHoldSec * 1000;
-  }
   renderConnectionBar();
-  if (typeof renderStatusRow === 'function') renderStatusRow();
 }
 
 /**
@@ -970,14 +786,6 @@ function applyRecord(record) {
   if (record.name === 'ITDETECTSTATUS') rememberLastDetection(record);
   if (record.name === 'VERSION') renderVersionSummary(record);
   registerFilterOption(record.name);
-  // The status row, wall tile, and health line update here so they are not waiting
-  // for the one-second timer or for their own tab to be opened. Sliced tests do
-  // not define these renderers; typeof skips the call there.
-  if (record.name === 'ITDETECTSTATUS' && typeof renderVerdict === 'function') renderVerdict();
-  if (record.name === 'BESTPOS' && typeof refreshPositionFreshness === 'function') refreshPositionFreshness();
-  if (record.name === 'RXSTATUS' && typeof publishHealthWarning === 'function') publishHealthWarning(record);
-  if ((record.name === 'ITDETECTSTATUS' || record.name === 'BESTPOS' || record.name === 'RXSTATUS')
-    && typeof renderStatusRow === 'function') renderStatusRow();
 }
 
 /**
@@ -1084,31 +892,6 @@ function explainSolution(solutionStatus, positionType) {
 }
 
 /**
- * Short position name. NovAtel tokens stay available as the tooltip.
- * @param {string} positionType Receiver position type.
- * @param {string} solutionStatus Receiver solution status.
- * @returns {string}
- * Side effects: none. events: none.
- */
-function positionShortLabel(positionType, solutionStatus) {
-  if (solutionStatus && solutionStatus !== 'SOL_COMPUTED') {
-    return (typeof SOLUTION_STATUS_TEXT !== 'undefined' && SOLUTION_STATUS_TEXT[solutionStatus]) || solutionStatus;
-  }
-  const short = {
-    NONE: 'No position', FIXEDPOS: 'Fixed position', FIXEDHEIGHT: 'Fixed height',
-    DOPPLER_VELOCITY: 'Doppler velocity', SINGLE: 'Single point', PSRDIFF: 'Differential',
-    WAAS: 'SBAS corrected', PROPAGATED: 'Propagated', L1_FLOAT: 'RTK float',
-    NARROW_FLOAT: 'RTK float', L1_INT: 'RTK fixed', NARROW_INT: 'RTK fixed',
-    RTK_DIRECT_INS: 'RTK fixed', INS_SBAS: 'INS SBAS', INS_PSRSP: 'INS single',
-    INS_PSRDIFF: 'INS differential', INS_RTKFLOAT: 'RTK float', INS_RTKFIXED: 'RTK fixed',
-    PPP_CONVERGING: 'PPP converging', PPP: 'PPP', PPP_BASIC_CONVERGING: 'PPP converging',
-    PPP_BASIC: 'PPP', OPERATIONAL: 'Align operational', WARNING: 'Align degraded',
-    OUT_OF_BOUNDS: 'Align out of bounds',
-  };
-  return short[positionType] || positionType || 'No position';
-}
-
-/**
  * Fills the BESTPOS fields and updates the map from one report.
  * @param {object} record BESTPOS report.
  * @returns {void}
@@ -1117,40 +900,17 @@ function positionShortLabel(positionType, solutionStatus) {
 function renderBestPos(record) {
   const d = record.data;
   if (!d) return;
-  const novAtel = `${d.solutionStatus} / ${d.positionType}`;
-  const short = typeof positionShortLabel === 'function' ? positionShortLabel(d.positionType, d.solutionStatus) : novAtel;
-  $('pos-type').textContent = short;
-  $('pos-type').title = novAtel;
+  $('pos-type').textContent = `${d.solutionStatus} / ${d.positionType}`;
   $('pos-type').classList.toggle('alert', d.solutionStatus !== 'SOL_COMPUTED');
 
   const explained = explainSolution(d.solutionStatus, d.positionType);
   $('pos-status-hint').textContent = explained.text;
-  const receivedAt = Date.parse(record.receivedAt);
-  const age = Number.isFinite(receivedAt) ? Date.now() - receivedAt : null;
-  const staleLimit = typeof POSITION_STALE_MS === 'number' ? POSITION_STALE_MS : 5000;
-  const stale = age !== null && age >= staleLimit;
   const quality = $('pos-quality');
-  if (quality && quality.dataset) {
-    quality.dataset.tier = explained.quality || '';
-    quality.dataset.label = explained.quality && typeof QUALITY_LABEL !== 'undefined' ? (QUALITY_LABEL[explained.quality] || '') : '';
+  quality.hidden = !explained.quality;
+  if (explained.quality) {
+    quality.className = `quality ${explained.quality}`;
+    quality.textContent = QUALITY_LABEL[explained.quality];
   }
-  if (stale) {
-    quality.hidden = false;
-    quality.className = 'quality stale';
-    quality.textContent = 'Stale – receiver not reporting';
-  } else {
-    quality.hidden = !explained.quality;
-    if (explained.quality) {
-      quality.className = `quality ${explained.quality}`;
-      quality.textContent = (typeof QUALITY_LABEL !== 'undefined' && QUALITY_LABEL[explained.quality]) || explained.quality;
-    }
-  }
-  const last = $('pos-last');
-  if (last) {
-    last.textContent = age === null ? 'Last BESTPOS: time unknown' : `Last BESTPOS: ${Math.max(0, Math.round(age / 1000))} s ago`;
-  }
-  const cards = $('pos-cards');
-  if (cards && cards.classList) cards.classList.toggle('stale-fix', stale);
   $('pos-lat').textContent = fmt(d.latitude, 9, '°');
   $('pos-lon').textContent = fmt(d.longitude, 9, '°');
   $('pos-hgt').textContent = fmt(heightFor(d), 3, ' m');
@@ -1924,11 +1684,6 @@ function initTimePlotNavigation(chart) {
     const area = geometry();
     const fraction = (event.clientX - area.left) / area.width;
     if (fraction < 0 || fraction > 1 || event.deltaY === 0) return;
-    // Chrome reports a trackpad pinch as ctrlKey. A plain wheel scrolls the page.
-    if (!event.ctrlKey && !event.metaKey) {
-      if (typeof showZoomHint === 'function') showZoomHint();
-      return;
-    }
     event.preventDefault();
     zoomTimeline(event.deltaY < 0 ? 0.8 : 1.25, fraction);
   }, { passive: false });
@@ -2978,32 +2733,19 @@ function setWallMode(enabled, { fullscreen = false } = {}) {
   else url.searchParams.delete('wall');
   history.replaceState(null, '', url);
   if (state.wall) {
-    state.tabBeforeWall = document.querySelector('.tab.active')?.dataset.tab || 'interference';
     // Dispatches a DOM click on the Interference tab button.
     document.querySelector('button.tab[data-tab="interference"]')?.click();
     if (state.selectMode) setSelectMode(false);
     state.timelineView = null;
     if (fullscreen && !document.fullscreenElement) document.documentElement.requestFullscreen?.().catch(() => {});
     requestWallWakeLock();
-    // History and Exit stay hidden until the pointer moves, same as the cursor.
-    document.documentElement.classList.add('wall-idle');
-    clearTimeout(wallCursorTimer);
-    const info = $('display-info');
-    if (info) {
-      info.hidden = false;
-      if (typeof renderDisplayInfo === 'function') renderDisplayInfo();
-    }
+    wallCursorActivity();
   } else {
-    const info = $('display-info');
-    if (info) info.hidden = true;
     if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
     wallWakeLock?.release().catch(() => {});
     wallWakeLock = null;
     clearTimeout(wallCursorTimer);
     document.documentElement.classList.remove('wall-idle');
-    const restore = state.tabBeforeWall;
-    state.tabBeforeWall = '';
-    if (restore) document.querySelector(`.tab[data-tab="${restore}"]`)?.click();
   }
   timelineDirty = true;
   flushUpdates(true);
@@ -3124,9 +2866,7 @@ function renderArchiveStatus() {
   $('archive-root').disabled = !known || pending;
   $('archive-days').disabled = !known || pending;
   $('archive-load').disabled = !known || pending;
-  $('archive-load').textContent = busy ? 'Restart load'
-    : status && status.state === 'error' ? 'Retry'
-      : status && status.state !== 'idle' ? 'Reload' : 'Load history';
+  $('archive-load').textContent = busy ? 'Restart load' : status && status.state !== 'idle' ? 'Reload' : 'Load history';
   $('archive-cancel').disabled = !busy || pending;
   $('archive-clear').disabled = !known || status.state === 'idle' || pending;
   $('archive-default').disabled = !state.archive.defaults || pending;
@@ -3182,17 +2922,8 @@ function renderArchiveStatus() {
         + `${Number.isFinite(status.finishedAt) && Number.isFinite(status.startedAt)
           ? ` in ${formatDuration(status.finishedAt - status.startedAt)}` : ''}.`);
     }
-    if (status.state === 'error') {
-      const mapped = typeof plainError === 'function'
-        ? plainError(status.message || 'Archive loading failed.')
-        : { text: status.message || 'Archive loading failed.', raw: status.message || '' };
-      parts.push(mapped.text);
-      parts.push('Check that the network folder is shared and this PC can open it, then press Retry.');
-      $('archive-status').title = mapped.raw;
-    } else {
-      $('archive-status').title = '';
-    }
-    if (status.state !== 'listing' && status.state !== 'error') {
+    if (status.state === 'error') parts.push(status.message || 'Archive loading failed.');
+    if (status.state !== 'listing') {
       parts.push(`${status.reports.toLocaleString()} status reports, ${status.samples.toLocaleString()} seconds with detections`
         + `${status.resolutionMs > 1000 ? ` (stored at ${formatSpan(status.resolutionMs)} resolution)` : ''}`
         + ` · ${(status.solutionReports || 0).toLocaleString()} BESTPOS reports, ${(status.solutionSamples || 0).toLocaleString()} solution intervals`
@@ -3205,12 +2936,6 @@ function renderArchiveStatus() {
     if (status.errors?.length) parts.push(`${status.errors.length} problem${status.errors.length === 1 ? '' : 's'}: ${status.errors.slice(0, 3).join('; ')}`);
   }
   const auto = status?.auto;
-  if (Number.isFinite(status?.lastReachableAt)) {
-    const when = dateFormatter({
-      timeZone: state.timeZone, hourCycle: 'h23', hour: '2-digit', minute: '2-digit',
-    }).format(new Date(status.lastReachableAt));
-    parts.push(`NAS last reachable ${when} (${timeAgo(status.lastReachableAt)}).`);
-  }
   if (auto?.enabled) {
     /** @param {number} time @returns {string} Hours and minutes in the selected zone. Side effects: none. Events: none. */
     const clock = (time) => dateFormatter({ timeZone: state.timeZone, hourCycle: 'h23', hour: '2-digit', minute: '2-digit' })
@@ -3227,24 +2952,20 @@ function renderArchiveStatus() {
 /** One-line archive state for the collapsed panel header. */
 function archiveSummary(status, known, busy) {
   if (!known) return '';
+  if (status.state === 'idle') return 'Expand to choose days and load history';
   /** @param {number} time @returns {string} Short date and time in the selected zone. Side effects: none. Events: none. */
   const clock = (time) => dateFormatter({
     timeZone: state.timeZone, hourCycle: 'h23', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
   }).format(new Date(time));
-  if (status.state === 'idle') {
-    const reachable = Number.isFinite(status.lastReachableAt) ? ` · NAS last reachable ${clock(status.lastReachableAt)}` : '';
-    return `Expand to choose days and load history${reachable}`;
-  }
   const bits = [];
   if (busy && status.state === 'listing') bits.push('Searching for log files…');
   else if (busy && status.state === 'scanning') {
     const percent = status.bytesTotal > 0 ? Math.floor(100 * status.bytesDone / status.bytesTotal) : 0;
     bits.push(`File ${Math.min(status.filesDone + 1, status.filesTotal)} of ${status.filesTotal} · ${percent}%`);
   }
-  if (status.state !== 'error' && Number.isFinite(status.from)) bits.push(`${clock(status.from)} – ${clock(status.to)}`);
+  if (Number.isFinite(status.from)) bits.push(`${clock(status.from)} – ${clock(status.to)}`);
   if (status.auto?.enabled) bits.push(`auto-refresh every ${formatSpan(status.auto.refreshMs || 900000)}`);
-  if (status.state === 'error') return 'Could not read the archive – expand for what to check';
-  if (status.auto?.lastError || status.errors?.length) bits.push('problem – expand for details');
+  if (status.state === 'error' || status.auto?.lastError || status.errors?.length) bits.push('problem – expand for details');
   return bits.join(' · ');
 }
 
@@ -3516,24 +3237,18 @@ function renderSkyplot() {
   $('sv-missing').textContent = satelliteTrackingAvailable() ? counts.missing : '\u2014';
   $('sv-unhealthy').textContent = usageAvailable ? counts.unhealthy : '\u2014';
   $('sv-status-note').textContent = usageAvailable
-    ? 'Usage: BESTSATS. Missing observations: visible assigned channels above the tracking cutoff without RANGE observations. In view: SATVIS2 above-horizon prediction, not a tracking count.'
+    ? 'Usage: BESTSATS. Missing: visible assigned TRACKSTAT channels above the tracking cutoff without RANGE observations. In view: SATVIS2 above-horizon prediction, not a tracking count.'
     : 'Per-satellite usage unavailable: waiting for BESTSATS. The used total, when available, comes from BESTPOS; tracked comes from RANGE.'
       + (satelliteTrackingAvailable() ? ' Missing is derived from TRACKSTAT and SATVIS2.' : ' Missing status is unavailable without TRACKSTAT.');
   const best = latestByName.BESTSATS;
   const bestAge = Date.now() - Date.parse(best?.receivedAt);
-  const warnings = [];
   if (Number.isFinite(bestAge) && bestAge >= 5000) {
-    warnings.push(`BESTSATS is ${Math.floor(bestAge / 1000)} s old; usage counts are last reported, not live.`);
+    $('sv-status-note').textContent += ` WARNING: BESTSATS is ${Math.floor(bestAge / 1000)} s old; usage counts are last reported, not live.`;
   }
   const bestEpoch = best?.header?.utc;
   if (usageAvailable && bestEpoch && bestEpoch === bestpos?.header?.utc
     && Number.isInteger(solutionUsed) && counts.used !== solutionUsed) {
-    warnings.push(`same-epoch BESTPOS reports ${solutionUsed} used, but BESTSATS identifies ${counts.used}; counts have not been adjusted.`);
-  }
-  const warningBox = $('sv-warnings');
-  if (warningBox) {
-    warningBox.hidden = warnings.length === 0;
-    warningBox.textContent = warnings.join(' ');
+    $('sv-status-note').textContent += ` WARNING: same-epoch BESTPOS reports ${solutionUsed} used, but BESTSATS identifies ${counts.used}; counts have not been adjusted.`;
   }
   $('sv-missing').classList.toggle('alert', counts.missing > 0);
   $('sv-unhealthy').classList.toggle('alert', counts.unhealthy > 0);
@@ -3973,35 +3688,12 @@ function renderRange(record) {
  * @returns {void}
  * Side effects: DOM health fields. Returns when data is missing. events: none.
  */
-/**
- * Antenna and receiver-error flags worth showing outside the Health tab.
- * @param {object} record RXSTATUS report.
- * @returns {string[]}
- * Side effects: none. events: none.
- */
-function seriousReceiverWarnings(record) {
-  const data = record?.data;
-  if (!data) return [];
-  const flags = Array.isArray(data.activeFlags) ? data.activeFlags : [];
-  const serious = flags.filter((flag) => /antenna|open circuit|short circuit/i.test(String(flag)));
-  if (data.hasError && !serious.some((flag) => /error word/i.test(flag))) serious.unshift('Receiver error word is set');
-  return serious;
-}
-
 function renderRxStatus(record) {
   const d = record.data;
   if (!d) return;
   $('rx-error').textContent = `0x${d.errorWord}`;
   $('rx-error').classList.toggle('alert', d.hasError);
   $('rx-status').textContent = `0x${d.receiverStatusWord}`;
-  const receivedAt = Date.parse(record.receivedAt);
-  const age = $('rx-age');
-  if (age) {
-    age.textContent = Number.isFinite(receivedAt)
-      ? `Last RXSTATUS: ${formatTimestamp(receivedAt)} · ${timeAgo(receivedAt)}`
-      : 'Last RXSTATUS: time unknown';
-  }
-  if (typeof publishHealthWarning === 'function') publishHealthWarning(record);
 
   const list = $('rx-flags');
   list.replaceChildren();
@@ -4197,44 +3889,19 @@ function bandStats(now) {
  * @returns {HTMLElement}
  * Side effects: none until the caller inserts the card. events: none.
  */
-/**
- * Pill for one band. Active while a hit is inside the hold, Recent for the next
- * few minutes, otherwise Clear for N min. A live detection is Active even when
- * the history sample has not been stored yet.
- * @param {string} status jammed, clear, or unmonitored. This is the latest report only.
- * @param {number} detectionCount Detections on this band in the latest report.
- * @param {number|null} lastHit Epoch ms of the last hit in the history window.
- * @param {number} now Clock in milliseconds.
- * @returns {{status: string, text: string}}
- * Side effects: none. events: none.
- */
-function bandPill(status, detectionCount, lastHit, now) {
-  const holdMs = typeof interferenceHoldMs === 'number' ? interferenceHoldMs : 30000;
-  const recentMs = typeof INTERFERENCE_RECENT_MS === 'number' ? INTERFERENCE_RECENT_MS : 10 * 60 * 1000;
-  if (status === 'unmonitored') return { status: 'unmonitored', text: 'No data' };
-  const age = Number.isFinite(lastHit) ? now - lastHit : Infinity;
-  if (status === 'jammed' || age <= holdMs) return { status: 'active', text: '\u26a0 Active' };
-  if (age <= recentMs) return { status: 'recent', text: 'Recent' };
-  if (Number.isFinite(lastHit)) {
-    const minutes = Math.max(1, Math.round(age / 60000));
-    return { status: 'clear', text: `Clear for ${minutes} min` };
-  }
-  return { status: 'clear', text: 'Clear' };
-}
-
 function buildBandCard(band, group, detections, status, stats) {
   const card = document.createElement('article');
-  const pillState = bandPill(status, detections.length, stats && stats.lastHit, Date.now());
-  card.className = `band ${pillState.status === 'active' ? 'jammed' : pillState.status}`;
+  card.className = `band ${status}`;
 
   const head = document.createElement('header');
   const title = document.createElement('div');
   title.className = 'band-title';
   title.textContent = band.title;
   const pill = document.createElement('span');
-  pill.className = `pill ${pillState.status}`;
-  pill.setAttribute('role', 'status');
-  pill.textContent = pillState.text;
+  pill.className = `pill ${status}`;
+  pill.textContent = status === 'jammed'
+    ? `${detections.length} detection${detections.length === 1 ? '' : 's'}`
+    : status === 'clear' ? 'Clear' : 'No data';
   head.append(title, pill);
 
   const range = document.createElement('div');
@@ -4263,9 +3930,9 @@ function buildBandCard(band, group, detections, status, stats) {
     const summary = document.createElement('div');
     summary.className = 'band-stats';
     const rate = Math.round((stats.hits / stats.samples) * 100);
-    const lastHit = stats.lastHit ? `Last hit ${timeAgo(stats.lastHit)}` : 'No hits in this window';
-    summary.textContent = `${lastHit} \u00b7 ${rate}% of ${stats.samples} reports in the last ${formatWindow(state.windowMinutes)}`
-      + (stats.peak !== null ? ` \u00b7 peak ${stats.peak.toFixed(1)} dBm` : '');
+    summary.textContent = `${rate}% of ${stats.samples} reports in the last ${formatWindow(state.windowMinutes)}`
+      + (stats.peak !== null ? ` \u00b7 peak ${stats.peak.toFixed(1)} dBm` : '')
+      + (stats.lastHit ? ` \u00b7 last hit ${timeAgo(stats.lastHit)}` : '');
     if (stats.hits) summary.classList.add('has-hits');
     card.append(summary);
   }
@@ -4288,7 +3955,6 @@ function buildBandCard(band, group, detections, status, stats) {
       const description = document.createElement('span');
       description.className = 'det-description';
       description.textContent = describeDetection(det);
-      if (typeof detectionTooltip === 'function') description.title = detectionTooltip(det);
       li.append(type, freq, power, description);
       list.append(li);
     }
@@ -4320,35 +3986,29 @@ function detectionTypeLabel(type) {
  * Side effects: none. events: none.
  */
 function describeDetection(detection) {
-  const freq = formatFrequency(detection.centerFrequencyHz);
-  if (detection.type === 'SPECTRUMANALYSIS') {
-    const narrow = !Number.isFinite(detection.bandwidthHz) || detection.bandwidthHz < 5e6;
-    return `${narrow ? 'Narrow-band interference' : 'Interference'} near ${freq}.`;
-  }
-  if (detection.type === 'STATISTICANALYSIS') return 'The signal shape does not look like a navigation signal.';
-  return 'The receiver reported interference.';
-}
-
-/**
- * NovAtel detail for the tooltip on a detection line.
- * @param {object} detection One ITDETECTSTATUS detection.
- * @returns {string}
- * Side effects: none. events: none.
- */
-function detectionTooltip(detection) {
   const masks = (detection.affectedSignals || []).filter((mask) => mask && mask !== '00000000');
   const maskText = masks.length ? ` Affected-signal masks: ${masks.join(', ')}.` : '';
-  const name = detectionTypeLabel(detection.type);
+
   if (detection.type === 'SPECTRUMANALYSIS') {
-    return `NovAtel ${name}. Energy peak centred at ${formatFrequency(detection.centerFrequencyHz)}`
+    const delta = Number.isFinite(detection.powerDbm) && Number.isFinite(detection.noiseFloorDbm)
+      ? detection.powerDbm - detection.noiseFloorDbm
+      : null;
+    return `Energy peak centred at ${formatFrequency(detection.centerFrequencyHz)}`
       + ` with ${formatFrequency(detection.bandwidthHz)} bandwidth.`
       + (Number.isFinite(detection.powerDbm) ? ` Peak power ${detection.powerDbm.toFixed(3)} dBm.` : '')
+      + (Number.isFinite(detection.noiseFloorDbm) ? ` Noise floor ${detection.noiseFloorDbm.toFixed(3)} dBm.` : '')
+      + (delta !== null ? ` Peak is ${delta.toFixed(1)} dB above the noise floor.` : '')
       + maskText;
   }
+
   if (detection.type === 'STATISTICANALYSIS') {
-    return `NovAtel ${name}. Statistical detector found a non-GNSS-like signal distribution.${maskText}`;
+    const metrics = (detection.metrics || []).filter(Number.isFinite);
+    return 'Statistical detector found a non-GNSS-like signal distribution.'
+      + (metrics.length ? ` Receiver metrics: ${metrics.map((value) => value.toFixed(3)).join(', ')}.` : '')
+      + maskText;
   }
-  return `NovAtel ${name} event.${maskText}`;
+
+  return `Receiver-reported ${detectionTypeLabel(detection.type).toLowerCase()} event.` + maskText;
 }
 
 /** Signal strength bar spanning a typical detector range of -130 to -70 dBm. */
@@ -4413,15 +4073,11 @@ function renderVerdict() {
 
   const messageCount = state.counts.ITDETECTSTATUS || 0;
   const reportIsFresh = hasFreshInterferenceReport(record, now);
-  const manualStop = connection.status?.manualStop && connection.status?.connected === false && !connection.offline;
   $('it-freshness').textContent = reportIsFresh
     ? `Receiving Data \u00b7 ${messageCount} status messages`
-    : manualStop
-      ? `Monitoring stopped \u00b7 Last message ${age === null ? 'never' : `${Math.floor(age / 1000)} s ago`}`
-        + ` \u00b7 ${messageCount} status messages`
-      : `${connection.offline ? 'Live server connection lost' : 'Device connection lost'}`
-        + ` \u00b7 Last message ${age === null ? 'never' : `${Math.floor(age / 1000)} s ago`}`
-        + ` \u00b7 ${messageCount} status messages`;
+    : `${connection.offline ? 'Live server connection lost' : 'Device connection lost'}`
+      + ` \u00b7 Last message ${age === null ? 'never' : `${Math.floor(age / 1000)} s ago`}`
+      + ` \u00b7 ${messageCount} status messages`;
   renderClock(now);
   renderLastDetection();
   renderDeviceSummary();
@@ -4432,13 +4088,6 @@ function renderVerdict() {
 
   const lastReportAt = Number.isFinite(receivedAt) ? receivedAt : liveStatusStartedAt;
   if (!reportIsFresh && now - lastReportAt >= INTERFERENCE_STALE_MS) {
-    if (manualStop) {
-      banner.className = 'banner manual-stop';
-      verdict.textContent = 'Monitoring stopped manually';
-      const when = typeof formatTimestamp === 'function' ? formatTimestamp(connection.status.manualStop.at) : '';
-      detail.textContent = `Monitoring stopped manually at ${when} from ${connection.status.manualStop.clientIp} – press Connect`;
-      return;
-    }
     banner.className = 'banner device-error';
     verdict.textContent = connection.offline ? 'Live server connection lost'
       : connection.status?.connected === false ? 'Device disconnected' : 'Device status unavailable';
@@ -4455,62 +4104,14 @@ function renderVerdict() {
     return;
   }
   if (jammedBands.length) {
-    state.lastJamAt = Number.isFinite(receivedAt) ? receivedAt : now;
-    state.lastJamBands = jammedBands.slice();
     banner.className = 'banner alarm';
     verdict.textContent = `Jamming detected on ${jammedBands.join(', ')}`;
     detail.textContent = `${totalDetections} active detection${totalDetections === 1 ? '' : 's'} across ${jammedBands.length} band${jammedBands.length === 1 ? '' : 's'}.`;
     return;
   }
-  // A fresh clear report still stays red until the hold expires. The stale
-  // branch above returns first, so a dead receiver never sits on this hold.
-  const holdMs = typeof interferenceHoldMs === 'number' ? interferenceHoldMs : 30000;
-  const lastJamAt = Number(state.lastJamAt) || Number(state.lastDetection && state.lastDetection.at) || 0;
-  // The latest report can already be clear while the hold is still running.
-  // Band names then come from the detection that started the hold, not from
-  // this clear report. A missing name stays off the title rather than inventing one.
-  let heldBands = Array.isArray(state.lastJamBands) ? state.lastJamBands.slice() : [];
-  const heldDetection = state.lastDetection && state.lastDetection.detection;
-  if (!heldBands.length && heldDetection && typeof detectionBands === 'function') {
-    heldBands = BANDS.map((band) => band.id)
-      .filter((band) => detectionBands(heldDetection.signalType, heldDetection).includes(band));
-    if (heldBands.length) state.lastJamBands = heldBands.slice();
-  }
-  if (reportIsFresh && lastJamAt && now - lastJamAt < holdMs && holdMs > 0) {
-    banner.className = 'banner alarm';
-    verdict.textContent = heldBands.length ? `Jamming detected on ${heldBands.join(', ')}` : 'Jamming detected';
-    detail.textContent = `Held ${Math.round(holdMs / 1000)} s after the last detection`
-      + ` \u00b7 last hit ${Math.max(0, Math.floor((now - lastJamAt) / 1000))} s ago.`;
-    return;
-  }
-  const burst = interferenceBurst(now);
-  if (reportIsFresh && burst.rate > 0) {
-    banner.className = 'banner intermittent';
-    verdict.textContent = `Intermittent interference \u2013 ${burst.rate}% of reports in last 5 min`;
-    detail.textContent = `${burst.hits} of ${burst.samples} reports in the last 5 min had detections.`;
-    return;
-  }
   banner.className = 'banner clear';
   verdict.textContent = 'No interference detected';
   detail.textContent = 'Latest receiver status reports no active detections.';
-}
-
-/**
- * Hit rate of interference history over the last 5 minutes.
- * A recent lastJamAt with no stored samples still counts as intermittent.
- * @param {number} now Clock in milliseconds.
- * @returns {{rate: number, hits: number, samples: number}}
- * Side effects: none. events: none.
- */
-function interferenceBurst(now) {
-  const windowMs = typeof INTERFERENCE_BURST_MS === 'number' ? INTERFERENCE_BURST_MS : 5 * 60 * 1000;
-  const history = Array.isArray(state.interferenceHistory) ? state.interferenceHistory : [];
-  const samples = history.filter((sample) => Number.isFinite(sample.t) && sample.t >= now - windowMs);
-  const hits = samples.filter((sample) => sample.count > 0).length;
-  if (samples.length) return { rate: Math.round((hits / samples.length) * 100), hits, samples: samples.length };
-  const lastJamAt = Number(state.lastJamAt) || Number(state.lastDetection && state.lastDetection.at) || 0;
-  if (lastJamAt && now - lastJamAt < windowMs) return { rate: 100, hits: 1, samples: 1 };
-  return { rate: 0, hits: 0, samples: 0 };
 }
 
 /**
@@ -4609,27 +4210,6 @@ function renderClock(now = Date.now()) {
     timeZone: state.timeZone, weekday: 'short', day: '2-digit', month: 'short', year: 'numeric',
     timeZoneName: 'shortOffset',
   }).format(date);
-  const utc = $('it-clock-utc');
-  if (utc) {
-    const utcClock = dateFormatter({
-      timeZone: 'UTC', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
-    }).format(date);
-    const gpsEpoch = Date.UTC(1980, 0, 6);
-    const elapsed = now - gpsEpoch;
-    const week = Math.floor(elapsed / 604800000);
-    const day = Math.floor((elapsed % 604800000) / 86400000);
-    utc.textContent = `${utcClock} UTC \u00b7 GPS week ${week}, day ${day}`;
-  }
-  const receiverClock = $('it-receiver-clock');
-  if (receiverClock) {
-    const source = latestByName.ITDETECTSTATUS || latestByName.BESTPOS;
-    const receiverAt = Date.parse(source?.header?.utc);
-    receiverClock.textContent = Number.isFinite(receiverAt)
-      ? `Receiver time ${dateFormatter({
-        timeZone: state.timeZone, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
-      }).format(new Date(receiverAt))}`
-      : 'PC clock';
-  }
 }
 
 const SATELLITE_SYSTEMS = ['GPS', 'GLONASS', 'GALILEO', 'BEIDOU', 'QZSS', 'NAVIC'];
@@ -4768,49 +4348,10 @@ function renderDeviceSummary() {
   }
   const inViewTotal = sumCounts(inView);
   $('satellite-total-counts').textContent = `${trackedTotal} / ${inViewTotal}`;
-  const liveText = trackedTotal || inViewTotal
+  $('satellite-view-total').textContent = trackedTotal || inViewTotal
     ? `${trackedTotal} tracked \u00b7 ${inViewTotal} in view \u00b7 ${signalTotal} signals`
     : 'No satellite data';
-  const satTimes = [];
-  const rangeAt = Date.parse(latestByName.RANGE?.receivedAt);
-  if (Number.isFinite(rangeAt)) satTimes.push(rangeAt);
-  for (const record of Object.values(state.satvis || {})) {
-    const at = Date.parse(record?.receivedAt);
-    if (Number.isFinite(at)) satTimes.push(at);
-  }
-  const latestSat = satTimes.length ? Math.max(...satTimes) : null;
-  const satStale = latestSat !== null && nowSatAge(latestSat) >= 5000;
-  $('satellite-view-total').textContent = satStale && liveText !== 'No satellite data'
-    ? `${liveText} \u00b7 as of ${satClock(latestSat)} (${Math.floor(nowSatAge(latestSat) / 1000)} s ago)`
-    : liveText;
-  const panel = $('satellite-view-panel');
-  if (panel && panel.classList) panel.classList.toggle('stale', satStale);
   renderSatelliteViewPlot();
-}
-
-/**
- * Age of a satellite report. Kept beside renderDeviceSummary so the banner test,
- * which loads this function, does not need another helper from outside the slice.
- * @param {number} timestamp Epoch milliseconds.
- * @returns {number}
- * Side effects: none. events: none.
- */
-function nowSatAge(timestamp) {
-  return Date.now() - timestamp;
-}
-
-/**
- * Hours, minutes and seconds for a stale satellite caption.
- * @param {number} timestamp Epoch milliseconds.
- * @returns {string}
- * Side effects: none. Uses dateFormatter when that binding exists. events: none.
- */
-function satClock(timestamp) {
-  if (typeof dateFormatter !== 'function') return '';
-  const zone = typeof state !== 'undefined' && state.timeZone ? state.timeZone : 'UTC';
-  return dateFormatter({
-    timeZone: zone, hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
-  }).format(new Date(timestamp));
 }
 
 /**
@@ -5022,8 +4563,7 @@ function renderCounts() {
     cell(row, name);
     cell(row, record ? record.format : '—');
     cell(row, state.counts[name]);
-    const seenAt = record ? Date.parse((record.header && record.header.utc) || record.receivedAt) : NaN;
-    cell(row, record ? `${formatTime(record)}${Number.isFinite(seenAt) ? ` · ${timeAgo(seenAt)}` : ''}` : '—');
+    cell(row, record ? formatTime(record) : '—');
     const crc = cell(row, record ? crcLabel(record.crcValid) : '—');
     if (record && record.crcValid === false) crc.className = 'bad';
   }
@@ -5044,10 +4584,7 @@ function renderEphemeris() {
 
   $('eph-systems').textContent = new Set(messageGroups.map(([name]) => ephemerisConstellation(name))).size;
   const latest = records.reduce((current, record) => !current || record.receivedAt > current.receivedAt ? record : current, null);
-  const latestAt = latest ? Date.parse(latest.receivedAt) : NaN;
-  $('eph-latest').textContent = latest
-    ? `${formatTime(latest)}${Number.isFinite(latestAt) ? ` · ${timeAgo(latestAt)}` : ''}`
-    : '—';
+  $('eph-latest').textContent = latest ? formatTime(latest) : '—';
 
   if (!messageGroups.length) {
     const empty = document.createElement('div');
@@ -5641,9 +5178,7 @@ function appendItRow(record) {
     for (const detection of d.detections || []) {
       const description = document.createElement('div');
       description.className = 'it-event-detail';
-      description.textContent = `${describeDetection(detection)} (${detection.signalType})`;
-      const technical = typeof detectionTooltip === 'function' ? detectionTooltip(detection) : describeDetection(detection);
-      description.title = `${detection.signalType} - ${detectionTypeLabel(detection.type)}: ${technical}`;
+      description.textContent = `${detection.signalType} - ${detectionTypeLabel(detection.type)}: ${describeDetection(detection)}`;
       content.append(description);
     }
   }
@@ -5842,11 +5377,8 @@ function initTimeZone() {
     if ([...select.options].some((option) => option.value === zone)) continue;
     const option = document.createElement('option');
     option.value = zone;
-    option.textContent = typeof zoneLabel === 'function' ? zoneLabel(zone) : zone.replace(/_/g, ' ');
+    option.textContent = zone.replace(/_/g, ' ');
     select.append(option);
-  }
-  if (typeof zoneLabel === 'function') {
-    for (const option of select.options) option.textContent = zoneLabel(option.value);
   }
   select.value = state.timeZone;
   select.addEventListener('change', () => {
@@ -5907,217 +5439,19 @@ function maybeReloadForHeap() {
   location.reload();
 }
 
-/**
- * Writes one chip in the always-visible status row.
- * @param {string} id Element id.
- * @param {string} level ok, warn, bad, manual, or idle.
- * @param {string} text Chip text.
- * @returns {void}
- * Side effects: DOM. events: none.
- */
-function setStatusChip(id, level, text) {
-  const element = $(id);
-  if (!element) return;
-  element.className = `status-chip ${level}`;
-  element.textContent = text;
-}
-
-/**
- * Colour and sentence for the latest BESTPOS, including a stale receiver.
- * @param {number} [now] Clock in milliseconds.
- * @returns {{level: string, text: string}}
- * Side effects: none. events: none.
- */
-function positionReadout(now = Date.now()) {
-  const record = latestByName.BESTPOS;
-  const at = Date.parse(record?.receivedAt);
-  const age = Number.isFinite(at) ? now - at : null;
-  const staleLimit = typeof POSITION_STALE_MS === 'number' ? POSITION_STALE_MS : 5000;
-  const stale = !record?.data || age === null || age >= staleLimit;
-  const type = record?.data?.positionType;
-  const solutionStatus = record?.data?.solutionStatus;
-  const label = record?.data && typeof positionShortLabel === 'function'
-    ? positionShortLabel(type, solutionStatus) : 'no fix';
-  const used = record?.data?.satellitesUsed;
-  const sats = Number.isInteger(used) ? ` · ${used} sats` : '';
-  if (!record?.data) return { level: 'idle', text: 'Position: waiting' };
-  if (stale) return { level: 'bad', text: `Position: stale${age !== null ? ` · ${Math.floor(age / 1000)} s ago` : ''}` };
-  const tier = typeof POSITION_TYPE_TEXT !== 'undefined' && POSITION_TYPE_TEXT[type] ? POSITION_TYPE_TEXT[type][1] : 'single';
-  const level = solutionStatus && solutionStatus !== 'SOL_COMPUTED' ? 'bad'
-    : tier === 'fixed' ? 'ok' : tier === 'float' || tier === 'diff' ? 'warn' : 'bad';
-  return { level, text: `Position: ${label}${sats}` };
-}
-
-/**
- * Shows or hides the warning dot on a tab.
- * @param {string} name Tab name.
- * @param {string} level Chip level.
- * @returns {void}
- * Side effects: DOM. events: none.
- */
-function setTabDot(name, level) {
-  const dot = document.querySelector(`.tab[data-tab="${name}"] .tab-dot`);
-  if (!dot) return;
-  const show = level === 'bad' || level === 'warn';
-  dot.hidden = !show;
-  dot.className = `tab-dot ${level}`;
-}
-
-/**
- * Fills the status row under the header from the latest receiver, interference, position, and health.
- * @returns {void}
- * Side effects: DOM status chips and tab dots. events: none.
- */
-function renderStatusRow() {
-  const now = Date.now();
-  const phase = typeof connectionPhase === 'function' ? connectionPhase() : 'connecting';
-  const manual = phase === 'stopped' && connection.status?.manualStop && !connection.offline;
-  if (manual) setStatusChip('status-receiver', 'manual', 'Receiver: stopped manually');
-  else if (phase === 'connected') setStatusChip('status-receiver', 'ok', 'Receiver: connected');
-  else if (phase === 'connecting' || !connection.status) setStatusChip('status-receiver', 'warn', 'Receiver: connecting');
-  else if (phase === 'offline') setStatusChip('status-receiver', 'bad', 'Receiver: server offline');
-  else setStatusChip('status-receiver', 'bad', phase === 'stopped' ? 'Receiver: disconnected' : 'Receiver: no live data');
-
-  const bannerClass = $('it-banner')?.className || '';
-  if (bannerClass.includes('alarm')) setStatusChip('status-interference', 'bad', 'Interference: jamming');
-  else if (bannerClass.includes('intermittent')) setStatusChip('status-interference', 'warn', 'Interference: intermittent');
-  else if (bannerClass.includes('clear')) setStatusChip('status-interference', 'ok', 'Interference: clear');
-  else if (bannerClass.includes('manual-stop')) setStatusChip('status-interference', 'manual', 'Interference: monitoring stopped');
-  else if (bannerClass.includes('device-error')) setStatusChip('status-interference', 'bad', 'Interference: no live data');
-  else setStatusChip('status-interference', 'idle', 'Interference: waiting');
-
-  const position = positionReadout(now);
-  setStatusChip('status-position', position.level, position.text);
-  const warnings = typeof seriousReceiverWarnings === 'function' ? seriousReceiverWarnings(latestByName.RXSTATUS) : [];
-  const rxAt = Date.parse(latestByName.RXSTATUS?.receivedAt);
-  const rxAge = Number.isFinite(rxAt) ? ` · ${timeAgo(rxAt)}` : '';
-  if (warnings.length) setStatusChip('status-health', 'bad', `Health: ${warnings[0]}${rxAge}`);
-  else if (latestByName.RXSTATUS) setStatusChip('status-health', 'ok', `Health: ok${rxAge}`);
-  else setStatusChip('status-health', 'idle', 'Health: waiting');
-
-  setTabDot('interference', bannerClass.includes('alarm') || bannerClass.includes('device-error') ? 'bad'
-    : bannerClass.includes('intermittent') ? 'warn' : 'ok');
-  setTabDot('position', position.level);
-  setTabDot('health', warnings.length ? 'bad' : 'ok');
-  const rangeAt = Date.parse(latestByName.RANGE?.receivedAt);
-  setTabDot('satellites', Number.isFinite(rangeAt) && now - rangeAt >= 5000 ? 'warn' : 'ok');
-}
-
-/**
- * Greys a stale BESTPOS and refreshes the wall position tile.
- * @param {number} [now] Clock in milliseconds.
- * @returns {void}
- * Side effects: DOM position badge, map marker opacity, and the wall tile. events: none.
- */
-function refreshPositionFreshness(now = Date.now()) {
-  const record = latestByName.BESTPOS;
-  const at = Date.parse(record?.receivedAt);
-  const age = Number.isFinite(at) ? now - at : null;
-  const staleLimit = typeof POSITION_STALE_MS === 'number' ? POSITION_STALE_MS : 5000;
-  const stale = Boolean(record?.data) && age !== null && age >= staleLimit;
-  const cards = $('pos-cards');
-  if (cards && cards.classList) cards.classList.toggle('stale-fix', stale);
-  const last = $('pos-last');
-  if (last && record?.data) {
-    last.textContent = age === null ? 'Last BESTPOS: time unknown' : `Last BESTPOS: ${Math.max(0, Math.round(age / 1000))} s ago`;
-  }
-  const quality = $('pos-quality');
-  if (quality && stale) {
-    quality.hidden = false;
-    quality.className = 'quality stale';
-    quality.textContent = 'Stale – receiver not reporting';
-  } else if (quality && quality.dataset && quality.classList && quality.className.includes('stale') && quality.dataset.label) {
-    quality.className = `quality ${quality.dataset.tier}`;
-    quality.textContent = quality.dataset.label;
-    quality.hidden = !quality.dataset.tier;
-  }
-  const wall = $('wall-position-value');
-  if (wall) {
-    const info = positionReadout(now);
-    wall.textContent = info.text.replace(/^Position: /, '');
-    wall.className = `banner-block-value ${info.level}`;
-  }
-  if (typeof marker !== 'undefined' && marker && typeof marker.setOpacity === 'function') marker.setOpacity(stale ? 0.35 : 1);
-}
-
-/**
- * Header and wall-banner line for antenna and receiver-error flags.
- * @param {object} record RXSTATUS report.
- * @returns {void}
- * Side effects: #health-warning and #it-health-line. events: none.
- */
-function publishHealthWarning(record) {
-  const warnings = seriousReceiverWarnings(record);
-  const at = Date.parse(record?.receivedAt);
-  const text = warnings.length
-    ? `${warnings.join(' · ')}${Number.isFinite(at) ? ` · last RXSTATUS ${timeAgo(at)}` : ''}`
-    : '';
-  const banner = $('health-warning');
-  if (banner) {
-    banner.hidden = !text;
-    banner.textContent = text;
-  }
-  const line = $('it-health-line');
-  if (line) {
-    line.hidden = !text;
-    line.textContent = text;
-  }
-}
-
-/**
- * Shows the plot hint after a plain wheel. Pinch and Ctrl-scroll still zoom.
- * @returns {void}
- * Side effects: #zoom-hint and a timer. events: none.
- */
-function showZoomHint() {
-  const hint = $('zoom-hint');
-  if (!hint) return;
-  hint.hidden = false;
-  if (showZoomHint.timer) clearTimeout(showZoomHint.timer);
-  showZoomHint.timer = setTimeout(() => { hint.hidden = true; }, 1600);
-}
-
-/**
- * Fills the display-info popover: kiosk URL, heap threshold, and page age.
- * @returns {void}
- * Side effects: DOM. events: none.
- */
-function renderDisplayInfo() {
-  const heap = heapReloadLimitMb();
-  const kiosk = new URL(location.href);
-  kiosk.searchParams.set('wall', '1');
-  if (!kiosk.searchParams.has('heapmb')) kiosk.searchParams.set('heapmb', String(heap || 0));
-  const url = $('display-info-url');
-  if (url) url.textContent = kiosk.href;
-  const heapLine = $('display-info-heap');
-  if (heapLine) {
-    heapLine.textContent = heap
-      ? `Reloads this page above ${heap} MB. ?heapmb=N changes it. ?heapmb=0 turns it off.`
-      : 'Heap reload is off (?heapmb=0).';
-  }
-  let reloaded = '';
-  try {
-    const last = Number(sessionStorage.getItem('gnssHeapReloadAt'));
-    if (last) reloaded = ` Last heap reload ${timeAgo(last)}.`;
-  } catch { /* private mode */ }
-  const loaded = $('display-info-loaded');
-  if (loaded) loaded.textContent = `Loaded ${timeAgo(liveStatusStartedAt)}.${reloaded}`;
-}
-
 setInterval(() => flushUpdates(), 250);
 setInterval(maybeReloadForHeap, 60000);
 setInterval(() => {
-  if (document.hidden) return;
   const tab = document.querySelector('.tab.active')?.dataset.tab;
-  renderSafely('Updating live device status', () => {
-    renderVerdict();
-    refreshPositionFreshness();
-    if (latestByName.RXSTATUS && typeof publishHealthWarning === 'function') publishHealthWarning(latestByName.RXSTATUS);
-    renderStatusRow();
-    if (tab === 'interference' && !interferenceIsLive(latestByName.ITDETECTSTATUS)) renderBands();
-    if (tab === 'satellites') renderSkyplot();
-    if (state.wall) renderDisplayInfo();
-  });
+  if (!document.hidden && tab === 'satellites') {
+    renderSafely('Updating satellite report freshness', renderSkyplot);
+  }
+  if (!document.hidden && tab === 'interference') {
+    renderSafely('Updating live device status', () => {
+      renderVerdict();
+      if (!interferenceIsLive(latestByName.ITDETECTSTATUS)) renderBands();
+    });
+  }
 }, 1000);
 setInterval(() => {
   pruneClientHistory();
@@ -6158,15 +5492,6 @@ $('retry-display').addEventListener('click', () => {
 syncHeightToggle();
 initTimeZone();
 initTimelineControls();
-$('display-info-toggle').addEventListener('click', () => {
-  const panel = $('display-info');
-  panel.hidden = !panel.hidden;
-  $('display-info-toggle').setAttribute('aria-expanded', String(!panel.hidden));
-  if (!panel.hidden) renderDisplayInfo();
-});
-const savedTab = readPreference('activeTab', 'interference');
-const savedTabButton = document.querySelector(`.tab[data-tab="${savedTab}"]`);
-if (savedTabButton && !savedTabButton.classList.contains('active')) savedTabButton.click();
 connectStream();
 loadHistory();
 // Long windows are served downsampled; re-fetching keeps their oldest hours from being trimmed by the cap.
